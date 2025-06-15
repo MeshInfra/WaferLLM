@@ -27,7 +27,7 @@ const memcpy = @import_module( "<memcpy/get_params>", .{
     .LAUNCH = LAUNCH
 });
 
-const comm = @import_module("comm/comm_layout.csl", .{
+const comm = @import_module("comm_lib/comm_layout.csl", .{
     .P = P,
     .x_interleave = [3]color{X_0, X_1, X_2},
     .x_shift_interleave = [3]color{X_shift_0, X_shift_1, X_shift_2},

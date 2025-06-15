@@ -212,8 +212,8 @@ def main():
     print(f"Max Cycle count: {(max_time_end - min_time_start)/total_repeat_times}")
     
     freq_ghz = 1.1
-    throughput_p_request = 1 / ((max_time_end - min_time_start) / total_repeat_times / (freq_ghz*1e9))
-    print(f"Host: throughput_p_request: {throughput_p_request}")
+    time = (max_time_end - min_time_start) / total_repeat_times / (freq_ghz*1e6)
+    print(f"Time: {time} ms")
     
 if __name__ == "__main__":
     main()

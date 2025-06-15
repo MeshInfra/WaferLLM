@@ -30,7 +30,7 @@ var res_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Mt*Nt} -> res_tile[i] 
 const sys_mod = @import_module("<memcpy/memcpy>", memcpy_params);
 const layout_module = @import_module("<layout>");
 
-const comm_mod = @import_module("comm/comm_pe.csl", @concat_structs(comm_params, .{
+const comm_mod = @import_module("comm_lib/comm_pe.csl", @concat_structs(comm_params, .{
     .P = P, .Mt = Mt, .Kt = Kt, .Nt = Nt, 
     .x_finish_id = x_finish_id,
     .y_finish_id = y_finish_id,
@@ -38,8 +38,6 @@ const comm_mod = @import_module("comm/comm_pe.csl", @concat_structs(comm_params,
 }));
 
 // ---------------------- Local Variables ---------------------- //
-
-const init_task_id: local_task_id = @get_local_task_id(26);
 
 const jumpcast_finish_id: local_task_id = @get_local_task_id(6);
 const x_finish_id: local_task_id = @get_local_task_id(7); // X axis

@@ -116,7 +116,6 @@ task x_shift_finish() void {
 
 comptime {
     @load_to_dsr(x_shift_out_dsr, x_shift_out_dsd, .{.async=true, .unblock=x_shift_finish_id});
-    // @load_to_dsr(x_shift_out_dsr, x_out_dsd, .{.async=true, .unblock=x_shift_finish_id});
     @load_to_dsr(x_shift_re_out_dsr, x_shift_re_out_dsd, .{.async=true, .unblock=x_shift_finish_id});
 }
 
