@@ -1,0 +1,500 @@
+param P: i16;
+param bsz: i16;
+param dim_p_pe: i16;
+param pes_p_head: i16;
+param pes_p_kv_head: i16;
+param head_dim_p_pe: i16;
+param seq_len_p_pe: i16;
+param ffn_dim_p_pe: i16;
+
+param pe_num_p_group: i16;
+param root_1st_phase: i16;
+param root_2nd_phase: i16;
+
+const LAUNCH: color = @get_color(0);
+
+const C_R_0: color = @get_color(1);
+const C_R_1: color = @get_color(2);
+const C_L_0: color = @get_color(3);
+const C_L_1: color = @get_color(4);
+
+const C_D_0: color = @get_color(5);
+const C_D_1: color = @get_color(6);
+const C_U_0: color = @get_color(7);
+const C_U_1: color = @get_color(8);
+
+const C_U_B: color = @get_color(9);
+const C_D_B: color = @get_color(10);
+
+const C_L_B: color = @get_color(11);
+const C_R_B: color = @get_color(12);
+
+const C_Y_up_reduce_0: color = @get_color(13);
+const C_Y_up_reduce_1: color = @get_color(14);
+
+const C_Y_down_reduce_0: color = @get_color(15);
+const C_Y_down_reduce_1: color = @get_color(16);
+
+const C_X_left_reduce_0: color = @get_color(17);
+const C_X_left_reduce_1: color = @get_color(18);
+
+const C_X_right_reduce_0: color = @get_color(19);
+const C_X_right_reduce_1: color = @get_color(20);
+
+const memcpy = @import_module( "<memcpy/get_params>", .{
+    .width = P,
+    .height = P,
+    .LAUNCH = LAUNCH
+});
+
+const comm = @import_module("comm_lib/comm_layout.csl", .{
+    .P = P,
+    .x_colors = [4]color{C_R_0, C_R_1, C_L_0, C_L_1},
+    .y_colors = [4]color{C_D_0, C_D_1, C_U_0, C_U_1},
+    .y_reduce_colors = [4]color{C_Y_up_reduce_0, C_Y_up_reduce_1, C_Y_down_reduce_0, C_Y_down_reduce_1},
+    .x_reduce_colors = [4]color{C_X_left_reduce_0, C_X_left_reduce_1, C_X_right_reduce_0, C_X_right_reduce_1},
+});
+
+const math = @import_module("<math>");
+
+layout {
+    @set_rectangle(P, P);
+
+    var px: i16 = 0;
+    var py: i16 = 0;
+
+    const comm_even_even = comm.get_step_params(true, true);
+    const comm_even_odd = comm.get_step_params(true, false);
+    const comm_odd_even = comm.get_step_params(false, true);
+    const comm_odd_odd = comm.get_step_params(false, false);
+
+    px = 0;
+    while (px < P) : (px += 2) {
+        const memcpy_params = memcpy.get_params(px);
+
+        const quotient_x: i16 = @as(i16, math.floor_f16(@as(f16, px) / @as(f16, pe_num_p_group)));
+        const remainder_x: i16 = px - quotient_x * pe_num_p_group;
+
+        py = 0;
+        while (py < P) : (py += 2) {
+
+            const quotient_y: i16 = @as(i16, math.floor_f16(@as(f16, py) / @as(f16, pe_num_p_group)));
+            const remainder_y: i16 = py - quotient_y * pe_num_p_group;
+
+            const reduce_2nd_params = comm.get_reduce_2nd_params(px, py, quotient_x, quotient_y);
+
+            @set_tile_code(px, py, "decode.csl", .{
+                .memcpy_params = memcpy_params,
+                .comm_params = @concat_structs(@concat_structs(comm_even_even, reduce_2nd_params), .{
+                    .up_bd_color = C_U_B, .down_bd_color = C_D_B,
+                    .left_bd_color = C_L_B, .right_bd_color = C_R_B,
+                }),
+                .P = P, .bsz = bsz, .dim_p_pe = dim_p_pe, .seq_len_p_pe = seq_len_p_pe, .ffn_dim_p_pe = ffn_dim_p_pe,
+                .pe_num_p_group = pe_num_p_group, .root_1st_phase = root_1st_phase, .root_2nd_phase = root_2nd_phase,
+            });
+
+            // Broadcast along y-axis
+            if (py == root_2nd_phase) {
+                @set_color_config(px, py, C_U_B, .{ .routes = .{ .rx = .{RAMP}, .tx = .{NORTH} } });
+                @set_color_config(px, py, C_D_B, .{ .routes = .{ .rx = .{RAMP}, .tx = .{SOUTH} } });
+            } else {
+                if (py == 0) {
+                    @set_color_config(px, py, C_U_B, .{ .routes = .{ .rx = .{SOUTH}, .tx = .{RAMP} } });
+                } else if (py == P-1) {
+                    @set_color_config(px, py, C_D_B, .{ .routes = .{ .rx = .{NORTH}, .tx = .{RAMP} } });
+                } else {
+                    if (py < root_2nd_phase) {
+                        @set_color_config(px, py, C_U_B, .{ .routes = .{ .rx = .{SOUTH}, .tx = .{RAMP, NORTH} } });
+                    } else { // py > root_2nd_phase
+                        @set_color_config(px, py, C_D_B, .{ .routes = .{ .rx = .{NORTH}, .tx = .{RAMP, SOUTH} } });
+                    }
+                }
+            }
+
+            if (px == root_2nd_phase) {
+                @set_color_config(px, py, C_L_B, .{ .routes = .{ .rx = .{RAMP}, .tx = .{WEST} } });
+                @set_color_config(px, py, C_R_B, .{ .routes = .{ .rx = .{RAMP}, .tx = .{EAST} } });
+            } else {
+                if (px == 0) {
+                    @set_color_config(px, py, C_L_B, .{ .routes = .{ .rx = .{EAST}, .tx = .{RAMP} } });
+                } else if (px == P-1) {
+                    @set_color_config(px, py, C_R_B, .{ .routes = .{ .rx = .{WEST}, .tx = .{RAMP} } });
+                } else {
+                    if (px < root_2nd_phase) {
+                        @set_color_config(px, py, C_L_B, .{ .routes = .{ .rx = .{EAST}, .tx = .{RAMP, WEST} } });
+                    } else { // px > root_2nd_phase
+                        @set_color_config(px, py, C_R_B, .{ .routes = .{ .rx = .{WEST}, .tx = .{RAMP, EAST} } });
+                    }
+                }
+            }
+
+            // Reduce along y-axis
+            if (remainder_y == root_1st_phase) {
+                @set_color_config(px, py, reduce_2nd_params.c_y_up_reduce_recv, .{ .routes = .{ .rx = .{SOUTH}, .tx = .{RAMP} } });
+                @set_color_config(px, py, reduce_2nd_params.c_y_up_reduce_send, .{ .routes = .{ .rx = .{RAMP}, .tx = .{NORTH} } });
+
+                @set_color_config(px, py, reduce_2nd_params.c_y_down_reduce_recv, .{ .routes = .{ .rx = .{NORTH}, .tx = .{RAMP} } });
+                @set_color_config(px, py, reduce_2nd_params.c_y_down_reduce_send, .{ .routes = .{ .rx = .{RAMP}, .tx = .{SOUTH} } });
+            } else {
+                @set_color_config(px, py, reduce_2nd_params.c_y_up_reduce_send, .{ .routes = .{ .rx = .{SOUTH}, .tx = .{NORTH} } });
+                @set_color_config(px, py, reduce_2nd_params.c_y_up_reduce_recv, .{ .routes = .{ .rx = .{SOUTH}, .tx = .{NORTH} } });
+
+                @set_color_config(px, py, reduce_2nd_params.c_y_down_reduce_send, .{ .routes = .{ .rx = .{NORTH}, .tx = .{SOUTH} } });
+                @set_color_config(px, py, reduce_2nd_params.c_y_down_reduce_recv, .{ .routes = .{ .rx = .{NORTH}, .tx = .{SOUTH} } });
+            }
+
+            // Reduce along x-axis
+            if (remainder_x == root_1st_phase) {
+                @set_color_config(px, py, reduce_2nd_params.c_x_left_reduce_recv, .{ .routes = .{ .rx = .{EAST}, .tx = .{RAMP} } });
+                @set_color_config(px, py, reduce_2nd_params.c_x_left_reduce_send, .{ .routes = .{ .rx = .{RAMP}, .tx = .{WEST} } });
+
+                @set_color_config(px, py, reduce_2nd_params.c_x_right_reduce_recv, .{ .routes = .{ .rx = .{WEST}, .tx = .{RAMP} } });
+                @set_color_config(px, py, reduce_2nd_params.c_x_right_reduce_send, .{ .routes = .{ .rx = .{RAMP}, .tx = .{EAST} } });
+            } else {
+                @set_color_config(px, py, reduce_2nd_params.c_x_left_reduce_send, .{ .routes = .{ .rx = .{EAST}, .tx = .{WEST} } });
+                @set_color_config(px, py, reduce_2nd_params.c_x_left_reduce_recv, .{ .routes = .{ .rx = .{EAST}, .tx = .{WEST} } });
+
+                @set_color_config(px, py, reduce_2nd_params.c_x_right_reduce_send, .{ .routes = .{ .rx = .{WEST}, .tx = .{EAST} } });
+                @set_color_config(px, py, reduce_2nd_params.c_x_right_reduce_recv, .{ .routes = .{ .rx = .{WEST}, .tx = .{EAST} } });
+            }
+
+            {
+                @set_color_config(px, py, comm_even_even.c_right_send, .{ .routes = .{ .rx = .{RAMP}, .tx = .{EAST} } });
+                @set_color_config(px, py, comm_even_even.c_right_recv, .{ .routes = .{ .rx = .{WEST}, .tx = .{RAMP} } });
+
+                @set_color_config(px, py, comm_even_even.c_left_recv, .{ .routes = .{ .rx = .{EAST}, .tx = .{RAMP} } });
+                @set_color_config(px, py, comm_even_even.c_left_send, .{ .routes = .{ .rx = .{RAMP}, .tx = .{WEST} } });
+
+                @set_color_config(px, py, comm_even_even.c_down_send, .{ .routes = .{ .rx = .{RAMP}, .tx = .{SOUTH} } });
+                @set_color_config(px, py, comm_even_even.c_down_recv, .{ .routes = .{ .rx = .{NORTH}, .tx = .{RAMP} } });
+
+                @set_color_config(px, py, comm_even_even.c_up_recv, .{ .routes = .{ .rx = .{SOUTH}, .tx = .{RAMP} } });
+                @set_color_config(px, py, comm_even_even.c_up_send, .{ .routes = .{ .rx = .{RAMP}, .tx = .{NORTH} } });
+            }
+
+        }
+
+        py = 1;
+        while (py < P) : (py += 2) {
+
+            const quotient_y: i16 = @as(i16, math.floor_f16(@as(f16, py) / @as(f16, pe_num_p_group)));
+            const remainder_y: i16 = py - quotient_y * pe_num_p_group;
+
+            const reduce_2nd_params = comm.get_reduce_2nd_params(px, py, quotient_x, quotient_y);
+
+            @set_tile_code(px, py, "decode.csl", .{
+                .memcpy_params = memcpy_params,
+                .comm_params = @concat_structs(@concat_structs(comm_even_odd, reduce_2nd_params), .{
+                    .up_bd_color = C_U_B, .down_bd_color = C_D_B,
+                    .left_bd_color = C_L_B, .right_bd_color = C_R_B,
+                }),
+                .P = P, .bsz = bsz, .dim_p_pe = dim_p_pe, .seq_len_p_pe = seq_len_p_pe, .ffn_dim_p_pe = ffn_dim_p_pe,
+                .pe_num_p_group = pe_num_p_group, .root_1st_phase = root_1st_phase, .root_2nd_phase = root_2nd_phase,
+            });
+
+            if (py == root_2nd_phase) {
+                @set_color_config(px, py, C_U_B, .{ .routes = .{ .rx = .{RAMP}, .tx = .{NORTH} } });
+                @set_color_config(px, py, C_D_B, .{ .routes = .{ .rx = .{RAMP}, .tx = .{SOUTH} } });
+            } else {
+                if (py == 0) {
+                    @set_color_config(px, py, C_U_B, .{ .routes = .{ .rx = .{SOUTH}, .tx = .{RAMP} } });
+                } else if (py == P-1) {
+                    @set_color_config(px, py, C_D_B, .{ .routes = .{ .rx = .{NORTH}, .tx = .{RAMP} } });
+                } else {
+                    if (py < root_2nd_phase) {
+                        @set_color_config(px, py, C_U_B, .{ .routes = .{ .rx = .{SOUTH}, .tx = .{RAMP, NORTH} } });
+                    } else { // py > root_2nd_phase
+                        @set_color_config(px, py, C_D_B, .{ .routes = .{ .rx = .{NORTH}, .tx = .{RAMP, SOUTH} } });
+                    }
+                }
+            }
+
+            if (px == root_2nd_phase) {
+                @set_color_config(px, py, C_L_B, .{ .routes = .{ .rx = .{RAMP}, .tx = .{WEST} } });
+                @set_color_config(px, py, C_R_B, .{ .routes = .{ .rx = .{RAMP}, .tx = .{EAST} } });
+            } else {
+                if (px == 0) {
+                    @set_color_config(px, py, C_L_B, .{ .routes = .{ .rx = .{EAST}, .tx = .{RAMP} } });
+                } else if (px == P-1) {
+                    @set_color_config(px, py, C_R_B, .{ .routes = .{ .rx = .{WEST}, .tx = .{RAMP} } });
+                } else {
+                    if (px < root_2nd_phase) {
+                        @set_color_config(px, py, C_L_B, .{ .routes = .{ .rx = .{EAST}, .tx = .{RAMP, WEST} } });
+                    } else { // px > root_2nd_phase
+                        @set_color_config(px, py, C_R_B, .{ .routes = .{ .rx = .{WEST}, .tx = .{RAMP, EAST} } });
+                    }
+                }
+            }
+
+            // Reduce along y-axis
+            if (remainder_y == root_1st_phase) {
+                @set_color_config(px, py, reduce_2nd_params.c_y_up_reduce_recv, .{ .routes = .{ .rx = .{SOUTH}, .tx = .{RAMP} } });
+                @set_color_config(px, py, reduce_2nd_params.c_y_up_reduce_send, .{ .routes = .{ .rx = .{RAMP}, .tx = .{NORTH} } });
+
+                @set_color_config(px, py, reduce_2nd_params.c_y_down_reduce_recv, .{ .routes = .{ .rx = .{NORTH}, .tx = .{RAMP} } });
+                @set_color_config(px, py, reduce_2nd_params.c_y_down_reduce_send, .{ .routes = .{ .rx = .{RAMP}, .tx = .{SOUTH} } });
+            } else {
+                @set_color_config(px, py, reduce_2nd_params.c_y_up_reduce_send, .{ .routes = .{ .rx = .{SOUTH}, .tx = .{NORTH} } });
+                @set_color_config(px, py, reduce_2nd_params.c_y_up_reduce_recv, .{ .routes = .{ .rx = .{SOUTH}, .tx = .{NORTH} } });
+
+                @set_color_config(px, py, reduce_2nd_params.c_y_down_reduce_send, .{ .routes = .{ .rx = .{NORTH}, .tx = .{SOUTH} } });
+                @set_color_config(px, py, reduce_2nd_params.c_y_down_reduce_recv, .{ .routes = .{ .rx = .{NORTH}, .tx = .{SOUTH} } });
+            }
+
+            // Reduce along x-axis
+            if (remainder_x == root_1st_phase) {
+                @set_color_config(px, py, reduce_2nd_params.c_x_left_reduce_recv, .{ .routes = .{ .rx = .{EAST}, .tx = .{RAMP} } });
+                @set_color_config(px, py, reduce_2nd_params.c_x_left_reduce_send, .{ .routes = .{ .rx = .{RAMP}, .tx = .{WEST} } });
+
+                @set_color_config(px, py, reduce_2nd_params.c_x_right_reduce_recv, .{ .routes = .{ .rx = .{WEST}, .tx = .{RAMP} } });
+                @set_color_config(px, py, reduce_2nd_params.c_x_right_reduce_send, .{ .routes = .{ .rx = .{RAMP}, .tx = .{EAST} } });
+            } else {
+                @set_color_config(px, py, reduce_2nd_params.c_x_left_reduce_send, .{ .routes = .{ .rx = .{EAST}, .tx = .{WEST} } });
+                @set_color_config(px, py, reduce_2nd_params.c_x_left_reduce_recv, .{ .routes = .{ .rx = .{EAST}, .tx = .{WEST} } });
+
+                @set_color_config(px, py, reduce_2nd_params.c_x_right_reduce_send, .{ .routes = .{ .rx = .{WEST}, .tx = .{EAST} } });
+                @set_color_config(px, py, reduce_2nd_params.c_x_right_reduce_recv, .{ .routes = .{ .rx = .{WEST}, .tx = .{EAST} } });
+            }
+
+            {
+                @set_color_config(px, py, comm_even_odd.c_right_send, .{ .routes = .{ .rx = .{RAMP}, .tx = .{EAST} } });
+                @set_color_config(px, py, comm_even_odd.c_right_recv, .{ .routes = .{ .rx = .{WEST}, .tx = .{RAMP} } });
+
+                @set_color_config(px, py, comm_even_odd.c_left_recv, .{ .routes = .{ .rx = .{EAST}, .tx = .{RAMP} } });
+                @set_color_config(px, py, comm_even_odd.c_left_send, .{ .routes = .{ .rx = .{RAMP}, .tx = .{WEST} } });
+
+                @set_color_config(px, py, comm_even_odd.c_down_send, .{ .routes = .{ .rx = .{RAMP}, .tx = .{SOUTH} } });
+                @set_color_config(px, py, comm_even_odd.c_down_recv, .{ .routes = .{ .rx = .{NORTH}, .tx = .{RAMP} } });
+
+                @set_color_config(px, py, comm_even_odd.c_up_recv, .{ .routes = .{ .rx = .{SOUTH}, .tx = .{RAMP} } });
+                @set_color_config(px, py, comm_even_odd.c_up_send, .{ .routes = .{ .rx = .{RAMP}, .tx = .{NORTH} } });
+            }
+
+        }
+
+    }
+
+    px = 1;
+    while (px < P) : (px += 2) {
+        const memcpy_params = memcpy.get_params(px);
+
+        const quotient_x: i16 = @as(i16, math.floor_f16(@as(f16, px) / @as(f16, pe_num_p_group)));
+        const remainder_x: i16 = px - quotient_x * pe_num_p_group;
+
+        py = 0;
+        while (py < P) : (py += 2) {
+            const quotient_y: i16 = @as(i16, math.floor_f16(@as(f16, py) / @as(f16, pe_num_p_group)));
+            const remainder_y: i16 = py - quotient_y * pe_num_p_group;
+
+            const reduce_2nd_params = comm.get_reduce_2nd_params(px, py, quotient_x, quotient_y);
+
+            @set_tile_code(px, py, "decode.csl", .{
+                .memcpy_params = memcpy_params,
+                .comm_params = @concat_structs(@concat_structs(comm_odd_even, reduce_2nd_params), .{
+                    .up_bd_color = C_U_B, .down_bd_color = C_D_B,
+                    .left_bd_color = C_L_B, .right_bd_color = C_R_B,
+                }),
+                .P = P, .bsz = bsz, .dim_p_pe = dim_p_pe, .seq_len_p_pe = seq_len_p_pe, .ffn_dim_p_pe = ffn_dim_p_pe,
+                .pe_num_p_group = pe_num_p_group, .root_1st_phase = root_1st_phase, .root_2nd_phase = root_2nd_phase,
+            });
+
+            if (py == root_2nd_phase) {
+                @set_color_config(px, py, C_U_B, .{ .routes = .{ .rx = .{RAMP}, .tx = .{NORTH} } });
+                @set_color_config(px, py, C_D_B, .{ .routes = .{ .rx = .{RAMP}, .tx = .{SOUTH} } });
+            } else {
+                if (py == 0) {
+                    @set_color_config(px, py, C_U_B, .{ .routes = .{ .rx = .{SOUTH}, .tx = .{RAMP} } });
+                } else if (py == P-1) {
+                    @set_color_config(px, py, C_D_B, .{ .routes = .{ .rx = .{NORTH}, .tx = .{RAMP} } });
+                } else {
+                    if (py < root_2nd_phase) {
+                        @set_color_config(px, py, C_U_B, .{ .routes = .{ .rx = .{SOUTH}, .tx = .{RAMP, NORTH} } });
+                    } else { // py > root_2nd_phase
+                        @set_color_config(px, py, C_D_B, .{ .routes = .{ .rx = .{NORTH}, .tx = .{RAMP, SOUTH} } });
+                    }
+                }
+            }
+
+            if (px == root_2nd_phase) {
+                @set_color_config(px, py, C_L_B, .{ .routes = .{ .rx = .{RAMP}, .tx = .{WEST} } });
+                @set_color_config(px, py, C_R_B, .{ .routes = .{ .rx = .{RAMP}, .tx = .{EAST} } });
+            } else {
+                if (px == 0) {
+                    @set_color_config(px, py, C_L_B, .{ .routes = .{ .rx = .{EAST}, .tx = .{RAMP} } });
+                } else if (px == P-1) {
+                    @set_color_config(px, py, C_R_B, .{ .routes = .{ .rx = .{WEST}, .tx = .{RAMP} } });
+                } else {
+                    if (px < root_2nd_phase) {
+                        @set_color_config(px, py, C_L_B, .{ .routes = .{ .rx = .{EAST}, .tx = .{RAMP, WEST} } });
+                    } else { // px > root_2nd_phase
+                        @set_color_config(px, py, C_R_B, .{ .routes = .{ .rx = .{WEST}, .tx = .{RAMP, EAST} } });
+                    }
+                }
+            }
+
+            // Reduce along y-axis
+            if (remainder_y == root_1st_phase) {
+                @set_color_config(px, py, reduce_2nd_params.c_y_up_reduce_recv, .{ .routes = .{ .rx = .{SOUTH}, .tx = .{RAMP} } });
+                @set_color_config(px, py, reduce_2nd_params.c_y_up_reduce_send, .{ .routes = .{ .rx = .{RAMP}, .tx = .{NORTH} } });
+
+                @set_color_config(px, py, reduce_2nd_params.c_y_down_reduce_recv, .{ .routes = .{ .rx = .{NORTH}, .tx = .{RAMP} } });
+                @set_color_config(px, py, reduce_2nd_params.c_y_down_reduce_send, .{ .routes = .{ .rx = .{RAMP}, .tx = .{SOUTH} } });
+            } else {
+                @set_color_config(px, py, reduce_2nd_params.c_y_up_reduce_send, .{ .routes = .{ .rx = .{SOUTH}, .tx = .{NORTH} } });
+                @set_color_config(px, py, reduce_2nd_params.c_y_up_reduce_recv, .{ .routes = .{ .rx = .{SOUTH}, .tx = .{NORTH} } });
+
+                @set_color_config(px, py, reduce_2nd_params.c_y_down_reduce_send, .{ .routes = .{ .rx = .{NORTH}, .tx = .{SOUTH} } });
+                @set_color_config(px, py, reduce_2nd_params.c_y_down_reduce_recv, .{ .routes = .{ .rx = .{NORTH}, .tx = .{SOUTH} } });
+            }
+
+            // Reduce along x-axis
+            if (remainder_x == root_1st_phase) {
+                @set_color_config(px, py, reduce_2nd_params.c_x_left_reduce_recv, .{ .routes = .{ .rx = .{EAST}, .tx = .{RAMP} } });
+                @set_color_config(px, py, reduce_2nd_params.c_x_left_reduce_send, .{ .routes = .{ .rx = .{RAMP}, .tx = .{WEST} } });
+
+                @set_color_config(px, py, reduce_2nd_params.c_x_right_reduce_recv, .{ .routes = .{ .rx = .{WEST}, .tx = .{RAMP} } });
+                @set_color_config(px, py, reduce_2nd_params.c_x_right_reduce_send, .{ .routes = .{ .rx = .{RAMP}, .tx = .{EAST} } });
+            } else {
+                @set_color_config(px, py, reduce_2nd_params.c_x_left_reduce_send, .{ .routes = .{ .rx = .{EAST}, .tx = .{WEST} } });
+                @set_color_config(px, py, reduce_2nd_params.c_x_left_reduce_recv, .{ .routes = .{ .rx = .{EAST}, .tx = .{WEST} } });
+
+                @set_color_config(px, py, reduce_2nd_params.c_x_right_reduce_send, .{ .routes = .{ .rx = .{WEST}, .tx = .{EAST} } });
+                @set_color_config(px, py, reduce_2nd_params.c_x_right_reduce_recv, .{ .routes = .{ .rx = .{WEST}, .tx = .{EAST} } });
+            }
+
+            {
+                @set_color_config(px, py, comm_odd_even.c_right_send, .{ .routes = .{ .rx = .{RAMP}, .tx = .{EAST} } });
+                @set_color_config(px, py, comm_odd_even.c_right_recv, .{ .routes = .{ .rx = .{WEST}, .tx = .{RAMP} } });
+
+                @set_color_config(px, py, comm_odd_even.c_left_recv, .{ .routes = .{ .rx = .{EAST}, .tx = .{RAMP} } });
+                @set_color_config(px, py, comm_odd_even.c_left_send, .{ .routes = .{ .rx = .{RAMP}, .tx = .{WEST} } });
+
+                @set_color_config(px, py, comm_odd_even.c_down_send, .{ .routes = .{ .rx = .{RAMP}, .tx = .{SOUTH} } });
+                @set_color_config(px, py, comm_odd_even.c_down_recv, .{ .routes = .{ .rx = .{NORTH}, .tx = .{RAMP} } });
+
+                @set_color_config(px, py, comm_odd_even.c_up_recv, .{ .routes = .{ .rx = .{SOUTH}, .tx = .{RAMP} } });
+                @set_color_config(px, py, comm_odd_even.c_up_send, .{ .routes = .{ .rx = .{RAMP}, .tx = .{NORTH} } });
+            }
+            
+        }
+
+        py = 1;
+        while (py < P) : (py += 2) {
+            
+            const quotient_y: i16 = @as(i16, math.floor_f16(@as(f16, py) / @as(f16, pe_num_p_group)));
+            const remainder_y: i16 = py - quotient_y * pe_num_p_group;
+
+            const reduce_2nd_params = comm.get_reduce_2nd_params(px, py, quotient_x, quotient_y);
+
+            @set_tile_code(px, py, "decode.csl", .{
+                .memcpy_params = memcpy_params,
+                .comm_params = @concat_structs(@concat_structs(comm_odd_odd, reduce_2nd_params), .{
+                    .up_bd_color = C_U_B, .down_bd_color = C_D_B,
+                    .left_bd_color = C_L_B, .right_bd_color = C_R_B,
+                }),
+                .P = P, .bsz = bsz, .dim_p_pe = dim_p_pe, .seq_len_p_pe = seq_len_p_pe, .ffn_dim_p_pe = ffn_dim_p_pe,
+                .pe_num_p_group = pe_num_p_group, .root_1st_phase = root_1st_phase, .root_2nd_phase = root_2nd_phase,
+            });
+
+            if (py == root_2nd_phase) {
+                @set_color_config(px, py, C_U_B, .{ .routes = .{ .rx = .{RAMP}, .tx = .{NORTH} } });
+                @set_color_config(px, py, C_D_B, .{ .routes = .{ .rx = .{RAMP}, .tx = .{SOUTH} } });
+            } else {
+                if (py == 0) {
+                    @set_color_config(px, py, C_U_B, .{ .routes = .{ .rx = .{SOUTH}, .tx = .{RAMP} } });
+                } else if (py == P-1) {
+                    @set_color_config(px, py, C_D_B, .{ .routes = .{ .rx = .{NORTH}, .tx = .{RAMP} } });
+                } else {
+                    if (py < root_2nd_phase) {
+                        @set_color_config(px, py, C_U_B, .{ .routes = .{ .rx = .{SOUTH}, .tx = .{RAMP, NORTH} } });
+                    } else { // py > root_2nd_phase
+                        @set_color_config(px, py, C_D_B, .{ .routes = .{ .rx = .{NORTH}, .tx = .{RAMP, SOUTH} } });
+                    }
+                }
+            }
+
+            if (px == root_2nd_phase) {
+                @set_color_config(px, py, C_L_B, .{ .routes = .{ .rx = .{RAMP}, .tx = .{WEST} } });
+                @set_color_config(px, py, C_R_B, .{ .routes = .{ .rx = .{RAMP}, .tx = .{EAST} } });
+            } else {
+                if (px == 0) {
+                    @set_color_config(px, py, C_L_B, .{ .routes = .{ .rx = .{EAST}, .tx = .{RAMP} } });
+                } else if (px == P-1) {
+                    @set_color_config(px, py, C_R_B, .{ .routes = .{ .rx = .{WEST}, .tx = .{RAMP} } });
+                } else {
+                    if (px < root_2nd_phase) {
+                        @set_color_config(px, py, C_L_B, .{ .routes = .{ .rx = .{EAST}, .tx = .{RAMP, WEST} } });
+                    } else { // px > root_2nd_phase
+                        @set_color_config(px, py, C_R_B, .{ .routes = .{ .rx = .{WEST}, .tx = .{RAMP, EAST} } });
+                    }
+                }
+            }
+
+            // Reduce along y-axis
+            if (remainder_y == root_1st_phase) {
+                @set_color_config(px, py, reduce_2nd_params.c_y_up_reduce_recv, .{ .routes = .{ .rx = .{SOUTH}, .tx = .{RAMP} } });
+                @set_color_config(px, py, reduce_2nd_params.c_y_up_reduce_send, .{ .routes = .{ .rx = .{RAMP}, .tx = .{NORTH} } });
+
+                @set_color_config(px, py, reduce_2nd_params.c_y_down_reduce_recv, .{ .routes = .{ .rx = .{NORTH}, .tx = .{RAMP} } });
+                @set_color_config(px, py, reduce_2nd_params.c_y_down_reduce_send, .{ .routes = .{ .rx = .{RAMP}, .tx = .{SOUTH} } });
+            } else {
+                @set_color_config(px, py, reduce_2nd_params.c_y_up_reduce_send, .{ .routes = .{ .rx = .{SOUTH}, .tx = .{NORTH} } });
+                @set_color_config(px, py, reduce_2nd_params.c_y_up_reduce_recv, .{ .routes = .{ .rx = .{SOUTH}, .tx = .{NORTH} } });
+
+                @set_color_config(px, py, reduce_2nd_params.c_y_down_reduce_send, .{ .routes = .{ .rx = .{NORTH}, .tx = .{SOUTH} } });
+                @set_color_config(px, py, reduce_2nd_params.c_y_down_reduce_recv, .{ .routes = .{ .rx = .{NORTH}, .tx = .{SOUTH} } });
+            }
+
+            // Reduce along x-axis
+            if (remainder_x == root_1st_phase) {
+                @set_color_config(px, py, reduce_2nd_params.c_x_left_reduce_recv, .{ .routes = .{ .rx = .{EAST}, .tx = .{RAMP} } });
+                @set_color_config(px, py, reduce_2nd_params.c_x_left_reduce_send, .{ .routes = .{ .rx = .{RAMP}, .tx = .{WEST} } });
+
+                @set_color_config(px, py, reduce_2nd_params.c_x_right_reduce_recv, .{ .routes = .{ .rx = .{WEST}, .tx = .{RAMP} } });
+                @set_color_config(px, py, reduce_2nd_params.c_x_right_reduce_send, .{ .routes = .{ .rx = .{RAMP}, .tx = .{EAST} } });
+            } else {
+                @set_color_config(px, py, reduce_2nd_params.c_x_left_reduce_send, .{ .routes = .{ .rx = .{EAST}, .tx = .{WEST} } });
+                @set_color_config(px, py, reduce_2nd_params.c_x_left_reduce_recv, .{ .routes = .{ .rx = .{EAST}, .tx = .{WEST} } });
+
+                @set_color_config(px, py, reduce_2nd_params.c_x_right_reduce_send, .{ .routes = .{ .rx = .{WEST}, .tx = .{EAST} } });
+                @set_color_config(px, py, reduce_2nd_params.c_x_right_reduce_recv, .{ .routes = .{ .rx = .{WEST}, .tx = .{EAST} } });
+            }
+
+            {
+                @set_color_config(px, py, comm_odd_odd.c_right_send, .{ .routes = .{ .rx = .{RAMP}, .tx = .{EAST} } });
+                @set_color_config(px, py, comm_odd_odd.c_right_recv, .{ .routes = .{ .rx = .{WEST}, .tx = .{RAMP} } });
+
+                @set_color_config(px, py, comm_odd_odd.c_left_recv, .{ .routes = .{ .rx = .{EAST}, .tx = .{RAMP} } });
+                @set_color_config(px, py, comm_odd_odd.c_left_send, .{ .routes = .{ .rx = .{RAMP}, .tx = .{WEST} } });
+
+                @set_color_config(px, py, comm_odd_odd.c_down_send, .{ .routes = .{ .rx = .{RAMP}, .tx = .{SOUTH} } });
+                @set_color_config(px, py, comm_odd_odd.c_down_recv, .{ .routes = .{ .rx = .{NORTH}, .tx = .{RAMP} } });
+
+                @set_color_config(px, py, comm_odd_odd.c_up_recv, .{ .routes = .{ .rx = .{SOUTH}, .tx = .{RAMP} } });
+                @set_color_config(px, py, comm_odd_odd.c_up_send, .{ .routes = .{ .rx = .{RAMP}, .tx = .{NORTH} } });
+            }
+
+        }
+    }
+
+    @export_name("X", [*]f16, true);
+    @export_name("W", [*]f16, true);
+    @export_name("Q_weight", [*]f16, true);
+    @export_name("K_weight", [*]f16, true);
+    @export_name("V_weight", [*]f16, true);
+    @export_name("freqs_sin", [*]f16, true);
+    @export_name("freqs_cos", [*]f16, true);
+    @export_name("XKCache", [*]f16, true);
+    @export_name("XVCache", [*]f16, true);
+    @export_name("O_weight", [*]f16, true);
+    @export_name("UP_weight", [*]f16, true);
+    @export_name("GATE_weight", [*]f16, true);
+    @export_name("DOWN_weight", [*]f16, true);
+
+    @export_name("init_task", fn()void);
+    @export_name("decode_host", fn(i16, i16)void);
+
+    @export_name("time_memcpy", [*]f32, true);
+    @export_name("time_ref", [*]f32, true);
+
+}

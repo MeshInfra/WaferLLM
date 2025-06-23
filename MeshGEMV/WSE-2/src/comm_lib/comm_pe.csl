@@ -154,7 +154,7 @@ fn init_(_px: i16, _py: i16) void {
     }
 }
 
-fn two_tree_allreduce_y(vector_buf_ptr: [*]f16) void {
+fn two-tree_allreduce_y(vector_buf_ptr: [*]f16) void {
 
     vector_buf_dsd = @set_dsd_base_addr(vector_buf_dsd, vector_buf_ptr);
     @load_to_dsr(vector_buf_dsr, vector_buf_dsd);

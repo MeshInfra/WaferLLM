@@ -74,7 +74,7 @@ fn mv_compute() void {
 
     @map(gemv_static_step, X_dsd);
 
-    comm_mod.two_tree_allreduce_y(ptr_res);
+    comm_mod.two-tree_allreduce_y(ptr_res);
     meshgemv_entry();
 }
 
