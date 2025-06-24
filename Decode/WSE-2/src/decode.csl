@@ -689,7 +689,7 @@ fn decode_struct() void {
     xq_matvec_mult();
     xk_matvec_mult();
     xv_matvec_mult();
-    // comm_mod.all_reduce_bsz_dim_QKV_fusion(py, quotient_y, remainder_y, ptr_QKV_tile);
+    comm_mod.two_tree_allreduce_add_y_bsz_dim_QKV_fusion(ptr_QKV_tile);
 
     xq_rope();
     xk_rope();
@@ -708,7 +708,7 @@ fn decode_struct() void {
 
     up_matvec_mult();
     gate_matvec_mult();
-    // comm_mod.all_reduce_bsz_ffn_dim_ZZ_fusion(py, quotient_y, remainder_y, ptr_ZZ_tile);
+    comm_mod.two_tree_allreduce_add_y_bsz_ffn_dim_ZZ_fusion(ptr_ZZ_tile);
 
     z2_silu();
 
