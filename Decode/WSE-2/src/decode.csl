@@ -28,11 +28,6 @@ const comm_mod = @import_module("comm_lib/comm_pe.csl", @concat_structs(comm_par
 var px: i16 = 0;
 var py: i16 = 0;
 
-var quotient_x: i16 = 0;
-var remainder_x: i16 = 0;
-var quotient_y: i16 = 0;
-var remainder_y: i16 = 0;
-
 const timestamp = @import_module("<time>");
 // starting time of H2D/D2H
 var tscStartBuffer = @zeros([timestamp.tsc_size_words]u16);
@@ -51,12 +46,6 @@ fn init_task() void {
 
     px = @as(i16, layout_mod.get_x_coord());
     py = @as(i16, layout_mod.get_y_coord());
-
-    // quotient_x = @as(i16, math_lib.floor_f16(@as(f16, px) / @as(f16, pe_num_p_group)));
-    // remainder_x = px - quotient_x * pe_num_p_group;
-
-    // quotient_y = @as(i16, math_lib.floor_f16(@as(f16, py) / @as(f16, pe_num_p_group)));
-    // remainder_y = py - quotient_y * pe_num_p_group;
 
     comm_mod.init_(px, py);
 
@@ -339,7 +328,6 @@ fn xq_matvec_mult() void {
 
     ptr_right_matrix = &Q_weight_tile;
 
-    // out_vector_dsd = @set_dsd_base_addr(out_vector_dsd, ptr_Q);
     out_vector_dsd = @set_dsd_base_addr(out_vector_dsd, ptr_QKV_tile);
 
     Kt = dim_p_pe;
@@ -347,7 +335,6 @@ fn xq_matvec_mult() void {
 
     vecmat_computation();
 
-    // comm_mod.two_tree_allreduce_add_y_bsz_dim(ptr_Q);
 }
 
 fn xk_matvec_mult() void {
@@ -357,7 +344,6 @@ fn xk_matvec_mult() void {
 
     ptr_right_matrix = &K_weight_tile;
 
-    // out_vector_dsd = @set_dsd_base_addr(out_vector_dsd, ptr_K);
     out_vector_dsd = @set_dsd_base_addr(out_vector_dsd, ptr_QKV_tile);
     out_vector_dsd = @increment_dsd_offset(out_vector_dsd, bsz*dim_p_pe, f16);
 
@@ -366,7 +352,6 @@ fn xk_matvec_mult() void {
 
     vecmat_computation();
 
-    // comm_mod.all_reduce_bsz_dim(ptr_K);
 }
 
 fn xv_matvec_mult() void {
@@ -376,7 +361,6 @@ fn xv_matvec_mult() void {
 
     ptr_right_matrix = &V_weight_tile;
 
-    // out_vector_dsd = @set_dsd_base_addr(out_vector_dsd, ptr_V);
     out_vector_dsd = @set_dsd_base_addr(out_vector_dsd, ptr_QKV_tile);
     out_vector_dsd = @increment_dsd_offset(out_vector_dsd, 2*bsz*dim_p_pe, f16);
 
@@ -385,7 +369,6 @@ fn xv_matvec_mult() void {
 
     vecmat_computation();
 
-    // comm_mod.all_reduce_bsz_dim(ptr_V);
 }
 
 fn xq_rope() void {
@@ -609,7 +592,6 @@ fn up_matvec_mult() void {
     
     ptr_right_matrix = &UP_weight_tile;
 
-    // out_vector_dsd = @set_dsd_base_addr(out_vector_dsd, ptr_z1);
     out_vector_dsd = @set_dsd_base_addr(out_vector_dsd, ptr_ZZ_tile);
 
     Kt = dim_p_pe;
@@ -617,7 +599,6 @@ fn up_matvec_mult() void {
 
     vecmat_computation();
 
-    // comm_mod.two_tree_allreduce_add_y_bsz_ffn_dim(ptr_z1);
 }
 
 fn gate_matvec_mult() void {
@@ -627,7 +608,6 @@ fn gate_matvec_mult() void {
     
     ptr_right_matrix = &GATE_weight_tile;
 
-    // out_vector_dsd = @set_dsd_base_addr(out_vector_dsd, ptr_z2);
     out_vector_dsd = @set_dsd_base_addr(out_vector_dsd, ptr_ZZ_tile);
     out_vector_dsd = @increment_dsd_offset(out_vector_dsd, bsz * ffn_dim_p_pe, f16);
 
@@ -636,7 +616,6 @@ fn gate_matvec_mult() void {
 
     vecmat_computation();
 
-    // comm_mod.two_tree_allreduce_add_y_bsz_ffn_dim(ptr_z2);
 }
 
 fn silu_kernel(val: f16) f16 {
