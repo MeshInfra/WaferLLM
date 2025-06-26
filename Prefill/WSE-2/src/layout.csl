@@ -8,6 +8,8 @@ param ffn_dim_p_pe: i16;
 
 const root: i16 = P / 2;
 
+const LAUNCH: color = @get_color(0);
+
 const C_R_0: color = @get_color(1);
 const C_R_1: color = @get_color(2);
 const C_L_0: color = @get_color(3);

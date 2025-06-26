@@ -267,3 +267,6 @@ def main():
     freq_ghz = 1.1
     time = (max_time_end - min_time_start) / total_repeat_times / (freq_ghz*1e6)
     print(f"Time: {time} ms")
+    
+if __name__ == "__main__":
+    main()
