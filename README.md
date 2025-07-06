@@ -61,10 +61,10 @@ We provide two main execution scripts for each module:
 
 Each module has specific parameters that can be configured. Please refer to the individual README files in each module directory:
 
-- [MeshGEMV/README.md](https://claude.ai/chat/MeshGEMV/README.md) - Matrix-vector multiplication parameters
-- [MeshGEMM/README.md](https://claude.ai/chat/MeshGEMM/README.md) - Matrix-matrix multiplication parameters
-- [Prefill/README.md](https://claude.ai/chat/Prefill/README.md) - Prefill phase configuration
-- [Decode/README.md](https://claude.ai/chat/Decode/README.md) - Decode phase configuration
+- [MeshGEMV/README.md](./MeshGEMV/README.md) - Matrix-vector multiplication parameters
+- [MeshGEMM/README.md](./MeshGEMM/README.md) - Matrix-matrix multiplication parameters
+- [Prefill/README.md](./Prefill/README.md) - Prefill phase configuration
+- [Decode/README.md](./Decode/README.md) - Decode phase configuration
 
 ### Communication Library
 
