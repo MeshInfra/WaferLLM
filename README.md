@@ -99,7 +99,7 @@ If you use WaferLLM in your research, please cite:
 
 ## License
 
-This project is licensed under the GNU General Public License v3.0 - see the [LICENSE](https://claude.ai/chat/LICENSE) file for details.
+This project is licensed under the Apache License 2.0 - see the [LICENSE](./LICENSE) file for details.
 
 ## Contact
 
@@ -107,4 +107,4 @@ For questions and support, please open an issue on GitHub or contact the authors
 
 ## Acknowledgments
 
-We thank the Cerebras team for their support and access to the WSE-2 hardware platform.
+This work is made possible through funding, hardware, and technical support from the University of Edinburgh, the Edinburgh International Data Facility (EIDF), the Edinburgh Parallel Computing Centre (EPCC), and the Cerebras teams.
