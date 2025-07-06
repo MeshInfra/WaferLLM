@@ -1,0 +1,192 @@
+param P: i16;
+param Mt: i16;
+param Kt: i16;
+param Nt: i16;
+
+var px: i16 = 0;
+var py: i16 = 0;
+
+const _Mt_Kt: i16 = ((Mt * Kt) / 2) * 2;
+const _Kt_Nt: i16 = ((Kt * Nt) / 2) * 2;
+
+param x_send_color: color;
+param x_recv_color: color;
+param x_tran_color: color;
+
+param x_shift_send_color: color;
+param x_shift_recv_color: color;
+param x_shift_tran_color: color;
+
+param x_shift_re_send_color: color;
+param x_shift_re_recv_color: color;
+param x_shift_re_tran_color: color;
+
+param y_send_color: color;
+param y_recv_color: color;
+param y_tran_color: color;
+
+const x_out_dsr = @get_dsr(dsr_dest, 2);
+const x_in_dsr = @get_dsr(dsr_src1, 2);
+
+const y_out_dsr = @get_dsr(dsr_dest, 3);
+const y_in_dsr = @get_dsr(dsr_src1, 3);
+
+const x_shift_out_dsr = @get_dsr(dsr_dest, 4);
+const x_shift_in_dsr = @get_dsr(dsr_src1, 4);
+
+const x_shift_re_out_dsr = @get_dsr(dsr_dest, 5);
+const x_shift_re_in_dsr = @get_dsr(dsr_src1, 5);
+
+const left_send_dsr = @get_dsr(dsr_src1, 6);
+const left_recv_dsr = @get_dsr(dsr_dest, 6);
+
+const right_send_dsr = @get_dsr(dsr_src1, 7);
+const right_recv_dsr = @get_dsr(dsr_dest, 7);
+
+const x_shift_finish_id: local_task_id = @get_local_task_id(25);
+
+param x_finish_id: local_task_id;
+param y_finish_id: local_task_id;
+param left_matrix_shift_callback: fn ()void;
+
+// MeshGEMM two-hop communication
+const x_in_dsd = @get_dsd(fabin_dsd, .{
+    .fabric_color = x_recv_color, .extent = _Mt_Kt,
+    .input_queue = @get_input_queue(1),
+    .simd_mode = .{ .simd_64 = true }
+});
+const x_out_dsd = @get_dsd(fabout_dsd, .{
+    .fabric_color = x_send_color, .extent = _Mt_Kt,
+    .output_queue = @get_output_queue(3),
+    .simd_mode = .{ .simd_64 = true }
+});
+
+const y_in_dsd = @get_dsd(fabin_dsd, .{
+    .fabric_color = y_recv_color, .extent = _Kt_Nt,
+    .input_queue = @get_input_queue(4),
+    .simd_mode = .{ .simd_64 = true }
+});
+const y_out_dsd = @get_dsd(fabout_dsd, .{
+    .fabric_color = y_send_color, .extent = _Kt_Nt,
+    .output_queue = @get_output_queue(2),
+    .simd_mode = .{ .simd_64 = true }
+});
+
+// non-reverse
+const x_shift_in_dsd = @get_dsd(fabin_dsd, .{
+    .fabric_color = x_shift_recv_color, .extent = _Mt_Kt,
+    .input_queue = @get_input_queue(2),
+    .simd_mode = .{ .simd_64 = true }
+});
+const x_shift_out_dsd = @get_dsd(fabout_dsd, .{
+    .fabric_color = x_shift_send_color, .extent = _Mt_Kt,
+    .output_queue = @get_output_queue(3),
+    .simd_mode = .{ .simd_64 = true }
+});
+
+// reverse
+const x_shift_re_in_dsd = @get_dsd(fabin_dsd, .{
+    .fabric_color = x_shift_re_recv_color, .extent = _Kt_Nt,
+    .input_queue = @get_input_queue(2),
+    .simd_mode = .{ .simd_64 = true }
+});
+const x_shift_re_out_dsd = @get_dsd(fabout_dsd, .{
+    .fabric_color = x_shift_re_send_color, .extent = _Kt_Nt,
+    .output_queue = @get_output_queue(3),
+    .simd_mode = .{ .simd_64 = true }
+});
+
+const dummy = @zeros([1]f16);
+
+var left_matrix_send_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{_Mt_Kt} -> dummy[i] });
+var right_matrix_send_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{_Kt_Nt} -> dummy[i] });
+
+var left_matrix_recv_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{_Mt_Kt} -> dummy[i] });
+var right_matrix_recv_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{_Kt_Nt} -> dummy[i] });
+
+fn init_(_px: i16, _py: i16) void {
+    px = _px;
+    py = _py;
+}
+
+task x_shift_finish() void {
+    @block(x_shift_finish_id);
+    left_matrix_shift_callback();
+}
+
+comptime {
+    @load_to_dsr(x_shift_out_dsr, x_shift_out_dsd, .{.async=true, .unblock=x_shift_finish_id});
+    @load_to_dsr(x_shift_re_out_dsr, x_shift_re_out_dsd, .{.async=true, .unblock=x_shift_finish_id});
+}
+
+
+fn left_matrix_shift(left_matrix_send_buffer_ptr: [*]f16, left_matrix_recv_buffer_ptr: [*]f16) void {
+
+    left_matrix_send_dsd = @set_dsd_base_addr(left_matrix_send_dsd, left_matrix_send_buffer_ptr);
+    left_matrix_recv_dsd = @set_dsd_base_addr(left_matrix_recv_dsd, left_matrix_recv_buffer_ptr);
+
+    @load_to_dsr(left_send_dsr, left_matrix_send_dsd);
+    @load_to_dsr(left_recv_dsr, left_matrix_recv_dsd);
+
+    @mov16(x_shift_out_dsr, left_send_dsr, .{.async=true, .unblock=x_shift_finish_id});
+    @mov16(left_recv_dsr, x_shift_in_dsd, .{.async=true, .activate=x_shift_finish_id});
+
+}
+
+fn left_matrix_shift_reverse(left_matrix_send_buffer_ptr: [*]f16, left_matrix_recv_buffer_ptr: [*]f16) void {
+
+    left_matrix_send_dsd = @set_dsd_base_addr(left_matrix_send_dsd, left_matrix_send_buffer_ptr);
+    left_matrix_recv_dsd = @set_dsd_base_addr(left_matrix_recv_dsd, left_matrix_recv_buffer_ptr);
+
+    @load_to_dsr(left_send_dsr, left_matrix_send_dsd);
+    @load_to_dsr(left_recv_dsr, left_matrix_recv_dsd);
+
+    @mov16(x_shift_re_out_dsr, left_send_dsr, .{.async=true, .unblock=x_shift_finish_id});
+    @mov16(left_recv_dsr, x_shift_re_in_dsd, .{.async=true, .activate=x_shift_finish_id});
+}
+
+comptime {
+    @initialize_queue(@get_input_queue(1), .{.color = x_recv_color});
+    @initialize_queue(@get_input_queue(4), .{.color = y_recv_color});
+
+    @load_to_dsr(x_in_dsr, x_in_dsd, .{.async=true, .activate=x_finish_id});
+    @load_to_dsr(x_out_dsr, x_out_dsd, .{.async=true, .unblock=x_finish_id});
+
+    @load_to_dsr(y_in_dsr, y_in_dsd, .{.async=true, .activate=y_finish_id});
+    @load_to_dsr(y_out_dsr, y_out_dsd, .{.async=true, .unblock=y_finish_id});
+}
+
+fn two_hop_comm(left_matrix_send_buffer_ptr: [*]f16, right_matrix_send_buffer_ptr: [*]f16, left_matrix_recv_buffer_ptr: [*]f16, right_matrix_recv_buffer_ptr: [*]f16) void {
+
+    left_matrix_send_dsd = @set_dsd_base_addr(left_matrix_send_dsd, left_matrix_send_buffer_ptr);
+
+    right_matrix_send_dsd = @set_dsd_base_addr(right_matrix_send_dsd, right_matrix_send_buffer_ptr);
+
+    left_matrix_recv_dsd = @set_dsd_base_addr(left_matrix_recv_dsd, left_matrix_recv_buffer_ptr);
+
+    right_matrix_recv_dsd = @set_dsd_base_addr(right_matrix_recv_dsd, right_matrix_recv_buffer_ptr);
+    
+    @load_to_dsr(left_send_dsr, left_matrix_send_dsd);
+    @load_to_dsr(left_recv_dsr, left_matrix_recv_dsd);
+    @load_to_dsr(right_send_dsr, right_matrix_send_dsd);
+    @load_to_dsr(right_recv_dsr, right_matrix_recv_dsd);
+
+    @mov16(x_out_dsr, left_send_dsr, .{.async=true, .unblock=x_finish_id});
+    @mov16(left_recv_dsr, x_in_dsr, .{.async=true, .activate=x_finish_id});
+
+    @mov16(y_out_dsr, right_send_dsr, .{.async=true, .unblock=y_finish_id});
+    @mov16(right_recv_dsr, y_in_dsr, .{.async=true, .activate=y_finish_id});
+
+    return;
+}
+
+comptime {
+
+    @block(x_recv_color);
+    @block(y_recv_color);
+    @block(x_shift_recv_color);
+    @block(x_shift_re_recv_color);
+
+    @bind_local_task(x_shift_finish, x_shift_finish_id);
+    @block(x_shift_finish_id);
+}

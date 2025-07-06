@@ -1,0 +1,138 @@
+param P: i16;
+param Mt: i16;
+param Kt: i16;
+param Nt: i16;
+
+const LAUNCH: color = @get_color(0);
+
+const X_0: color = @get_color(9);
+const X_1: color = @get_color(10);
+const X_2: color = @get_color(11);
+
+const Y_0: color = @get_color(12);
+const Y_1: color = @get_color(13);
+const Y_2: color = @get_color(14);
+
+const X_shift_re_0: color = @get_color(15);
+const X_shift_re_1: color = @get_color(16);
+const X_shift_re_2: color = @get_color(17);
+
+const X_shift_0: color = @get_color(18);
+const X_shift_1: color = @get_color(19);
+const X_shift_2: color = @get_color(20);
+
+const memcpy = @import_module( "<memcpy/get_params>", .{
+    .width = P,
+    .height = P,
+    .LAUNCH = LAUNCH
+});
+
+const comm = @import_module("comm_lib/comm_layout.csl", .{
+    .P = P,
+    .x_interleave = [3]color{X_0, X_1, X_2},
+    .x_shift_interleave = [3]color{X_shift_0, X_shift_1, X_shift_2},
+    .x_shift_re_interleave = [3]color{X_shift_re_0, X_shift_re_1, X_shift_re_2},
+    .y_interleave = [3]color{Y_0, Y_1, Y_2},
+});
+
+layout {
+    @set_rectangle(P, P);
+
+    var px: i16 = 0;
+    var py: i16 = 0;
+
+    while (px < P) : (px += 1) {
+        const memcpy_params = memcpy.get_params(px);
+
+        py = 0;
+        while (py < P) : (py += 1) {
+            const comm_params = comm.get_params(px, py);
+            @set_tile_code(px, py, "meshgemm.csl", .{
+                .memcpy_params = memcpy_params,
+                .comm_params = comm_params,
+                .P = P, .Mt = Mt, .Kt = Kt, .Nt = Nt
+            });
+
+            {
+                if (px == 0) {
+                    @set_color_config(px, py, comm_params.x_recv_color, .{ .routes = .{ .rx = .{EAST}, .tx = .{RAMP} } });
+                    @set_color_config(px, py, comm_params.x_send_color, .{ .routes = .{ .rx = .{RAMP}, .tx = .{EAST} } });
+
+                    @set_color_config(px, py, comm_params.x_shift_recv_color, .{ .routes = .{ .rx = .{EAST}, .tx = .{RAMP} } });
+                    @set_color_config(px, py, comm_params.x_shift_send_color, .{ .routes = .{ .rx = .{RAMP}, .tx = .{EAST} } });
+
+                    @set_color_config(px, py, comm_params.x_shift_re_recv_color, .{ .routes = .{ .rx = .{EAST}, .tx = .{RAMP} } });
+                    @set_color_config(px, py, comm_params.x_shift_re_send_color, .{ .routes = .{ .rx = .{RAMP}, .tx = .{EAST} } });
+                } else if (px == P-1) {
+                    @set_color_config(px, py, comm_params.x_recv_color, .{ .routes = .{ .rx = .{WEST}, .tx = .{RAMP} } });
+                    @set_color_config(px, py, comm_params.x_send_color, .{ .routes = .{ .rx = .{RAMP}, .tx = .{WEST} } });
+
+                    @set_color_config(px, py, comm_params.x_shift_recv_color, .{ .routes = .{ .rx = .{WEST}, .tx = .{RAMP} } });
+                    @set_color_config(px, py, comm_params.x_shift_send_color, .{ .routes = .{ .rx = .{RAMP}, .tx = .{WEST} } });
+
+                    @set_color_config(px, py, comm_params.x_shift_re_recv_color, .{ .routes = .{ .rx = .{WEST}, .tx = .{RAMP} } });
+                    @set_color_config(px, py, comm_params.x_shift_re_send_color, .{ .routes = .{ .rx = .{RAMP}, .tx = .{WEST} } });
+                } else {
+                    if (px % 2 == 0) {
+                        @set_color_config(px, py, comm_params.x_recv_color, .{ .routes = .{ .rx = .{WEST}, .tx = .{RAMP} } });
+                        @set_color_config(px, py, comm_params.x_send_color, .{ .routes = .{ .rx = .{RAMP}, .tx = .{EAST} } });
+                        @set_color_config(px, py, comm_params.x_tran_color, .{ .routes = .{ .rx = .{EAST}, .tx = .{WEST} } });
+
+                        @set_color_config(px, py, comm_params.x_shift_recv_color, .{ .routes = .{ .rx = .{WEST}, .tx = .{RAMP} } });
+                        @set_color_config(px, py, comm_params.x_shift_send_color, .{ .routes = .{ .rx = .{RAMP}, .tx = .{EAST} } });
+                        @set_color_config(px, py, comm_params.x_shift_tran_color, .{ .routes = .{ .rx = .{EAST}, .tx = .{WEST} } });
+
+                        @set_color_config(px, py, comm_params.x_shift_re_recv_color, .{ .routes = .{ .rx = .{EAST}, .tx = .{RAMP} } });
+                        @set_color_config(px, py, comm_params.x_shift_re_send_color, .{ .routes = .{ .rx = .{RAMP}, .tx = .{WEST} } });
+                        @set_color_config(px, py, comm_params.x_shift_re_tran_color, .{ .routes = .{ .rx = .{WEST}, .tx = .{EAST} } });
+                    } else {
+                        @set_color_config(px, py, comm_params.x_recv_color, .{ .routes = .{ .rx = .{EAST}, .tx = .{RAMP} } });
+                        @set_color_config(px, py, comm_params.x_send_color, .{ .routes = .{ .rx = .{RAMP}, .tx = .{WEST} } });
+                        @set_color_config(px, py, comm_params.x_tran_color, .{ .routes = .{ .rx = .{WEST}, .tx = .{EAST} } });
+
+                        @set_color_config(px, py, comm_params.x_shift_recv_color, .{ .routes = .{ .rx = .{EAST}, .tx = .{RAMP} } });
+                        @set_color_config(px, py, comm_params.x_shift_send_color, .{ .routes = .{ .rx = .{RAMP}, .tx = .{WEST} } });
+                        @set_color_config(px, py, comm_params.x_shift_tran_color, .{ .routes = .{ .rx = .{WEST}, .tx = .{EAST} } });
+
+                        @set_color_config(px, py, comm_params.x_shift_re_recv_color, .{ .routes = .{ .rx = .{WEST}, .tx = .{RAMP} } });
+                        @set_color_config(px, py, comm_params.x_shift_re_send_color, .{ .routes = .{ .rx = .{RAMP}, .tx = .{EAST} } });
+                        @set_color_config(px, py, comm_params.x_shift_re_tran_color, .{ .routes = .{ .rx = .{EAST}, .tx = .{WEST} } });
+                    }
+                }
+
+                if (py == 0) {
+                    @set_color_config(px, py, comm_params.y_recv_color, .{ .routes = .{ .rx = .{SOUTH}, .tx = .{RAMP} } });
+                    @set_color_config(px, py, comm_params.y_send_color, .{ .routes = .{ .rx = .{RAMP}, .tx = .{SOUTH} } });
+                } else if (py == P-1) {
+                    @set_color_config(px, py, comm_params.y_recv_color, .{ .routes = .{ .rx = .{NORTH}, .tx = .{RAMP} } });
+                    @set_color_config(px, py, comm_params.y_send_color, .{ .routes = .{ .rx = .{RAMP}, .tx = .{NORTH} } });
+                } else {
+                    if (py % 2 == 0) {
+                        @set_color_config(px, py, comm_params.y_recv_color, .{ .routes = .{ .rx = .{NORTH}, .tx = .{RAMP} } });
+                        @set_color_config(px, py, comm_params.y_send_color, .{ .routes = .{ .rx = .{RAMP}, .tx = .{SOUTH} } });
+                        @set_color_config(px, py, comm_params.y_tran_color, .{ .routes = .{ .rx = .{SOUTH}, .tx = .{NORTH} } });
+                    } else {
+                        @set_color_config(px, py, comm_params.y_recv_color, .{ .routes = .{ .rx = .{SOUTH}, .tx = .{RAMP} } });
+                        @set_color_config(px, py, comm_params.y_send_color, .{ .routes = .{ .rx = .{RAMP}, .tx = .{NORTH} } });
+                        @set_color_config(px, py, comm_params.y_tran_color, .{ .routes = .{ .rx = .{NORTH}, .tx = .{SOUTH} } });
+                    }
+                }
+            }
+        }
+    }
+
+    @export_name("X", [*]f16, true);
+    @export_name("W", [*]f16, true);
+    @export_name("res", [*]f16, true);
+
+    @export_name("init_task", fn()void);
+    @export_name("meshgemm_entry", fn()void);
+    @export_name("meshgemm_host", fn(i16, i16)void);
+
+    @export_name("time_memcpy", [*]f32, true);
+    @export_name("time_ref", [*]f32, true);
+    
+    
+    @export_name("f_memcpy_timestamps", fn()void);
+    @export_name("f_reference_timestamps", fn()void);
+}

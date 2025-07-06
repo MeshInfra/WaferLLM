@@ -1,0 +1,127 @@
+param P: i16;
+
+param x_colors: [4]color;
+param y_colors: [4]color;
+
+param y_reduce_colors: [4]color;
+param x_reduce_colors: [4]color;
+
+const C_right_0: color = x_colors[0];
+const C_right_1: color = x_colors[1];
+const C_left_0: color = x_colors[2];
+const C_left_1: color = x_colors[3];
+
+const C_down_0: color = y_colors[0];
+const C_down_1: color = y_colors[1];
+const C_up_0: color = y_colors[2];
+const C_up_1: color = y_colors[3];
+
+const C_y_up_reduce_0: color = y_reduce_colors[0];
+const C_y_up_reduce_1: color = y_reduce_colors[1];
+const C_y_down_reduce_0: color = y_reduce_colors[2];
+const C_y_down_reduce_1: color = y_reduce_colors[3];
+
+const C_x_left_reduce_0: color = x_reduce_colors[0];
+const C_x_left_reduce_1: color = x_reduce_colors[1];
+const C_x_right_reduce_0: color = x_reduce_colors[2];
+const C_x_right_reduce_1: color = x_reduce_colors[3];
+
+fn get_step_params(is_px_even: bool, is_py_even: bool) comptime_struct {
+
+    var c_right_recv: color = C_right_0;
+    var c_right_send: color = C_right_1;
+
+    var c_left_recv: color = C_left_0;
+    var c_left_send: color = C_left_1;
+
+    if (is_px_even){
+        c_right_recv = C_right_0;
+        c_right_send = C_right_1;
+
+        c_left_recv = C_left_0;
+        c_left_send = C_left_1;
+    }else{
+        c_right_recv = C_right_1;
+        c_right_send = C_right_0;
+
+        c_left_recv = C_left_1;
+        c_left_send = C_left_0;
+    }
+
+    var c_down_recv: color = C_down_0;
+    var c_down_send: color = C_down_1;
+
+    var c_up_recv: color = C_up_0;
+    var c_up_send: color = C_up_1;
+
+    if (is_py_even){
+        c_down_recv = C_down_0;
+        c_down_send = C_down_1;
+
+        c_up_recv = C_up_0;
+        c_up_send = C_up_1;
+    } else {
+        c_down_recv = C_down_1;
+        c_down_send = C_down_0;
+
+        c_up_recv = C_up_1;
+        c_up_send = C_up_0;
+    }
+
+    return .{
+        .c_right_recv = c_right_recv,
+        .c_right_send = c_right_send,
+        .c_left_recv = c_left_recv,
+        .c_left_send = c_left_send,
+
+        .c_down_recv = c_down_recv,
+        .c_down_send = c_down_send,
+        .c_up_recv = c_up_recv,
+        .c_up_send = c_up_send,
+    };
+}
+
+fn get_reduce_2nd_params(px: i16, py: i16, quotient_x: i16, quotient_y: i16) comptime_struct {
+
+    var c_y_up_reduce_send: color = C_y_up_reduce_1;
+    var c_y_up_reduce_recv: color = C_y_up_reduce_0;
+
+    var c_y_down_reduce_send: color = C_y_down_reduce_1;
+    var c_y_down_reduce_recv: color = C_y_down_reduce_0;
+
+    if (quotient_y % 2 == 0){
+        c_y_up_reduce_send = C_y_up_reduce_0;
+        c_y_up_reduce_recv = C_y_up_reduce_1;
+
+        c_y_down_reduce_send = C_y_down_reduce_0;
+        c_y_down_reduce_recv = C_y_down_reduce_1;
+    }
+
+    var c_x_left_reduce_send: color = C_x_left_reduce_1;
+    var c_x_left_reduce_recv: color = C_x_left_reduce_0;
+
+    var c_x_right_reduce_send: color = C_x_right_reduce_1;
+    var c_x_right_reduce_recv: color = C_x_right_reduce_0;
+
+    if (quotient_x % 2 == 0){
+        c_x_left_reduce_send = C_x_left_reduce_0;
+        c_x_left_reduce_recv = C_x_left_reduce_1;
+
+        c_x_right_reduce_send = C_x_right_reduce_0;
+        c_x_right_reduce_recv = C_x_right_reduce_1;
+    }
+
+    return .{
+        .c_y_up_reduce_send = c_y_up_reduce_send,
+        .c_y_up_reduce_recv = c_y_up_reduce_recv,
+
+        .c_y_down_reduce_send = c_y_down_reduce_send,
+        .c_y_down_reduce_recv = c_y_down_reduce_recv,
+
+        .c_x_left_reduce_send = c_x_left_reduce_send,
+        .c_x_left_reduce_recv = c_x_left_reduce_recv,
+
+        .c_x_right_reduce_send = c_x_right_reduce_send,
+        .c_x_right_reduce_recv = c_x_right_reduce_recv,
+    };
+}

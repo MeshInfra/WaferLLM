@@ -1,0 +1,11 @@
+{
+    "P": 8,
+    "group_num": 2,
+    "bsz": 1,
+    "dim": 64,
+    "n_heads": 1,
+    "n_kv_heads": 1,
+    "head_dim": 64,
+    "seq_len": 64,
+    "ffn_dim": 64
+}

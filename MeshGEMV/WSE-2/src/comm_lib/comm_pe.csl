@@ -1,0 +1,219 @@
+param P: i16;
+param Mt: i16;
+param Nt: i16;
+
+const math = @import_module("<math>");
+
+var px: i16 = 0;
+var py: i16 = 0;
+
+param pe_num_group: i16;
+param root_1st_phase: i16;
+param root_2nd_phase: i16;
+
+var is_first_py: bool = false;
+var is_last_py: bool = false;
+
+// For broadcast in y-axis
+param c_down_recv: color;
+param c_down_send: color;
+param c_up_recv: color;
+param c_up_send: color;
+
+param up_bd_color: color;
+param down_bd_color: color;
+
+param c_y_up_reduce_send: color;
+param c_y_up_reduce_recv: color;
+
+param c_y_down_reduce_send: color;
+param c_y_down_reduce_recv: color;
+
+const mv_down_send = @get_dsd(fabout_dsd, .{
+    .extent = Nt,
+    .fabric_color = c_down_send,
+    .simd_mode = .{ .simd_32 = true },
+});
+
+const mv_down_recv = @get_dsd(fabin_dsd, .{
+    .extent = Nt,
+    .fabric_color = c_down_recv,
+    .simd_mode = .{ .simd_32 = true },
+});
+
+const mv_up_send = @get_dsd(fabout_dsd, .{
+    .extent = Nt,
+    .fabric_color = c_up_send,
+    .simd_mode = .{ .simd_32 = true },
+});
+
+const mv_up_recv = @get_dsd(fabin_dsd, .{
+    .extent = Nt,
+    .fabric_color = c_up_recv,
+    .simd_mode = .{ .simd_32 = true },
+});
+
+const up_reduce_send = @get_dsd(fabout_dsd, .{
+    .extent = Nt,
+    .fabric_color = c_y_up_reduce_send,
+    .simd_mode = .{ .simd_32 = true },
+});
+
+const up_reduce_recv = @get_dsd(fabin_dsd, .{
+    .extent = Nt,
+    .fabric_color = c_y_up_reduce_recv,
+    .simd_mode = .{ .simd_32 = true },
+});
+
+const down_reduce_send = @get_dsd(fabout_dsd, .{
+    .extent = Nt,
+    .fabric_color = c_y_down_reduce_send,
+    .simd_mode = .{ .simd_32 = true },
+});
+
+const down_reduce_recv = @get_dsd(fabin_dsd, .{
+    .extent = Nt,
+    .fabric_color = c_y_down_reduce_recv,
+    .simd_mode = .{ .simd_32 = true },
+});
+
+// For directly broadcast in y-axis
+const up_bd_send = @get_dsd(fabout_dsd, .{
+    .extent = Nt,
+    .fabric_color = up_bd_color,
+    .simd_mode = .{ .simd_32 = true },
+});
+
+const up_bd_recv = @get_dsd(fabin_dsd, .{
+    .extent = Nt,
+    .fabric_color = up_bd_color,
+    .simd_mode = .{ .simd_32 = true },
+});
+
+const down_bd_send = @get_dsd(fabout_dsd, .{
+    .extent = Nt,
+    .fabric_color = down_bd_color,
+    .simd_mode = .{ .simd_32 = true },
+});
+
+const down_bd_recv = @get_dsd(fabin_dsd, .{
+    .extent = Nt,
+    .fabric_color = down_bd_color,
+    .simd_mode = .{ .simd_32 = true },
+});
+
+const dummy = @zeros([1]f16);
+
+var vector_buf_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Nt} -> dummy[i] });
+const vector_buf_dsr = @get_dsr(dsr_src1, 2);
+
+var is_group_first_py: bool = false;
+var is_group_last_py: bool = false;
+var is_group_root_py: bool = false;
+
+var is_top_half_py: bool = false;
+var is_bottom_half_py: bool = false;
+
+var is_first_group_py: bool = false;
+var is_last_group_py: bool = false;
+
+fn init_(_px: i16, _py: i16) void {
+    px = _px;
+    py = _py;
+
+    if (py == 0) {
+        is_first_py = true;
+    } else if (py == P-1) {
+        is_last_py = true;
+    }
+
+    var remainder_y: i16 = py - @as(i16, math.floor_f16(@as(f16, py) / @as(f16, pe_num_group))) * pe_num_group;
+
+    if (remainder_y == 0) {
+        is_group_first_py = true;
+    }
+    
+    if (remainder_y == pe_num_group - 1) {
+        is_group_last_py = true;
+    } 
+    
+    if (remainder_y == root_1st_phase) {
+        is_group_root_py = true;
+    } else if (remainder_y < root_1st_phase) {
+        is_top_half_py = true;
+    } else {
+        is_bottom_half_py = true;
+    }
+
+    if (py < pe_num_group) {
+        is_first_group_py = true;
+    } 
+    
+    if (py > P - pe_num_group - 1) {
+        is_last_group_py = true;
+    }
+}
+
+fn two-tree_allreduce_y(vector_buf_ptr: [*]f16) void {
+
+    vector_buf_dsd = @set_dsd_base_addr(vector_buf_dsd, vector_buf_ptr);
+    @load_to_dsr(vector_buf_dsr, vector_buf_dsd);
+
+    // The first phase reduce
+    if (is_group_root_py) {
+        if (!is_group_last_py) {
+            @faddh(vector_buf_dsd, mv_up_recv, vector_buf_dsr);
+        } 
+        @faddh(vector_buf_dsd, mv_down_recv, vector_buf_dsr);
+    } else if (is_group_first_py) {
+        @fmovh(mv_down_send, vector_buf_dsr);
+    } else if (is_group_last_py) {
+        @fmovh(mv_up_send, vector_buf_dsr);
+    } else {
+        if (is_top_half_py) {
+            @faddh(mv_down_send, mv_down_recv, vector_buf_dsr);
+        } else {
+            @faddh(mv_up_send, mv_up_recv, vector_buf_dsr);
+        }
+    }
+
+    // The second phase reduce
+    if (py == root_2nd_phase) {
+        if (!is_last_group_py) {
+            @faddh(vector_buf_dsd, up_reduce_recv, vector_buf_dsr);
+        }
+        @faddh(vector_buf_dsd, down_reduce_recv, vector_buf_dsd);
+    } else if (is_group_root_py) {
+        if (is_first_group_py) {
+            @fmovh(down_reduce_send, vector_buf_dsr);
+        } else if (is_last_group_py) {
+            @fmovh(up_reduce_send, vector_buf_dsr);
+        } else {
+            if (py < root_2nd_phase) {
+                @faddh(down_reduce_send, down_reduce_recv, vector_buf_dsr);
+            } else {
+                @faddh(up_reduce_send, up_reduce_recv, vector_buf_dsr);
+            }
+        }
+    }
+
+    // Broadcast
+    if (py == root_2nd_phase) {
+        @fmovh(up_bd_send, vector_buf_dsr);
+        if (!is_last_py) {
+            @fmovh(down_bd_send, vector_buf_dsr);
+        }
+    } else {
+        if (py < root_2nd_phase) {
+            @fmovh(vector_buf_dsd, up_bd_recv);
+        } else {
+            @fmovh(vector_buf_dsd, down_bd_recv);
+        }
+    }
+
+}
+
+comptime {
+    @block(c_down_recv);
+    @block(c_up_recv);
+}

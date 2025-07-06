@@ -1,0 +1,799 @@
+param memcpy_params: comptime_struct;
+param comm_params: comptime_struct;
+
+param pe_num_p_group: i16;
+param root_1st_phase: i16;
+param root_2nd_phase: i16;
+
+param P: i16;
+param bsz: i16;
+param dim_p_pe: i16;
+param seq_len_p_pe: i16;
+param ffn_dim_p_pe: i16;
+
+const eps: f16 = 0.000001;
+var alpha: f16 = 0.0;
+
+const _dim_p_pe: i16 = (dim_p_pe / 2) * 2;
+const head_dim: f16 = @as(f16, dim_p_pe * P);
+
+const sys_mod = @import_module("<memcpy/memcpy>", memcpy_params);
+const math_lib = @import_module("<math>");
+const layout_mod = @import_module("<layout>");
+const comm_mod = @import_module("comm_lib/comm_pe.csl", @concat_structs(comm_params, .{
+    .P = P, .bsz = bsz, .dim_p_pe = dim_p_pe, .seq_len_p_pe = seq_len_p_pe, .ffn_dim_p_pe = ffn_dim_p_pe,
+    .pe_num_p_group = pe_num_p_group, .root_1st_phase = root_1st_phase, .root_2nd_phase = root_2nd_phase,
+}));
+
+var px: i16 = 0;
+var py: i16 = 0;
+
+const timestamp = @import_module("<time>");
+// starting time of H2D/D2H
+var tscStartBuffer = @zeros([timestamp.tsc_size_words]u16);
+// ending time of H2D/D2H
+var tscEndBuffer = @zeros([timestamp.tsc_size_words]u16);
+
+var time_buf_f32 = @zeros([3]f32);
+var ptr_time_memcpy: [*]f32 = &time_buf_f32;
+
+var tscRefBuffer = @zeros([timestamp.tsc_size_words]u16);
+var time_ref_f32 = @zeros([2]f32);
+var ptr_time_ref: [*]f32 = &time_ref_f32;
+
+fn init_task() void {
+    timestamp.enable_tsc();
+
+    px = @as(i16, layout_mod.get_x_coord());
+    py = @as(i16, layout_mod.get_y_coord());
+
+    comm_mod.init_(px, py);
+
+    alpha = 1.0 / @as(f16, math_lib.sqrt(head_dim));
+
+    sys_mod.unblock_cmd_stream();
+}
+
+// * X: input
+var X_tile: [bsz * dim_p_pe]f16 = @zeros([bsz * dim_p_pe]f16);
+var ptr_X: [*]f16 = &X_tile;
+var X_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{bsz * dim_p_pe} -> X_tile[i] });
+
+// * W: RMSNorm weights
+var W_tile: [dim_p_pe]f16 = @zeros([dim_p_pe]f16);
+var ptr_W: [*]f16 = &W_tile;
+var W_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{dim_p_pe} -> W_tile[i] });
+
+// * Q_weight, K_weight, V_weight: QKV weights input
+var Q_weight_tile: [dim_p_pe * dim_p_pe]f16 = @zeros([dim_p_pe * dim_p_pe]f16);
+var ptr_Q_weight: [*]f16 = &Q_weight_tile;
+
+var K_weight_tile: [dim_p_pe * dim_p_pe]f16 = @zeros([dim_p_pe * dim_p_pe]f16);
+var ptr_K_weight: [*]f16 = &K_weight_tile;
+
+var V_weight_tile: [dim_p_pe * dim_p_pe]f16 = @zeros([dim_p_pe * dim_p_pe]f16);
+var ptr_V_weight: [*]f16 = &V_weight_tile;
+
+var freqs_sin: [_dim_p_pe / 2]f16 = @zeros([_dim_p_pe / 2]f16);
+var ptr_freqs_sin: [*]f16 = &freqs_sin;
+var freqs_sin_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{_dim_p_pe / 2} -> freqs_sin[i] });
+
+var freqs_cos: [_dim_p_pe / 2]f16 = @zeros([_dim_p_pe / 2]f16);
+var ptr_freqs_cos: [*]f16 = &freqs_cos;
+var freqs_cos_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{_dim_p_pe / 2} -> freqs_cos[i] });
+
+var XKCache_tile: [dim_p_pe * seq_len_p_pe]f16 = @zeros([dim_p_pe * seq_len_p_pe]f16);
+var ptr_XKCache: [*]f16 = &XKCache_tile;
+
+var XVCache_tile: [seq_len_p_pe * dim_p_pe]f16 = @zeros([seq_len_p_pe * dim_p_pe]f16);
+var ptr_XVCache: [*]f16 = &XVCache_tile;
+
+var O_weight_tile: [dim_p_pe * dim_p_pe]f16 = @zeros([dim_p_pe * dim_p_pe]f16);
+var ptr_O_weight: [*]f16 = &O_weight_tile;
+
+var UP_weight_tile: [dim_p_pe * ffn_dim_p_pe]f16 = @zeros([dim_p_pe * ffn_dim_p_pe]f16);
+var ptr_UP_weight: [*]f16 = &UP_weight_tile;
+
+var GATE_weight_tile: [dim_p_pe * ffn_dim_p_pe]f16 = @zeros([dim_p_pe * ffn_dim_p_pe]f16);
+var ptr_GATE_weight: [*]f16 = &GATE_weight_tile;
+
+var DOWN_weight_tile: [dim_p_pe * ffn_dim_p_pe]f16 = @zeros([dim_p_pe * ffn_dim_p_pe]f16);
+var ptr_DOWN_weight: [*]f16 = &DOWN_weight_tile;
+
+// ************************ Middle Results ************************ //
+
+var X_tmp: [bsz * dim_p_pe]f16 = @zeros([bsz * dim_p_pe]f16);
+var ptr_X_tmp: [*]f16 = &X_tmp;
+var X_tmp_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{bsz * dim_p_pe} -> X_tmp[i] });
+
+var X_norm_tile: [bsz * dim_p_pe]f16 = @zeros([bsz * dim_p_pe]f16);
+var ptr_X_norm: [*]f16 = &X_norm_tile;
+
+var X_even_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{_dim_p_pe / 2} -> dummy[2*i] });
+var X_odd_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{_dim_p_pe / 2} -> dummy[2*i+1] });
+
+var local_sum: [bsz]f16 = @zeros([bsz]f16);
+var ptr_local_sum: [*]f16 = &local_sum;
+var local_sum_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{bsz} -> local_sum[i] });
+
+var sum: f16 = 0.0;
+var ptr_sum = &sum;
+
+var local_max: [bsz]f16 = @zeros([bsz]f16);
+var ptr_local_max: [*]f16 = &local_max;
+var local_max_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{bsz} -> local_max[i] });
+
+var max: f16 = 0.0;
+var ptr_max = &max;
+
+var X_tmp_1: [_dim_p_pe / 2]f16 = @zeros([_dim_p_pe / 2]f16);
+var ptr_X_tmp_1: [*]f16 = &X_tmp_1;
+var X_tmp_1_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{_dim_p_pe / 2} -> X_tmp_1[i] });
+
+var X_tmp_2: [_dim_p_pe / 2]f16 = @zeros([_dim_p_pe / 2]f16);
+var ptr_X_tmp_2: [*]f16 = &X_tmp_2;
+var X_tmp_2_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{_dim_p_pe / 2} -> X_tmp_2[i] });
+
+var X_tmp_3: [_dim_p_pe / 2]f16 = @zeros([_dim_p_pe / 2]f16);
+var ptr_X_tmp_3: [*]f16 = &X_tmp_3;
+var X_tmp_3_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{_dim_p_pe / 2} -> X_tmp_3[i] });
+
+var X_tmp_4: [_dim_p_pe / 2]f16 = @zeros([_dim_p_pe / 2]f16);
+var ptr_X_tmp_4: [*]f16 = &X_tmp_4;
+var X_tmp_4_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{_dim_p_pe / 2} -> X_tmp_4[i] });
+
+var QKV_tile: [bsz*3*dim_p_pe]f16 = @zeros([bsz*3*dim_p_pe]f16);
+var ptr_QKV_tile: [*]f16 = &QKV_tile;
+
+// var Q_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &QKV_tile, .offset = 0, .extent = bsz*dim_p_pe });
+// var K_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &QKV_tile, .offset = bsz*dim_p_pe, .extent = bsz*dim_p_pe });
+// var V_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &QKV_tile, .offset = 2*bsz*dim_p_pe, .extent = bsz*dim_p_pe });
+
+var Q_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{bsz*dim_p_pe} -> QKV_tile[i] });
+var K_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{bsz*dim_p_pe} -> QKV_tile[bsz*dim_p_pe+i] });
+var V_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{bsz*dim_p_pe} -> QKV_tile[2*bsz*dim_p_pe+i] });
+
+var score: [bsz * seq_len_p_pe]f16 = @zeros([bsz * seq_len_p_pe]f16);
+var ptr_score: [*]f16 = &score;
+var score_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{bsz * seq_len_p_pe} -> score[i] });
+
+var score_tmp: [bsz * seq_len_p_pe]f16 = @zeros([bsz * seq_len_p_pe]f16);
+var ptr_score_tmp: [*]f16 = &score_tmp;
+var score_tmp_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{bsz * seq_len_p_pe} -> score_tmp[i] });
+
+var output_tile: [bsz * dim_p_pe]f16 = @zeros([bsz * dim_p_pe]f16);
+var ptr_output: [*]f16 = &output_tile;
+var output_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{bsz * dim_p_pe} -> output_tile[i] });
+
+var h1_tile: [bsz * dim_p_pe]f16 = @zeros([bsz * dim_p_pe]f16);
+var ptr_h1: [*]f16 = &h1_tile;
+var h1_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{bsz * dim_p_pe} -> h1_tile[i] });
+
+var h2_tile: [bsz * dim_p_pe]f16 = @zeros([bsz * dim_p_pe]f16);
+var ptr_h2: [*]f16 = &h2_tile;
+var h2_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{bsz * dim_p_pe} -> h2_tile[i] });
+
+var ZZ_tile: [bsz * 2 * ffn_dim_p_pe]f16 = @zeros([bsz * 2 * ffn_dim_p_pe]f16);
+var ptr_ZZ_tile: [*]f16 = &ZZ_tile;
+
+var z1_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{bsz * ffn_dim_p_pe} -> ZZ_tile[i] });
+var z2_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{bsz * ffn_dim_p_pe} -> ZZ_tile[bsz * ffn_dim_p_pe+i] });
+
+var z3_tile: [bsz * ffn_dim_p_pe]f16 = @zeros([bsz * ffn_dim_p_pe]f16);
+var ptr_z3: [*]f16 = &z3_tile;
+var z3_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{bsz * ffn_dim_p_pe} -> z3_tile[i] });
+
+var z_norm_tile: [bsz * dim_p_pe]f16 = @zeros([bsz * dim_p_pe]f16);
+var ptr_z_norm: [*]f16 = &z_norm_tile;
+var z_norm_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{bsz * dim_p_pe} -> z_norm_tile[i] });
+
+var Z_tile: [bsz * dim_p_pe]f16 = @zeros([bsz * dim_p_pe]f16);
+var ptr_Z: [*]f16 = &Z_tile;
+var Z_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{bsz * dim_p_pe} -> Z_tile[i] });
+
+
+const dest_dsr_1 = @get_dsr(dsr_dest, 1);
+const src0_dsr_1 = @get_dsr(dsr_src0, 1);
+const src1_dsr_1 = @get_dsr(dsr_src1, 1);
+
+const dest_dsr_2 = @get_dsr(dsr_dest, 2);
+const src0_dsr_2 = @get_dsr(dsr_src0, 2);
+const src1_dsr_2 = @get_dsr(dsr_src1, 2);
+
+const dest_dsr_3 = @get_dsr(dsr_dest, 3);
+const src0_dsr_3 = @get_dsr(dsr_src0, 3);
+const src1_dsr_3 = @get_dsr(dsr_src1, 3);
+
+const dest_dsr_4 = @get_dsr(dsr_dest, 4);
+const src0_dsr_4 = @get_dsr(dsr_src0, 4);
+const src1_dsr_4 = @get_dsr(dsr_src1, 4);
+
+const dest_dsr_5 = @get_dsr(dsr_dest, 5);
+const src0_dsr_5 = @get_dsr(dsr_src0, 5);
+const src1_dsr_5 = @get_dsr(dsr_src1, 5);
+
+fn gemv_static_step(cur: f16) void {
+    @fmach(dest_dsr_1, src0_dsr_1, src1_dsr_1, cur);
+}
+
+fn fmulh_func(cur: f16) void {
+    @fmulh(dest_dsr_1, src0_dsr_1, cur);
+}
+
+fn fsubh_func(cur: f16) void {
+    @fsubh(dest_dsr_1, src0_dsr_1, cur);
+}
+
+var cur_: f16 = 0.0;
+fn fmulh_norm_func(cur: f16) void {
+    cur_ = cur / head_dim;
+    cur_ = 1.0 / math_lib.sqrt(cur_ + eps);
+    @fmulh(dest_dsr_1, src0_dsr_1, cur_);
+}
+
+fn fast_exp(x: f16) f16 {
+    var tmp: f16 = x;
+    tmp = 1.0 + tmp/256.0;
+    tmp *= tmp;
+    tmp *= tmp;
+
+    return tmp;
+}
+
+fn fmulh_softmax_func(cur: f16) void {
+    cur_ = 1.0 / cur;
+    @fmulh(dest_dsr_1, src0_dsr_1, cur_);
+}
+
+var dummy = @zeros([1]f16);
+
+var ptr_left_vector: [*]f16 = &dummy;
+var left_vector_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{1} -> dummy[i] });
+
+var ptr_right_matrix: [*]f16 = &dummy;
+var right_matrix_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{1} -> dummy[i] });
+
+var ptr_out_vector: [*]f16 = &dummy;
+var out_vector_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{1} -> dummy[i] });
+
+var dim_p_pe_dsd_1 = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{dim_p_pe} -> dummy[i] });
+var dim_p_pe_dsd_2 = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{dim_p_pe} -> dummy[i] });
+var seq_len_p_pe_dsd_1 = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{seq_len_p_pe} -> dummy[i] });
+var seq_len_p_pe_dsd_2 = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{seq_len_p_pe} -> dummy[i] });
+var ffn_dim_p_pe_dsd_1 = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{ffn_dim_p_pe} -> dummy[i] });
+var ffn_dim_p_pe_dsd_2 = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{ffn_dim_p_pe} -> dummy[i] });
+
+var Kt: i16 = 0;
+var Nt: i16 = 0;
+
+fn vecmat_computation() void {
+    left_vector_dsd = @set_dsd_length(left_vector_dsd, @bitcast(u16, Kt));
+    right_matrix_dsd = @set_dsd_length(right_matrix_dsd, @bitcast(u16, Nt));
+    out_vector_dsd = @set_dsd_length(out_vector_dsd, @bitcast(u16, Nt));
+    
+    for (@range(i16, bsz)) |b| {
+        right_matrix_dsd = @set_dsd_base_addr(right_matrix_dsd, ptr_right_matrix);
+
+        @load_to_dsr(dest_dsr_1, out_vector_dsd, .{ .save_address = false });
+        @load_to_dsr(src0_dsr_1, out_vector_dsd, .{ .save_address = false });
+        @load_to_dsr(src1_dsr_1, right_matrix_dsd, .{ .save_address = true });
+
+        @map(gemv_static_step, left_vector_dsd); // MFU 2x4Kx4K-flops
+
+        left_vector_dsd = @increment_dsd_offset(left_vector_dsd, Kt, f16);
+        out_vector_dsd = @increment_dsd_offset(out_vector_dsd, Nt, f16);
+    }
+
+}
+
+// -------------------------------------------------------------------------- //
+// ------------------------------ Decode Funcs ------------------------------ //
+// -------------------------------------------------------------------------- //
+
+fn rmsnorm_x() void {
+    @load_to_dsr(dest_dsr_1, X_tmp_dsd);
+    @load_to_dsr(src0_dsr_1, X_dsd);
+    @load_to_dsr(src1_dsr_1, X_dsd);
+    @fmulh(dest_dsr_1, src0_dsr_1, src1_dsr_1);
+
+    dim_p_pe_dsd_1 = @set_dsd_base_addr(dim_p_pe_dsd_1, ptr_X_tmp);
+    @load_to_dsr(src1_dsr_1, dim_p_pe_dsd_1, .{ .save_address = true });
+    for (@range(i16, bsz)) |b| {
+        sum = 0.0;
+        @faddh(ptr_sum, sum, src1_dsr_1);
+        local_sum[b] = sum;
+    }
+
+    comm_mod.two_tree_allreduce_add_y_bsz(ptr_local_sum);
+
+    dim_p_pe_dsd_1 = @set_dsd_base_addr(dim_p_pe_dsd_1, ptr_X_norm);
+    dim_p_pe_dsd_2 = @set_dsd_base_addr(dim_p_pe_dsd_2, ptr_X_tmp);
+    @load_to_dsr(dest_dsr_1, dim_p_pe_dsd_1, .{ .save_address = true});
+    @load_to_dsr(src0_dsr_1, dim_p_pe_dsd_2, .{ .save_address = true});
+    @load_to_dsr(src1_dsr_1, W_dsd, .{ .save_address = false});
+    for (@range(i16, bsz)) |b| {
+        @fmulh(dest_dsr_1, src0_dsr_1, src1_dsr_1);
+    }
+
+    dim_p_pe_dsd_1 = @set_dsd_base_addr(dim_p_pe_dsd_1, ptr_X_norm);
+    @load_to_dsr(dest_dsr_1, dim_p_pe_dsd_1, .{ .save_address = true});
+    @load_to_dsr(src0_dsr_1, dim_p_pe_dsd_1, .{ .save_address = true});
+    @map(fmulh_norm_func, local_sum_dsd);
+}
+
+fn xq_matvec_mult() void {
+    @fmovh(Q_dsd, 0.0);
+
+    left_vector_dsd = @set_dsd_base_addr(left_vector_dsd, ptr_X_norm);
+
+    ptr_right_matrix = &Q_weight_tile;
+
+    out_vector_dsd = @set_dsd_base_addr(out_vector_dsd, ptr_QKV_tile);
+
+    Kt = dim_p_pe;
+    Nt = dim_p_pe;
+
+    vecmat_computation();
+
+}
+
+fn xk_matvec_mult() void {
+    @fmovh(K_dsd, 0.0);
+
+    left_vector_dsd = @set_dsd_base_addr(left_vector_dsd, ptr_X_norm);
+
+    ptr_right_matrix = &K_weight_tile;
+
+    out_vector_dsd = @set_dsd_base_addr(out_vector_dsd, ptr_QKV_tile);
+    out_vector_dsd = @increment_dsd_offset(out_vector_dsd, bsz*dim_p_pe, f16);
+
+    Kt = dim_p_pe;
+    Nt = dim_p_pe;
+
+    vecmat_computation();
+
+}
+
+fn xv_matvec_mult() void {
+    @fmovh(V_dsd, 0.0);
+
+    left_vector_dsd = @set_dsd_base_addr(left_vector_dsd, ptr_X_norm);
+
+    ptr_right_matrix = &V_weight_tile;
+
+    out_vector_dsd = @set_dsd_base_addr(out_vector_dsd, ptr_QKV_tile);
+    out_vector_dsd = @increment_dsd_offset(out_vector_dsd, 2*bsz*dim_p_pe, f16);
+
+    Kt = dim_p_pe;
+    Nt = dim_p_pe;
+
+    vecmat_computation();
+
+}
+
+fn xq_rope() void {
+    X_even_dsd = @set_dsd_base_addr(X_even_dsd, ptr_QKV_tile);
+    X_odd_dsd = @set_dsd_base_addr(X_odd_dsd, ptr_QKV_tile);
+
+    @load_to_dsr(dest_dsr_1, X_tmp_1_dsd);
+    @load_to_dsr(dest_dsr_2, X_tmp_2_dsd);
+    @load_to_dsr(dest_dsr_3, X_tmp_3_dsd);
+    @load_to_dsr(dest_dsr_4, X_tmp_4_dsd);
+
+    @load_to_dsr(src1_dsr_1, freqs_cos_dsd);
+    @load_to_dsr(src1_dsr_2, freqs_sin_dsd);
+    @load_to_dsr(src1_dsr_3, freqs_cos_dsd);
+    @load_to_dsr(src1_dsr_4, freqs_sin_dsd);
+
+    for (@range(i16, bsz)) |b| {
+
+        @load_to_dsr(src0_dsr_1, X_odd_dsd);
+        @load_to_dsr(src0_dsr_2, X_even_dsd);
+        @load_to_dsr(src0_dsr_3, X_even_dsd);
+        @load_to_dsr(src0_dsr_4, X_odd_dsd);
+
+        @fmulh(dest_dsr_1, src0_dsr_1, src1_dsr_1);
+        @fmulh(dest_dsr_2, src0_dsr_2, src1_dsr_2);
+        @fmulh(dest_dsr_3, src0_dsr_3, src1_dsr_3);
+        @fmulh(dest_dsr_4, src0_dsr_4, src1_dsr_4);
+
+        @load_to_dsr(dest_dsr_5, X_even_dsd);
+        @load_to_dsr(src0_dsr_5, X_tmp_1_dsd);
+        @load_to_dsr(src1_dsr_5, X_tmp_2_dsd);
+        @fsubh(dest_dsr_5, src0_dsr_5, src1_dsr_5);
+
+        @load_to_dsr(dest_dsr_5, X_odd_dsd);
+        @load_to_dsr(src0_dsr_5, X_tmp_3_dsd);
+        @load_to_dsr(src1_dsr_5, X_tmp_4_dsd);
+        @faddh(dest_dsr_5, src0_dsr_5, src1_dsr_5);
+
+        X_even_dsd = @increment_dsd_offset(X_even_dsd, dim_p_pe, f16);
+        X_odd_dsd = @increment_dsd_offset(X_odd_dsd, dim_p_pe, f16);
+    }
+}
+
+fn xk_rope() void {
+    X_even_dsd = @set_dsd_base_addr(X_even_dsd, ptr_QKV_tile);
+    X_odd_dsd = @set_dsd_base_addr(X_odd_dsd, ptr_QKV_tile);
+    X_even_dsd = @increment_dsd_offset(X_even_dsd, bsz*dim_p_pe, f16);
+    X_odd_dsd = @increment_dsd_offset(X_odd_dsd, bsz*dim_p_pe, f16);
+
+    @load_to_dsr(dest_dsr_1, X_tmp_1_dsd);
+    @load_to_dsr(dest_dsr_2, X_tmp_2_dsd);
+    @load_to_dsr(dest_dsr_3, X_tmp_3_dsd);
+    @load_to_dsr(dest_dsr_4, X_tmp_4_dsd);
+
+    @load_to_dsr(src1_dsr_1, freqs_cos_dsd);
+    @load_to_dsr(src1_dsr_2, freqs_sin_dsd);
+    @load_to_dsr(src1_dsr_3, freqs_cos_dsd);
+    @load_to_dsr(src1_dsr_4, freqs_sin_dsd);
+
+    for (@range(i16, bsz)) |b| {
+
+        @load_to_dsr(src0_dsr_1, X_odd_dsd);
+        @load_to_dsr(src0_dsr_2, X_even_dsd);
+        @load_to_dsr(src0_dsr_3, X_even_dsd);
+        @load_to_dsr(src0_dsr_4, X_odd_dsd);
+
+        @fmulh(dest_dsr_1, src0_dsr_1, src1_dsr_1);
+        @fmulh(dest_dsr_2, src0_dsr_2, src1_dsr_2);
+        @fmulh(dest_dsr_3, src0_dsr_3, src1_dsr_3);
+        @fmulh(dest_dsr_4, src0_dsr_4, src1_dsr_4);
+
+        @load_to_dsr(dest_dsr_5, X_even_dsd);
+        @load_to_dsr(src0_dsr_5, X_tmp_1_dsd);
+        @load_to_dsr(src1_dsr_5, X_tmp_2_dsd);
+        @fsubh(dest_dsr_5, src0_dsr_5, src1_dsr_5);
+
+        @load_to_dsr(dest_dsr_5, X_odd_dsd);
+        @load_to_dsr(src0_dsr_5, X_tmp_3_dsd);
+        @load_to_dsr(src1_dsr_5, X_tmp_4_dsd);
+        @faddh(dest_dsr_5, src0_dsr_5, src1_dsr_5);
+
+        X_even_dsd = @increment_dsd_offset(X_even_dsd, dim_p_pe, f16);
+        X_odd_dsd = @increment_dsd_offset(X_odd_dsd, dim_p_pe, f16);
+    }
+}
+
+fn score_matvec_mult() void {
+    @fmovh(score_dsd, 0.0);
+
+    left_vector_dsd = @set_dsd_base_addr(left_vector_dsd, ptr_QKV_tile);
+    
+    ptr_right_matrix = &XKCache_tile;
+
+    out_vector_dsd = @set_dsd_base_addr(out_vector_dsd, ptr_score);
+
+    Kt = dim_p_pe;
+    Nt = seq_len_p_pe;
+
+    vecmat_computation();
+
+    comm_mod.two_tree_allreduce_add_x_bsz_seqLen(ptr_score);
+
+    // score factor
+    @load_to_dsr(dest_dsr_1, score_dsd);
+    @load_to_dsr(src0_dsr_1, score_dsd);
+    @fmulh(dest_dsr_1, src0_dsr_1, alpha);
+}
+
+fn softmax_score() void {
+
+    seq_len_p_pe_dsd_1 = @set_dsd_base_addr(seq_len_p_pe_dsd_1, ptr_score);
+    @load_to_dsr(src1_dsr_1, seq_len_p_pe_dsd_1, .{ .save_address = true });
+    for (@range(i16, bsz)) |b| {
+        max = 0.0;
+        @fmaxh(ptr_max, max, src1_dsr_1);
+        local_max[b] = max;
+    }
+
+    comm_mod.two_tree_allreduce_max_y_bsz(ptr_local_max);
+
+    seq_len_p_pe_dsd_1 = @set_dsd_base_addr(seq_len_p_pe_dsd_1, ptr_score_tmp);
+    seq_len_p_pe_dsd_2 = @set_dsd_base_addr(seq_len_p_pe_dsd_2, ptr_score);
+    @load_to_dsr(dest_dsr_1, seq_len_p_pe_dsd_1, .{ .save_address = true });
+    @load_to_dsr(src0_dsr_1, seq_len_p_pe_dsd_2, .{ .save_address = true });
+    @map(fsubh_func, local_max_dsd);
+
+    @map(fast_exp, score_tmp_dsd, score_dsd);
+
+    seq_len_p_pe_dsd_1 = @set_dsd_base_addr(seq_len_p_pe_dsd_1, ptr_score);
+    @load_to_dsr(src1_dsr_1, seq_len_p_pe_dsd_1, .{ .save_address = true });
+    for (@range(i16, bsz)) |b| {
+        sum = 0.0;
+        @faddh(ptr_sum, sum, src1_dsr_1);
+        local_sum[b] = sum;
+    }
+
+    comm_mod.two_tree_allreduce_add_y_bsz(ptr_local_sum);
+
+    seq_len_p_pe_dsd_1 = @set_dsd_base_addr(seq_len_p_pe_dsd_1, ptr_score);
+    @load_to_dsr(dest_dsr_1, seq_len_p_pe_dsd_1, .{ .save_address = true });
+    @load_to_dsr(src0_dsr_1, seq_len_p_pe_dsd_1, .{ .save_address = true });
+    @map(fmulh_softmax_func, local_sum_dsd);
+}
+
+fn output_matvec_mult() void {
+    @fmovh(output_dsd, 0.0);
+
+    left_vector_dsd = @set_dsd_base_addr(left_vector_dsd, ptr_score);
+    
+    ptr_right_matrix = &XVCache_tile;
+
+    out_vector_dsd = @set_dsd_base_addr(out_vector_dsd, ptr_output);
+
+    Kt = seq_len_p_pe;
+    Nt = dim_p_pe;
+
+    vecmat_computation();
+
+    comm_mod.two_tree_allreduce_add_y_bsz_dim(ptr_output);
+}
+
+fn o_matvec_mult() void {
+    @fmovh(h1_dsd, 0.0);
+
+    left_vector_dsd = @set_dsd_base_addr(left_vector_dsd, ptr_output);
+    
+    ptr_right_matrix = &O_weight_tile;
+
+    out_vector_dsd = @set_dsd_base_addr(out_vector_dsd, ptr_h1);
+
+    Kt = dim_p_pe;
+    Nt = dim_p_pe;
+
+    vecmat_computation();
+
+    comm_mod.two_tree_allreduce_add_x_bsz_dim(ptr_h1);
+}
+
+fn attn_residual_add() void {
+    @load_to_dsr(dest_dsr_1, Z_dsd);
+    @load_to_dsr(src0_dsr_1, X_dsd);
+    @load_to_dsr(src1_dsr_1, h1_dsd);
+    @faddh(dest_dsr_1, src0_dsr_1, src1_dsr_1);
+}
+
+fn rmsnorm_z() void {
+    @load_to_dsr(dest_dsr_1, X_tmp_dsd);
+    @load_to_dsr(src0_dsr_1, Z_dsd);
+    @load_to_dsr(src1_dsr_1, Z_dsd);
+    @fmulh(dest_dsr_1, src0_dsr_1, src1_dsr_1);
+    
+    dim_p_pe_dsd_1 = @set_dsd_base_addr(dim_p_pe_dsd_1, ptr_X_tmp);
+    @load_to_dsr(src1_dsr_1, dim_p_pe_dsd_1, .{ .save_address = true });
+    for (@range(i16, bsz)) |b| {
+        sum = 0.0;
+        @faddh(ptr_sum, sum, src1_dsr_1);
+        local_sum[b] = sum;
+    }
+
+    comm_mod.two_tree_allreduce_add_y_bsz(ptr_local_sum);
+
+    dim_p_pe_dsd_1 = @set_dsd_base_addr(dim_p_pe_dsd_1, ptr_z_norm);
+    dim_p_pe_dsd_2 = @set_dsd_base_addr(dim_p_pe_dsd_2, ptr_X_tmp);
+    @load_to_dsr(dest_dsr_1, dim_p_pe_dsd_1, .{ .save_address = true });
+    @load_to_dsr(src0_dsr_1, dim_p_pe_dsd_2, .{ .save_address = true });
+    @load_to_dsr(src1_dsr_1, W_dsd, .{ .save_address = false });
+    for (@range(i16, bsz)) |b| {
+        @fmulh(dest_dsr_1, src0_dsr_1, src1_dsr_1);
+    }
+
+    seq_len_p_pe_dsd_1 = @set_dsd_base_addr(seq_len_p_pe_dsd_1, ptr_z_norm);
+    @load_to_dsr(dest_dsr_1, seq_len_p_pe_dsd_1, .{ .save_address = true });
+    @load_to_dsr(src0_dsr_1, seq_len_p_pe_dsd_1, .{ .save_address = true });
+    @map(fmulh_norm_func, local_sum_dsd);
+}
+
+fn up_matvec_mult() void {
+    @fmovh(z1_dsd, 0.0);
+
+    left_vector_dsd = @set_dsd_base_addr(left_vector_dsd, ptr_z_norm);
+    
+    ptr_right_matrix = &UP_weight_tile;
+
+    out_vector_dsd = @set_dsd_base_addr(out_vector_dsd, ptr_ZZ_tile);
+
+    Kt = dim_p_pe;
+    Nt = ffn_dim_p_pe;
+
+    vecmat_computation();
+
+}
+
+fn gate_matvec_mult() void {
+    @fmovh(z2_dsd, 0.0);
+
+    left_vector_dsd = @set_dsd_base_addr(left_vector_dsd, ptr_z_norm);
+    
+    ptr_right_matrix = &GATE_weight_tile;
+
+    out_vector_dsd = @set_dsd_base_addr(out_vector_dsd, ptr_ZZ_tile);
+    out_vector_dsd = @increment_dsd_offset(out_vector_dsd, bsz * ffn_dim_p_pe, f16);
+
+    Kt = dim_p_pe;
+    Nt = ffn_dim_p_pe;
+
+    vecmat_computation();
+
+}
+
+fn silu_kernel(val: f16) f16 {
+    return val / (1.0 + fast_exp(-val));
+}
+
+var z2_val: f16 = 0.0;
+fn z2_silu() void {
+    for (@range(i16, bsz*dim_p_pe)) |i| {
+        z2_val = ZZ_tile[i];
+        ZZ_tile[i] = z2_val / (1.0 + fast_exp(-z2_val));
+    }
+}
+
+fn z3_mat() void {
+    @load_to_dsr(dest_dsr_1, z3_dsd);
+    @load_to_dsr(src0_dsr_1, z1_dsd);
+    @load_to_dsr(src1_dsr_1, z2_dsd);
+    @fmulh(dest_dsr_1, src0_dsr_1, src1_dsr_1);
+}
+
+fn down_matvec_mult() void {
+    @fmovh(h2_dsd, 0.0);
+
+    left_vector_dsd = @set_dsd_base_addr(left_vector_dsd, ptr_z3);
+    
+    ptr_right_matrix = &DOWN_weight_tile;
+
+    out_vector_dsd = @set_dsd_base_addr(out_vector_dsd, ptr_h2);
+
+    Kt = ffn_dim_p_pe;
+    Nt = dim_p_pe;
+
+    vecmat_computation();
+
+    comm_mod.two_tree_allreduce_add_x_bsz_dim(ptr_h2);
+}
+
+fn ffn_residual_add() void {
+    @load_to_dsr(dest_dsr_1, Z_dsd);
+    @load_to_dsr(src0_dsr_1, Z_dsd);
+    @load_to_dsr(src1_dsr_1, h2_dsd);
+    @faddh(dest_dsr_1, src0_dsr_1, src1_dsr_1);
+}
+
+fn decode_struct() void {
+
+    rmsnorm_x();
+
+    xq_matvec_mult();
+    xk_matvec_mult();
+    xv_matvec_mult();
+    comm_mod.two_tree_allreduce_add_y_bsz_dim_QKV_fusion(ptr_QKV_tile);
+
+    xq_rope();
+    xk_rope();
+
+    score_matvec_mult();
+
+    softmax_score();
+
+    output_matvec_mult();
+
+    o_matvec_mult();
+
+    attn_residual_add();
+
+    rmsnorm_z();
+
+    up_matvec_mult();
+    gate_matvec_mult();
+    comm_mod.two_tree_allreduce_add_y_bsz_ffn_dim_ZZ_fusion(ptr_ZZ_tile);
+
+    z2_silu();
+
+    z3_mat();
+
+    down_matvec_mult();
+
+    ffn_residual_add();
+
+    decode_entry();
+}
+
+// -------------------------------------------------------------------------- //
+// ------------------------------ Entry Point ----------------------------- //
+// -------------------------------------------------------------------------- //
+var total_repeat_times: i16 = 1;
+var total_warmup_times: i16 = 0;
+
+var repeat_times: i16 = 0; // Start from 0
+
+fn decode_host(total_warmup_times_: i16, total_repeat_times_: i16) void {
+    total_repeat_times = total_repeat_times_;
+    total_warmup_times = total_warmup_times_;
+
+    repeat_times = 0;
+
+    decode_entry();
+}
+
+fn decode_entry() void {
+    // Run (total_warmup_times + total_repeat_times) times; only the last `total_repeat_times` iterations are timed
+    if (repeat_times == total_repeat_times + total_warmup_times) {
+        exit();
+    } else {
+        if (repeat_times == total_warmup_times) {
+            timestamp.get_timestamp(&tscRefBuffer);
+            timestamp.get_timestamp(&tscStartBuffer);
+        }
+        
+        repeat_times += 1;
+        decode_struct();
+    }
+}
+
+fn exit() void {
+    timestamp.get_timestamp(&tscEndBuffer);
+    timestamp.disable_tsc();
+
+    f_reference_timestamps();
+    f_memcpy_timestamps();
+    sys_mod.unblock_cmd_stream();
+}
+
+fn f_memcpy_timestamps() void {
+    var lo_ : u16 = 0;
+    var hi_ : u16 = 0;
+    var word : u32 = 0;
+
+    lo_ = tscStartBuffer[0];
+    hi_ = tscStartBuffer[1];
+    time_buf_f32[0] = @bitcast(f32, (@as(u32,hi_) << @as(u16,16)) | @as(u32, lo_) );
+
+    lo_ = tscStartBuffer[2];
+    hi_ = tscEndBuffer[0];
+    time_buf_f32[1] = @bitcast(f32, (@as(u32,hi_) << @as(u16,16)) | @as(u32, lo_) );
+
+    lo_ = tscEndBuffer[1];
+    hi_ = tscEndBuffer[2];
+    time_buf_f32[2] = @bitcast(f32, (@as(u32,hi_) << @as(u16,16)) | @as(u32, lo_) );
+}
+
+fn f_reference_timestamps() void {
+    var lo_ : u16 = 0;
+    var hi_ : u16 = 0;
+
+    lo_ = tscRefBuffer[0];
+    hi_ = tscRefBuffer[1];
+    time_ref_f32[0] = @bitcast(f32, (@as(u32,hi_) << @as(u16,16)) | @as(u32, lo_) );
+
+    lo_ = tscRefBuffer[2];
+    hi_ = 0;
+    time_ref_f32[1] = @bitcast(f32, (@as(u32,hi_) << @as(u16,16)) | @as(u32, lo_) );
+}
+
+comptime {
+    @export_symbol(ptr_time_memcpy, "time_memcpy");
+    @export_symbol(ptr_time_ref, "time_ref");
+}
+
+comptime {
+    @export_symbol(ptr_X, "X");
+    @export_symbol(ptr_W, "W");
+    @export_symbol(ptr_Q_weight, "Q_weight");
+    @export_symbol(ptr_K_weight, "K_weight");
+    @export_symbol(ptr_V_weight, "V_weight");
+    @export_symbol(ptr_freqs_sin, "freqs_sin");
+    @export_symbol(ptr_freqs_cos, "freqs_cos");
+    @export_symbol(ptr_XKCache, "XKCache");
+    @export_symbol(ptr_XVCache, "XVCache");
+    @export_symbol(ptr_O_weight, "O_weight");
+    @export_symbol(ptr_UP_weight, "UP_weight");
+    @export_symbol(ptr_GATE_weight, "GATE_weight");
+    @export_symbol(ptr_DOWN_weight, "DOWN_weight");
+
+    @export_symbol(init_task);
+    @export_symbol(decode_host);
+
+    @rpc(@get_data_task_id(sys_mod.LAUNCH));
+}

@@ -1,0 +1,167 @@
+param memcpy_params: comptime_struct;
+param comm_params: comptime_struct;
+
+param P: i16;
+param Mt: i16;
+param Nt: i16;
+
+param pe_num_group: i16;
+
+param root_1st_phase: i16;
+param root_2nd_phase: i16;
+
+const sys_mod = @import_module("<memcpy/memcpy>", memcpy_params);
+const layout_module = @import_module("<layout>");
+
+const comm_mod = @import_module("comm_lib/comm_pe.csl", @concat_structs(comm_params, .{
+    .P = P, .Mt = Mt, .Nt = Nt, 
+    .pe_num_group = pe_num_group,
+    .root_1st_phase = root_1st_phase, .root_2nd_phase = root_2nd_phase,
+}));
+
+var px: i16 = 0;
+var py: i16 = 0;
+
+var X_tile: [Mt]f16 = @zeros([Mt]f16);
+var ptr_X: [*]f16 = &X_tile;
+var X_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Mt} -> X_tile[i] });
+
+var W_tile: [Mt*Nt]f16 = @zeros([Mt*Nt]f16);
+var ptr_W: [*]f16 = &W_tile;
+var W_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Nt} -> W_tile[i] });
+
+var res_tile: [Nt]f16 = @zeros([Nt]f16);
+var ptr_res: [*]f16 = &res_tile;
+var res_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Nt} -> res_tile[i] });
+
+const res_dest_dsr = @get_dsr(dsr_dest, 1);
+const res_src0_dsr = @get_dsr(dsr_src0, 1);
+const W_src1_dsr = @get_dsr(dsr_src1, 1);
+
+const timestamp = @import_module("<time>");
+// starting time of H2D/D2H
+var tscStartBuffer = @zeros([timestamp.tsc_size_words]u16);
+// ending time of H2D/D2H
+var tscEndBuffer = @zeros([timestamp.tsc_size_words]u16);
+
+var time_buf_f32 = @zeros([3]f32);
+var ptr_time_memcpy: [*]f32 = &time_buf_f32;
+
+var tscRefBuffer = @zeros([timestamp.tsc_size_words]u16);
+var time_ref_f32 = @zeros([2]f32);
+var ptr_time_ref: [*]f32 = &time_ref_f32;
+
+fn init_task() void {
+    timestamp.enable_tsc();
+    @assert(P >= 3);
+    px = @as(i16, layout_module.get_x_coord());
+    py = @as(i16, layout_module.get_y_coord());
+  
+    comm_mod.init_(px, py);
+    sys_mod.unblock_cmd_stream();
+}
+
+fn gemv_static_step(curL: f16) void {
+    @fmach(res_dest_dsr, res_src0_dsr, W_src1_dsr, curL);
+}
+
+// Vector-matrix multiplication
+fn mv_compute() void {
+
+    @load_to_dsr(res_dest_dsr, res_dsd, .{ .save_address = false });
+    @load_to_dsr(res_src0_dsr, res_dsd, .{ .save_address = false });
+    @load_to_dsr(W_src1_dsr, W_dsd, .{ .save_address = true });
+
+    @map(gemv_static_step, X_dsd);
+
+    comm_mod.two-tree_allreduce_y(ptr_res);
+    meshgemv_entry();
+}
+
+var total_repeat_times: i16 = 1;
+var total_warmup_times: i16 = 0;
+
+var repeat_times: i16 = 0; // Start from 0
+
+fn meshgemv_host(total_warmup_times_: i16, total_repeat_times_: i16) void {
+    total_repeat_times = total_repeat_times_;
+    total_warmup_times = total_warmup_times_;
+
+    repeat_times = 0;
+
+    meshgemv_entry();
+}
+
+fn meshgemv_entry() void {
+
+    // Run (total_warmup_times + total_repeat_times) times; only the last `total_repeat_times` iterations are timed
+    if (repeat_times == total_repeat_times + total_warmup_times) {
+        exit();
+    } else {
+        if (repeat_times == total_warmup_times) {
+            timestamp.get_timestamp(&tscRefBuffer);
+            timestamp.get_timestamp(&tscStartBuffer);
+        }
+
+        repeat_times += 1;
+        @fmovh(res_dsd, 0.0);
+        mv_compute();
+    }
+}
+
+fn exit() void {
+    timestamp.get_timestamp(&tscEndBuffer);
+    timestamp.disable_tsc();
+
+    f_reference_timestamps();
+    f_memcpy_timestamps();
+    sys_mod.unblock_cmd_stream();
+}
+
+fn f_memcpy_timestamps() void {
+    var lo_ : u16 = 0;
+    var hi_ : u16 = 0;
+    var word : u32 = 0;
+
+    lo_ = tscStartBuffer[0];
+    hi_ = tscStartBuffer[1];
+    time_buf_f32[0] = @bitcast(f32, (@as(u32,hi_) << @as(u16,16)) | @as(u32, lo_) );
+
+    lo_ = tscStartBuffer[2];
+    hi_ = tscEndBuffer[0];
+    time_buf_f32[1] = @bitcast(f32, (@as(u32,hi_) << @as(u16,16)) | @as(u32, lo_) );
+
+    lo_ = tscEndBuffer[1];
+    hi_ = tscEndBuffer[2];
+    time_buf_f32[2] = @bitcast(f32, (@as(u32,hi_) << @as(u16,16)) | @as(u32, lo_) );
+}
+
+fn f_reference_timestamps() void {
+    var lo_ : u16 = 0;
+    var hi_ : u16 = 0;
+
+    lo_ = tscRefBuffer[0];
+    hi_ = tscRefBuffer[1];
+    time_ref_f32[0] = @bitcast(f32, (@as(u32,hi_) << @as(u16,16)) | @as(u32, lo_) );
+
+    lo_ = tscRefBuffer[2];
+    hi_ = 0;
+    time_ref_f32[1] = @bitcast(f32, (@as(u32,hi_) << @as(u16,16)) | @as(u32, lo_) );
+}
+
+comptime {
+    @export_symbol(ptr_time_memcpy, "time_memcpy");
+    @export_symbol(ptr_time_ref, "time_ref");
+}
+
+comptime {
+    @export_symbol(ptr_X, "X");
+    @export_symbol(ptr_W, "W");
+    @export_symbol(ptr_res, "res");
+
+    @export_symbol(init_task);
+    @export_symbol(meshgemv_entry);
+    @export_symbol(meshgemv_host);
+
+    @rpc(@get_data_task_id(sys_mod.LAUNCH));
+}

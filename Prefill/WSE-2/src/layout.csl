@@ -1,0 +1,320 @@
+param P: i16;
+param dim_p_pe: i16;
+param pes_p_head: i16;
+param pes_p_kv_head: i16;
+param head_dim_p_pe: i16;
+param seq_len_p_pe: i16;
+param ffn_dim_p_pe: i16;
+
+const root: i16 = P / 2;
+
+const LAUNCH: color = @get_color(0);
+
+const C_R_0: color = @get_color(1);
+const C_R_1: color = @get_color(2);
+const C_L_0: color = @get_color(3);
+const C_L_1: color = @get_color(4);
+
+const C_L_B: color = @get_color(5);
+const C_R_B: color = @get_color(6);
+
+const X_0: color = @get_color(7);
+const X_1: color = @get_color(8);
+const X_2: color = @get_color(9);
+
+const Y_0: color = @get_color(10);
+const Y_1: color = @get_color(11);
+const Y_2: color = @get_color(12);
+
+const X_shift_0: color = @get_color(13);
+const X_shift_1: color = @get_color(14);
+const X_shift_2: color = @get_color(15);
+
+const X_shift_re_0: color = @get_color(16);
+const X_shift_re_1: color = @get_color(17);
+const X_shift_re_2: color = @get_color(18);
+
+const memcpy = @import_module( "<memcpy/get_params>", .{
+    .width = P,
+    .height = P,
+    .LAUNCH = LAUNCH
+});
+
+const comm = @import_module("comm_lib/comm_layout.csl", .{
+    .P = P,
+    .x_colors = [4]color{C_R_0, C_R_1, C_L_0, C_L_1},
+
+    .x_interleave = [3]color{X_0, X_1, X_2},
+    .y_interleave = [3]color{Y_0, Y_1, Y_2},
+
+    .x_shift_interleave = [3]color{X_shift_0, X_shift_1, X_shift_2},
+    .x_shift_re_interleave = [3]color{X_shift_re_0, X_shift_re_1, X_shift_re_2},
+});
+
+const math = @import_module("<math>");
+
+layout {
+    @set_rectangle(P, P);
+
+    var px: i16 = 0;
+    var py: i16 = 0;
+
+    var shift_reverse: bool = false;
+
+    const comm_even = comm.get_step_params(true);
+    const comm_odd = comm.get_step_params(false);
+
+    px = 0;
+    while (px < P) : (px += 2) {
+        const memcpy_params = memcpy.get_params(px);
+
+        py = 0;
+        while (py < P) : (py += 1) {
+            const two_hop_comm_params = comm.get_two_hop_comm_params(px, py);
+            if (py % 2 == 0) {
+                shift_reverse = true;
+            } else {
+                shift_reverse = false;
+            }
+
+            @set_tile_code(px, py, "prefill.csl", .{
+                .memcpy_params = memcpy_params,
+                .comm_params = @concat_structs(@concat_structs(comm_even, two_hop_comm_params), .{ 
+                    .left_bd_color = C_L_B, .right_bd_color = C_R_B,
+                }),
+                .P = P, .dim_p_pe = dim_p_pe, .seq_len_p_pe = seq_len_p_pe, .ffn_dim_p_pe = ffn_dim_p_pe,
+                .shift_reverse = shift_reverse,
+            });
+
+            {
+                @set_color_config(px, py, comm_even.c_right_send, .{ .routes = .{ .rx = .{RAMP}, .tx = .{EAST} } });
+                @set_color_config(px, py, comm_even.c_right_recv, .{ .routes = .{ .rx = .{WEST}, .tx = .{RAMP} } });
+
+                @set_color_config(px, py, comm_even.c_left_recv, .{ .routes = .{ .rx = .{EAST}, .tx = .{RAMP} } });
+                @set_color_config(px, py, comm_even.c_left_send, .{ .routes = .{ .rx = .{RAMP}, .tx = .{WEST} } });
+            }
+
+            {
+                if (px == root) {
+                    @set_color_config(px, py, C_L_B, .{ .routes = .{ .rx = .{RAMP}, .tx = .{WEST} } });
+                    @set_color_config(px, py, C_R_B, .{ .routes = .{ .rx = .{RAMP}, .tx = .{EAST} } });
+                } else {
+                    if (px == 0) {
+                        @set_color_config(px, py, C_L_B, .{ .routes = .{ .rx = .{EAST}, .tx = .{RAMP} } });
+                    } else if (px == P-1) {
+                        @set_color_config(px, py, C_R_B, .{ .routes = .{ .rx = .{WEST}, .tx = .{RAMP} } });
+                    } else {
+                        if (px < root) {
+                            @set_color_config(px, py, C_L_B, .{ .routes = .{ .rx = .{EAST}, .tx = .{RAMP, WEST} } });
+                        } else { // px > root
+                            @set_color_config(px, py, C_R_B, .{ .routes = .{ .rx = .{WEST}, .tx = .{RAMP, EAST} } });
+                        }
+                    }
+                }
+            }
+
+            {
+                if (px == 0) {
+                    @set_color_config(px, py, two_hop_comm_params.x_recv_color, .{ .routes = .{ .rx = .{EAST}, .tx = .{RAMP} } });
+                    @set_color_config(px, py, two_hop_comm_params.x_send_color, .{ .routes = .{ .rx = .{RAMP}, .tx = .{EAST} } });
+
+                    @set_color_config(px, py, two_hop_comm_params.x_shift_recv_color, .{ .routes = .{ .rx = .{EAST}, .tx = .{RAMP} } });
+                    @set_color_config(px, py, two_hop_comm_params.x_shift_send_color, .{ .routes = .{ .rx = .{RAMP}, .tx = .{EAST} } });
+
+                    @set_color_config(px, py, two_hop_comm_params.x_shift_re_recv_color, .{ .routes = .{ .rx = .{EAST}, .tx = .{RAMP} } });
+                    @set_color_config(px, py, two_hop_comm_params.x_shift_re_send_color, .{ .routes = .{ .rx = .{RAMP}, .tx = .{EAST} } });
+                } else if (px == P-1) {
+                    @set_color_config(px, py, two_hop_comm_params.x_recv_color, .{ .routes = .{ .rx = .{WEST}, .tx = .{RAMP} } });
+                    @set_color_config(px, py, two_hop_comm_params.x_send_color, .{ .routes = .{ .rx = .{RAMP}, .tx = .{WEST} } });
+
+                    @set_color_config(px, py, two_hop_comm_params.x_shift_recv_color, .{ .routes = .{ .rx = .{WEST}, .tx = .{RAMP} } });
+                    @set_color_config(px, py, two_hop_comm_params.x_shift_send_color, .{ .routes = .{ .rx = .{RAMP}, .tx = .{WEST} } });
+
+                    @set_color_config(px, py, two_hop_comm_params.x_shift_re_recv_color, .{ .routes = .{ .rx = .{WEST}, .tx = .{RAMP} } });
+                    @set_color_config(px, py, two_hop_comm_params.x_shift_re_send_color, .{ .routes = .{ .rx = .{RAMP}, .tx = .{WEST} } });
+                } else {
+                    if (px % 2 == 0) {
+                        @set_color_config(px, py, two_hop_comm_params.x_recv_color, .{ .routes = .{ .rx = .{WEST}, .tx = .{RAMP} } });
+                        @set_color_config(px, py, two_hop_comm_params.x_send_color, .{ .routes = .{ .rx = .{RAMP}, .tx = .{EAST} } });
+                        @set_color_config(px, py, two_hop_comm_params.x_tran_color, .{ .routes = .{ .rx = .{EAST}, .tx = .{WEST} } });
+
+                        @set_color_config(px, py, two_hop_comm_params.x_shift_recv_color, .{ .routes = .{ .rx = .{WEST}, .tx = .{RAMP} } });
+                        @set_color_config(px, py, two_hop_comm_params.x_shift_send_color, .{ .routes = .{ .rx = .{RAMP}, .tx = .{EAST} } });
+                        @set_color_config(px, py, two_hop_comm_params.x_shift_tran_color, .{ .routes = .{ .rx = .{EAST}, .tx = .{WEST} } });
+
+                        @set_color_config(px, py, two_hop_comm_params.x_shift_re_recv_color, .{ .routes = .{ .rx = .{EAST}, .tx = .{RAMP} } });
+                        @set_color_config(px, py, two_hop_comm_params.x_shift_re_send_color, .{ .routes = .{ .rx = .{RAMP}, .tx = .{WEST} } });
+                        @set_color_config(px, py, two_hop_comm_params.x_shift_re_tran_color, .{ .routes = .{ .rx = .{WEST}, .tx = .{EAST} } });
+                    } else {
+                        @set_color_config(px, py, two_hop_comm_params.x_recv_color, .{ .routes = .{ .rx = .{EAST}, .tx = .{RAMP} } });
+                        @set_color_config(px, py, two_hop_comm_params.x_send_color, .{ .routes = .{ .rx = .{RAMP}, .tx = .{WEST} } });
+                        @set_color_config(px, py, two_hop_comm_params.x_tran_color, .{ .routes = .{ .rx = .{WEST}, .tx = .{EAST} } });
+
+                        @set_color_config(px, py, two_hop_comm_params.x_shift_recv_color, .{ .routes = .{ .rx = .{EAST}, .tx = .{RAMP} } });
+                        @set_color_config(px, py, two_hop_comm_params.x_shift_send_color, .{ .routes = .{ .rx = .{RAMP}, .tx = .{WEST} } });
+                        @set_color_config(px, py, two_hop_comm_params.x_shift_tran_color, .{ .routes = .{ .rx = .{WEST}, .tx = .{EAST} } });
+
+                        @set_color_config(px, py, two_hop_comm_params.x_shift_re_recv_color, .{ .routes = .{ .rx = .{WEST}, .tx = .{RAMP} } });
+                        @set_color_config(px, py, two_hop_comm_params.x_shift_re_send_color, .{ .routes = .{ .rx = .{RAMP}, .tx = .{EAST} } });
+                        @set_color_config(px, py, two_hop_comm_params.x_shift_re_tran_color, .{ .routes = .{ .rx = .{EAST}, .tx = .{WEST} } });
+                    }
+                }
+
+                if (py == 0) {
+                    @set_color_config(px, py, two_hop_comm_params.y_recv_color, .{ .routes = .{ .rx = .{SOUTH}, .tx = .{RAMP} } });
+                    @set_color_config(px, py, two_hop_comm_params.y_send_color, .{ .routes = .{ .rx = .{RAMP}, .tx = .{SOUTH} } });
+                } else if (py == P-1) {
+                    @set_color_config(px, py, two_hop_comm_params.y_recv_color, .{ .routes = .{ .rx = .{NORTH}, .tx = .{RAMP} } });
+                    @set_color_config(px, py, two_hop_comm_params.y_send_color, .{ .routes = .{ .rx = .{RAMP}, .tx = .{NORTH} } });
+                } else {
+                    if (py % 2 == 0) {
+                        @set_color_config(px, py, two_hop_comm_params.y_recv_color, .{ .routes = .{ .rx = .{NORTH}, .tx = .{RAMP} } });
+                        @set_color_config(px, py, two_hop_comm_params.y_send_color, .{ .routes = .{ .rx = .{RAMP}, .tx = .{SOUTH} } });
+                        @set_color_config(px, py, two_hop_comm_params.y_tran_color, .{ .routes = .{ .rx = .{SOUTH}, .tx = .{NORTH} } });
+                    } else {
+                        @set_color_config(px, py, two_hop_comm_params.y_recv_color, .{ .routes = .{ .rx = .{SOUTH}, .tx = .{RAMP} } });
+                        @set_color_config(px, py, two_hop_comm_params.y_send_color, .{ .routes = .{ .rx = .{RAMP}, .tx = .{NORTH} } });
+                        @set_color_config(px, py, two_hop_comm_params.y_tran_color, .{ .routes = .{ .rx = .{NORTH}, .tx = .{SOUTH} } });
+                    }
+                }
+            }
+
+        }
+    }
+
+    px = 1;
+    while (px < P) : (px += 2) {
+        const memcpy_params = memcpy.get_params(px);
+
+        py = 0;
+        while (py < P) : (py += 1) {
+            const two_hop_comm_params = comm.get_two_hop_comm_params(px, py);
+            if (py % 2 == 0) {
+                shift_reverse = true;
+            } else {
+                shift_reverse = false;
+            }
+
+            @set_tile_code(px, py, "prefill.csl", .{
+                .memcpy_params = memcpy_params,
+                .comm_params = @concat_structs(@concat_structs(comm_odd, two_hop_comm_params), .{ 
+                    .left_bd_color = C_L_B, .right_bd_color = C_R_B,
+                }),
+                .P = P, .dim_p_pe = dim_p_pe, .seq_len_p_pe = seq_len_p_pe, .ffn_dim_p_pe = ffn_dim_p_pe,
+                .shift_reverse = shift_reverse,
+            });
+
+            {
+                @set_color_config(px, py, comm_odd.c_right_send, .{ .routes = .{ .rx = .{RAMP}, .tx = .{EAST} } });
+                @set_color_config(px, py, comm_odd.c_right_recv, .{ .routes = .{ .rx = .{WEST}, .tx = .{RAMP} } });
+
+                @set_color_config(px, py, comm_odd.c_left_recv, .{ .routes = .{ .rx = .{EAST}, .tx = .{RAMP} } });
+                @set_color_config(px, py, comm_odd.c_left_send, .{ .routes = .{ .rx = .{RAMP}, .tx = .{WEST} } });
+            }
+
+            {
+                if (px == root) {
+                    @set_color_config(px, py, C_L_B, .{ .routes = .{ .rx = .{RAMP}, .tx = .{WEST} } });
+                    @set_color_config(px, py, C_R_B, .{ .routes = .{ .rx = .{RAMP}, .tx = .{EAST} } });
+                } else {
+                    if (px == 0) {
+                        @set_color_config(px, py, C_L_B, .{ .routes = .{ .rx = .{EAST}, .tx = .{RAMP} } });
+                    } else if (px == P-1) {
+                        @set_color_config(px, py, C_R_B, .{ .routes = .{ .rx = .{WEST}, .tx = .{RAMP} } });
+                    } else {
+                        if (px < root) {
+                            @set_color_config(px, py, C_L_B, .{ .routes = .{ .rx = .{EAST}, .tx = .{RAMP, WEST} } });
+                        } else { // px > root
+                            @set_color_config(px, py, C_R_B, .{ .routes = .{ .rx = .{WEST}, .tx = .{RAMP, EAST} } });
+                        }
+                    }
+                }
+            }
+
+            {
+                if (px == 0) {
+                    @set_color_config(px, py, two_hop_comm_params.x_recv_color, .{ .routes = .{ .rx = .{EAST}, .tx = .{RAMP} } });
+                    @set_color_config(px, py, two_hop_comm_params.x_send_color, .{ .routes = .{ .rx = .{RAMP}, .tx = .{EAST} } });
+
+                    @set_color_config(px, py, two_hop_comm_params.x_shift_recv_color, .{ .routes = .{ .rx = .{EAST}, .tx = .{RAMP} } });
+                    @set_color_config(px, py, two_hop_comm_params.x_shift_send_color, .{ .routes = .{ .rx = .{RAMP}, .tx = .{EAST} } });
+
+                    @set_color_config(px, py, two_hop_comm_params.x_shift_re_recv_color, .{ .routes = .{ .rx = .{EAST}, .tx = .{RAMP} } });
+                    @set_color_config(px, py, two_hop_comm_params.x_shift_re_send_color, .{ .routes = .{ .rx = .{RAMP}, .tx = .{EAST} } });
+                } else if (px == P-1) {
+                    @set_color_config(px, py, two_hop_comm_params.x_recv_color, .{ .routes = .{ .rx = .{WEST}, .tx = .{RAMP} } });
+                    @set_color_config(px, py, two_hop_comm_params.x_send_color, .{ .routes = .{ .rx = .{RAMP}, .tx = .{WEST} } });
+
+                    @set_color_config(px, py, two_hop_comm_params.x_shift_recv_color, .{ .routes = .{ .rx = .{WEST}, .tx = .{RAMP} } });
+                    @set_color_config(px, py, two_hop_comm_params.x_shift_send_color, .{ .routes = .{ .rx = .{RAMP}, .tx = .{WEST} } });
+
+                    @set_color_config(px, py, two_hop_comm_params.x_shift_re_recv_color, .{ .routes = .{ .rx = .{WEST}, .tx = .{RAMP} } });
+                    @set_color_config(px, py, two_hop_comm_params.x_shift_re_send_color, .{ .routes = .{ .rx = .{RAMP}, .tx = .{WEST} } });
+                } else {
+                    if (px % 2 == 0) {
+                        @set_color_config(px, py, two_hop_comm_params.x_recv_color, .{ .routes = .{ .rx = .{WEST}, .tx = .{RAMP} } });
+                        @set_color_config(px, py, two_hop_comm_params.x_send_color, .{ .routes = .{ .rx = .{RAMP}, .tx = .{EAST} } });
+                        @set_color_config(px, py, two_hop_comm_params.x_tran_color, .{ .routes = .{ .rx = .{EAST}, .tx = .{WEST} } });
+
+                        @set_color_config(px, py, two_hop_comm_params.x_shift_recv_color, .{ .routes = .{ .rx = .{WEST}, .tx = .{RAMP} } });
+                        @set_color_config(px, py, two_hop_comm_params.x_shift_send_color, .{ .routes = .{ .rx = .{RAMP}, .tx = .{EAST} } });
+                        @set_color_config(px, py, two_hop_comm_params.x_shift_tran_color, .{ .routes = .{ .rx = .{EAST}, .tx = .{WEST} } });
+
+                        @set_color_config(px, py, two_hop_comm_params.x_shift_re_recv_color, .{ .routes = .{ .rx = .{EAST}, .tx = .{RAMP} } });
+                        @set_color_config(px, py, two_hop_comm_params.x_shift_re_send_color, .{ .routes = .{ .rx = .{RAMP}, .tx = .{WEST} } });
+                        @set_color_config(px, py, two_hop_comm_params.x_shift_re_tran_color, .{ .routes = .{ .rx = .{WEST}, .tx = .{EAST} } });
+                    } else {
+                        @set_color_config(px, py, two_hop_comm_params.x_recv_color, .{ .routes = .{ .rx = .{EAST}, .tx = .{RAMP} } });
+                        @set_color_config(px, py, two_hop_comm_params.x_send_color, .{ .routes = .{ .rx = .{RAMP}, .tx = .{WEST} } });
+                        @set_color_config(px, py, two_hop_comm_params.x_tran_color, .{ .routes = .{ .rx = .{WEST}, .tx = .{EAST} } });
+
+                        @set_color_config(px, py, two_hop_comm_params.x_shift_recv_color, .{ .routes = .{ .rx = .{EAST}, .tx = .{RAMP} } });
+                        @set_color_config(px, py, two_hop_comm_params.x_shift_send_color, .{ .routes = .{ .rx = .{RAMP}, .tx = .{WEST} } });
+                        @set_color_config(px, py, two_hop_comm_params.x_shift_tran_color, .{ .routes = .{ .rx = .{WEST}, .tx = .{EAST} } });
+
+                        @set_color_config(px, py, two_hop_comm_params.x_shift_re_recv_color, .{ .routes = .{ .rx = .{WEST}, .tx = .{RAMP} } });
+                        @set_color_config(px, py, two_hop_comm_params.x_shift_re_send_color, .{ .routes = .{ .rx = .{RAMP}, .tx = .{EAST} } });
+                        @set_color_config(px, py, two_hop_comm_params.x_shift_re_tran_color, .{ .routes = .{ .rx = .{EAST}, .tx = .{WEST} } });
+                    }
+                }
+
+                if (py == 0) {
+                    @set_color_config(px, py, two_hop_comm_params.y_recv_color, .{ .routes = .{ .rx = .{SOUTH}, .tx = .{RAMP} } });
+                    @set_color_config(px, py, two_hop_comm_params.y_send_color, .{ .routes = .{ .rx = .{RAMP}, .tx = .{SOUTH} } });
+                } else if (py == P-1) {
+                    @set_color_config(px, py, two_hop_comm_params.y_recv_color, .{ .routes = .{ .rx = .{NORTH}, .tx = .{RAMP} } });
+                    @set_color_config(px, py, two_hop_comm_params.y_send_color, .{ .routes = .{ .rx = .{RAMP}, .tx = .{NORTH} } });
+                } else {
+                    if (py % 2 == 0) {
+                        @set_color_config(px, py, two_hop_comm_params.y_recv_color, .{ .routes = .{ .rx = .{NORTH}, .tx = .{RAMP} } });
+                        @set_color_config(px, py, two_hop_comm_params.y_send_color, .{ .routes = .{ .rx = .{RAMP}, .tx = .{SOUTH} } });
+                        @set_color_config(px, py, two_hop_comm_params.y_tran_color, .{ .routes = .{ .rx = .{SOUTH}, .tx = .{NORTH} } });
+                    } else {
+                        @set_color_config(px, py, two_hop_comm_params.y_recv_color, .{ .routes = .{ .rx = .{SOUTH}, .tx = .{RAMP} } });
+                        @set_color_config(px, py, two_hop_comm_params.y_send_color, .{ .routes = .{ .rx = .{RAMP}, .tx = .{NORTH} } });
+                        @set_color_config(px, py, two_hop_comm_params.y_tran_color, .{ .routes = .{ .rx = .{NORTH}, .tx = .{SOUTH} } });
+                    }
+                }
+            }
+
+        }
+    }
+
+    @export_name("X", [*]f16, true);
+    @export_name("W", [*]f16, true);
+    @export_name("Q_weight", [*]f16, true);
+    @export_name("K_weight", [*]f16, true);
+    @export_name("V_weight", [*]f16, true);
+    @export_name("freqs_sin", [*]f16, true);
+    @export_name("freqs_cos", [*]f16, true);
+    @export_name("O_weight", [*]f16, true);
+    @export_name("UP_weight", [*]f16, true);
+    @export_name("GATE_weight", [*]f16, true);
+    @export_name("DOWN_weight", [*]f16, true);
+
+    @export_name("init_task", fn()void);
+    @export_name("prefill_host", fn(i16, i16)void);
+
+    @export_name("time_memcpy", [*]f32, true);
+    @export_name("time_ref", [*]f32, true);
+}
