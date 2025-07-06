@@ -61,4 +61,4 @@ bash ./run_device.sh model_config/test.json
 - Optimal performance is achieved when dimensions are divisible by P
 - Consider memory constraints when selecting batch size and sequence length
 - Decode phase is memory-bandwidth bound, so efficient data layout is crucial
-- The `group_num` parameter allows for efficient parallelization across PE groups
+- The `group_num` parameter allows for a trade-off between routing resources and allreduce latency
