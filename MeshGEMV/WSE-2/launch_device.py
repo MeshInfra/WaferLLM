@@ -22,7 +22,7 @@ def cast_tensor_u32(tensor):
 
 def parse_args():
     
-    parser = argparse.ArgumentParser(description="MeshGEMV simulation")
+    parser = argparse.ArgumentParser(description="MeshGEMV on WSE-2")
     parser.add_argument("--P", required=True, type=int, help="PEs rectangle size: P x P")
     parser.add_argument("--M", required=True, type=int, help="Left vector dimension: 1 x M")
     parser.add_argument("--N", required=True, type=int, help="Right matrix dimension: M x N")
