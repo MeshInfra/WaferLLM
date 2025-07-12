@@ -64,7 +64,7 @@ class Config:
         self.ffn_dim = 64
         
 def parse_args():
-    parser = argparse.ArgumentParser(description="Prefill Simulation")
+    parser = argparse.ArgumentParser(description="Prefill on simulator")
     parser.add_argument("--config", default="config.json", type=str, help="Config file")
     args = parser.parse_args()
     return args

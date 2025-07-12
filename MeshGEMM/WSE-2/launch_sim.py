@@ -9,7 +9,7 @@ from cerebras.sdk.runtime.sdkruntimepybind import MemcpyDataType, MemcpyOrder
 
 def parse_args():
     #[N,K]@[K,M]
-    parser = argparse.ArgumentParser(description="MeshGEMM simulation")
+    parser = argparse.ArgumentParser(description="MeshGEMM on simulator")
     parser.add_argument("--P", required=True, type=int, help="PEs rectangle size: P x P")
     parser.add_argument("--M", required=True, type=int, help="Input context length")
     parser.add_argument("--K", required=True, type=int, help="Word vector dimension")

@@ -28,7 +28,7 @@ class Config:
         self.ffn_dim = 64
         
 def parse_args():
-    parser = argparse.ArgumentParser(description="Decode Simulation")
+    parser = argparse.ArgumentParser(description="Decode on simulator")
     parser.add_argument("--config", default="config.json", type=str, help="Config file")
     args = parser.parse_args()
     return args

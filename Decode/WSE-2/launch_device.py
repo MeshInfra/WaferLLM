@@ -34,7 +34,7 @@ class Config:
         self.ffn_dim = 64
         
 def parse_args():
-    parser = argparse.ArgumentParser(description="Move to right unit test")
+    parser = argparse.ArgumentParser(description="Decode on WSE-2")
     parser.add_argument("--config", default="config.json", type=str, help="Config file")
     args = parser.parse_args()
     return args
