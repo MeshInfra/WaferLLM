@@ -12,7 +12,7 @@ out_path = "compile_out"
 
 print("Start compiling: "+time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(time.time())), flush=True)
 
-# Instantiate copmiler
+# Instantiate compiler
 compiler = SdkCompiler()
 
 # Launch compile job
