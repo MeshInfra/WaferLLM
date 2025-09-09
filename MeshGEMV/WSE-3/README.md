@@ -6,16 +6,15 @@ This folder contains the implementation of the **MeshGEMV** algorithm, which com
 
 ## Platform
 
-- **Cerebras SDK version**: 1.2
-- **Cerebras ML Software version**: 2.3
-- **Hardware**: WSE-2 only
+- **Cerebras SDK version**: 1.4
+- **Cerebras ML Software version**: 2.5
+- **Hardware**: WSE-3 only
 
 ## Run with Simulator
 
 The simulator allows you to test and debug your MeshGEMV implementation before deploying to actual hardware.
 
 ```bash
-cd ./WSE-2
 # ./run_sim.sh P M N
 # Then we run [1, M]@[M, N] on P * P PE cores on cerebras simulator
 # Example
@@ -31,10 +30,9 @@ bash ./run_sim.sh 64 1024 1024
 
 ## Run with Cerebras
 
-Deploy and execute your MeshGEMV algorithm on the actual WSE-2 hardware.
+Deploy and execute your MeshGEMV algorithm on the actual WSE-3 hardware.
 
 ```bash
-cd ./WSE-2
 # ./run_device.sh P M N
 # Then we run [1, M]@[M, N] on P * P PE cores on cerebras chip
 # Example
@@ -42,11 +40,11 @@ bash ./run_device.sh 64 1024 1024
 ```
 
 **Prerequisites:**
-- Ensure you have access to a WSE-2 system
+- Ensure you have access to a WSE-3 system
 - Verify your environment is properly configured with Cerebras SDK
 - Check that you have the necessary permissions to run on hardware
 
 **Performance Considerations:**
-- The WSE-2 provides massive parallelism with thousands of cores
+- The WSE-3 provides massive parallelism with thousands of cores
 - Optimal performance is achieved when matrix dimensions are divisible by P
 - Consider memory constraints when selecting matrix and vector sizes

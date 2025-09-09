@@ -15,7 +15,6 @@ This folder contains the implementation of the **MeshGEMM** algorithm, which com
 The simulator allows you to test and debug your MeshGEMM implementation before deploying to actual hardware.
 
 ```bash
-cd ./WSE-2
 # ./run_sim.sh P M K N
 # Then we run [M, K]@[K, N] on P * P PE cores on cerebras simulator
 # Example
@@ -35,7 +34,6 @@ bash ./run_sim.sh 64 1024 1024 1024
 Deploy and execute your MeshGEMM algorithm on the actual WSE-2 hardware.
 
 ```bash
-cd ./WSE-2
 # ./run_device.sh P M K N
 # Then we run [M, K]@[K, N] on P * P PE cores on cerebras chip
 # Example
