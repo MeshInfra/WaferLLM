@@ -17,12 +17,14 @@ Evaluations show that WaferLLM achieves up to 200× higher accelerator utilizati
 You will need Cerebras SDK to reproduce our results.
 
 - **Download link:** https://www.cerebras.ai/developers/sdk-request
-- **Documentation:** https://cerebras-sdk-docs-120.netlify.app/
-- **SDK Version:** This version of code is developed and fully tested on Cerebras SDK v1.2.0
+- **Documentation:** 
+  - SDK v1.2.0 https://cerebras-sdk-docs-120.netlify.app/
+  - SDK v1.4.0 https://sdk.cerebras.net/
+<!-- - **SDK Version:** This version of code is developed and fully tested on Cerebras SDK v1.2.0 -->
 
 ### System Requirements
 
-- Access to a Cerebras WSE-2 system or Cerebras SDK simulator
+- Access to a Cerebras WSE-2/3 system or Cerebras SDK 1.2/1.4 simulator
 - Python 3.8 or higher
 - Sufficient memory for running simulations (32GB+ recommended for simulator)
 
@@ -45,9 +47,10 @@ Each unit test folder follows a consistent code structure:
 │       └── src/
 │           ├── comm_lib/          # Communication library
 │           │   ├── comm_layout.csl    # Layout for the library
-│           │   └── comm_pe.csl        # Implementation
+│           │   └── comm_pe.csl        # Communication Implementation
 │           ├── layout.csl         # Layout for the module
 │           └── <module>.csl       # Module implementation
+│   └── WSE-3/
 ```
 
 ### Quick Start
@@ -55,16 +58,16 @@ Each unit test folder follows a consistent code structure:
 We provide two main execution scripts for each module:
 
 1. **`run_sim.sh`** - Run on the Cerebras SDK simulator for development and testing
-2. **`run_device.sh`** - Execute on actual Cerebras WSE-2 hardware
+2. **`run_device.sh`** - Execute on actual Cerebras WSE-2/3 hardware
 
 ### Module-Specific Parameters
 
 Each module has specific parameters that can be configured. Please refer to the individual README files in each module directory:
 
-- [MeshGEMV/README.md](./MeshGEMV/README.md) - Matrix-vector multiplication parameters
-- [MeshGEMM/README.md](./MeshGEMM/README.md) - Matrix-matrix multiplication parameters
-- [Prefill/README.md](./Prefill/README.md) - Prefill phase configuration
-- [Decode/README.md](./Decode/README.md) - Decode phase configuration
+- [MeshGEMV/WSE-*/README.md](./MeshGEMV/README.md) - Matrix-vector multiplication parameters
+- [MeshGEMM/WSE-*/README.md](./MeshGEMM/README.md) - Matrix-matrix multiplication parameters
+- [Prefill/WSE-*/README.md](./Prefill/README.md) - Prefill phase configuration
+- [Decode/WSE-*/README.md](./Decode/README.md) - Decode phase configuration
 
 ### Communication Library
 
@@ -73,13 +76,13 @@ The `comm_lib` directory in each module contains our custom communication librar
 - `comm_layout.csl` - Defines the communication topology and routing
 - `comm_pe.csl` - Implements the processing element communication primitives
 
-This library enables efficient data movement across the massive mesh of cores on the WSE-2.
+This library enables efficient data movement across the massive mesh of cores on the WSE-2/3.
 
 ## Benchmarking
 
 To reproduce the performance results reported in our paper:
 
-1. Ensure you have access to a Cerebras WSE-2 system
+1. Ensure you have access to a Cerebras WSE-2/3 system
 2. Run the benchmark scripts in each module directory
 3. Compare results with the baseline GPU implementations
 

@@ -1,0 +1,185 @@
+param P: i16;
+param Mt: i16;
+param Nt: i16;
+
+param pe_num_group: i16;
+
+param root_1st_phase: i16;
+param root_2nd_phase: i16;
+
+const LAUNCH: color = @get_color(0);
+
+const C_D_0: color = @get_color(5);
+const C_D_1: color = @get_color(6);
+const C_U_0: color = @get_color(7);
+const C_U_1: color = @get_color(8);
+
+const C_U_B: color = @get_color(9);
+const C_D_B: color = @get_color(10);
+
+const C_Y_up_reduce_0: color = @get_color(13);
+const C_Y_up_reduce_1: color = @get_color(14);
+
+const C_Y_down_reduce_0: color = @get_color(15);
+const C_Y_down_reduce_1: color = @get_color(16);
+
+const memcpy = @import_module( "<memcpy/get_params>", .{
+    .width = P,
+    .height = P,
+    .LAUNCH = LAUNCH
+});
+
+const comm = @import_module("comm_lib/comm_layout.csl", .{
+    .P = P,
+    .y_colors = [4]color{C_D_0, C_D_1, C_U_0, C_U_1},
+    .y_reduce_colors = [4]color{C_Y_up_reduce_0, C_Y_up_reduce_1, C_Y_down_reduce_0, C_Y_down_reduce_1}
+});
+
+const math = @import_module("<math>");
+
+layout {
+    @set_rectangle(P, P);
+
+    var px: i16 = 0;
+    var py: i16 = 0;
+
+    const comm_even = comm.get_step_params(true);
+    const comm_odd = comm.get_step_params(false);
+    
+    px = 0;
+    while (px < P) : (px += 1) {
+        const memcpy_params = memcpy.get_params(px);
+
+        py = 0;
+        while (py < P) : (py += 2) {
+
+            const quotient_y: i16 = @as(i16, math.floor_f16(@as(f16, py) / @as(f16, pe_num_group)));
+            const remainder_y: i16 = py - quotient_y * pe_num_group;
+
+            const reduce_2nd_params = comm.get_reduce_2nd_params(py, quotient_y);
+
+            @set_tile_code(px, py, "meshgemv.csl", .{
+                .memcpy_params = memcpy_params,
+                .comm_params = @concat_structs(@concat_structs(comm_even, reduce_2nd_params), .{
+                    .up_bd_color = C_U_B, .down_bd_color = C_D_B,
+                }),
+                .P = P, .Mt = Mt, .Nt = Nt, .pe_num_group = pe_num_group,
+                .root_1st_phase = root_1st_phase, .root_2nd_phase = root_2nd_phase,
+            });
+
+            // Broadcast along y-axis
+            if (py == root_2nd_phase) {
+                @set_color_config(px, py, C_U_B, .{ .routes = .{ .rx = .{RAMP}, .tx = .{NORTH} } });
+                @set_color_config(px, py, C_D_B, .{ .routes = .{ .rx = .{RAMP}, .tx = .{SOUTH} } });
+            } else {
+                if (py == 0) {
+                    @set_color_config(px, py, C_U_B, .{ .routes = .{ .rx = .{SOUTH}, .tx = .{RAMP} } });
+                } else if (py == P-1) {
+                    @set_color_config(px, py, C_D_B, .{ .routes = .{ .rx = .{NORTH}, .tx = .{RAMP} } });
+                } else {
+                    if (py < root_2nd_phase) {
+                        @set_color_config(px, py, C_U_B, .{ .routes = .{ .rx = .{SOUTH}, .tx = .{RAMP, NORTH} } });
+                    } else { // py > root_2nd_phase
+                        @set_color_config(px, py, C_D_B, .{ .routes = .{ .rx = .{NORTH}, .tx = .{RAMP, SOUTH} } });
+                    }
+                }
+            }
+
+            // Reduce along y-axis
+            if (remainder_y == root_1st_phase) {
+                @set_color_config(px, py, reduce_2nd_params.c_y_up_reduce_recv, .{ .routes = .{ .rx = .{SOUTH}, .tx = .{RAMP} } });
+                @set_color_config(px, py, reduce_2nd_params.c_y_up_reduce_send, .{ .routes = .{ .rx = .{RAMP}, .tx = .{NORTH} } });
+
+                @set_color_config(px, py, reduce_2nd_params.c_y_down_reduce_recv, .{ .routes = .{ .rx = .{NORTH}, .tx = .{RAMP} } });
+                @set_color_config(px, py, reduce_2nd_params.c_y_down_reduce_send, .{ .routes = .{ .rx = .{RAMP}, .tx = .{SOUTH} } });
+            } else {
+                @set_color_config(px, py, reduce_2nd_params.c_y_up_reduce_send, .{ .routes = .{ .rx = .{SOUTH}, .tx = .{NORTH} } });
+                @set_color_config(px, py, reduce_2nd_params.c_y_up_reduce_recv, .{ .routes = .{ .rx = .{SOUTH}, .tx = .{NORTH} } });
+
+                @set_color_config(px, py, reduce_2nd_params.c_y_down_reduce_send, .{ .routes = .{ .rx = .{NORTH}, .tx = .{SOUTH} } });
+                @set_color_config(px, py, reduce_2nd_params.c_y_down_reduce_recv, .{ .routes = .{ .rx = .{NORTH}, .tx = .{SOUTH} } });
+            }
+
+            // Step by step communication
+            {
+                @set_color_config(px, py, comm_even.c_down_send, .{ .routes = .{ .rx = .{RAMP}, .tx = .{SOUTH} } });
+                @set_color_config(px, py, comm_even.c_down_recv, .{ .routes = .{ .rx = .{NORTH}, .tx = .{RAMP} } });
+
+                @set_color_config(px, py, comm_even.c_up_recv, .{ .routes = .{ .rx = .{SOUTH}, .tx = .{RAMP} } });
+                @set_color_config(px, py, comm_even.c_up_send, .{ .routes = .{ .rx = .{RAMP}, .tx = .{NORTH} } });
+            }
+        }
+
+        py = 1;
+        while (py < P) : (py += 2) {
+
+            const quotient_y: i16 = @as(i16, math.floor_f16(@as(f16, py) / @as(f16, pe_num_group)));
+            const remainder_y: i16 = py - quotient_y * pe_num_group;
+
+            const reduce_2nd_params = comm.get_reduce_2nd_params(py, quotient_y);
+
+            @set_tile_code(px, py, "meshgemv.csl", .{
+                .memcpy_params = memcpy_params,
+                .comm_params = @concat_structs(@concat_structs(comm_odd, reduce_2nd_params), .{
+                    .up_bd_color = C_U_B, .down_bd_color = C_D_B,
+                }),
+                .P = P, .Mt = Mt, .Nt = Nt, .pe_num_group = pe_num_group,
+                .root_1st_phase = root_1st_phase, .root_2nd_phase = root_2nd_phase,
+            });
+
+            if (py == root_2nd_phase) {
+                @set_color_config(px, py, C_U_B, .{ .routes = .{ .rx = .{RAMP}, .tx = .{NORTH} } });
+                @set_color_config(px, py, C_D_B, .{ .routes = .{ .rx = .{RAMP}, .tx = .{SOUTH} } });
+            } else {
+                if (py == 0) {
+                    @set_color_config(px, py, C_U_B, .{ .routes = .{ .rx = .{SOUTH}, .tx = .{RAMP} } });
+                } else if (py == P-1) {
+                    @set_color_config(px, py, C_D_B, .{ .routes = .{ .rx = .{NORTH}, .tx = .{RAMP} } });
+                } else {
+                    if (py < root_2nd_phase) {
+                        @set_color_config(px, py, C_U_B, .{ .routes = .{ .rx = .{SOUTH}, .tx = .{RAMP, NORTH} } });
+                    } else { // py > root_2nd_phase
+                        @set_color_config(px, py, C_D_B, .{ .routes = .{ .rx = .{NORTH}, .tx = .{RAMP, SOUTH} } });
+                    }
+                }
+            }
+
+            // Reduce along y-axis
+            if (remainder_y == root_1st_phase) {
+                @set_color_config(px, py, reduce_2nd_params.c_y_up_reduce_recv, .{ .routes = .{ .rx = .{SOUTH}, .tx = .{RAMP} } });
+                @set_color_config(px, py, reduce_2nd_params.c_y_up_reduce_send, .{ .routes = .{ .rx = .{RAMP}, .tx = .{NORTH} } });
+
+                @set_color_config(px, py, reduce_2nd_params.c_y_down_reduce_recv, .{ .routes = .{ .rx = .{NORTH}, .tx = .{RAMP} } });
+                @set_color_config(px, py, reduce_2nd_params.c_y_down_reduce_send, .{ .routes = .{ .rx = .{RAMP}, .tx = .{SOUTH} } });
+            } else {
+                @set_color_config(px, py, reduce_2nd_params.c_y_up_reduce_send, .{ .routes = .{ .rx = .{SOUTH}, .tx = .{NORTH} } });
+                @set_color_config(px, py, reduce_2nd_params.c_y_up_reduce_recv, .{ .routes = .{ .rx = .{SOUTH}, .tx = .{NORTH} } });
+
+                @set_color_config(px, py, reduce_2nd_params.c_y_down_reduce_send, .{ .routes = .{ .rx = .{NORTH}, .tx = .{SOUTH} } });
+                @set_color_config(px, py, reduce_2nd_params.c_y_down_reduce_recv, .{ .routes = .{ .rx = .{NORTH}, .tx = .{SOUTH} } });
+            }
+
+            {
+                @set_color_config(px, py, comm_odd.c_down_send, .{ .routes = .{ .rx = .{RAMP}, .tx = .{SOUTH} } });
+                @set_color_config(px, py, comm_odd.c_down_recv, .{ .routes = .{ .rx = .{NORTH}, .tx = .{RAMP} } });
+
+                @set_color_config(px, py, comm_odd.c_up_recv, .{ .routes = .{ .rx = .{SOUTH}, .tx = .{RAMP} } });
+                @set_color_config(px, py, comm_odd.c_up_send, .{ .routes = .{ .rx = .{RAMP}, .tx = .{NORTH} } });
+            }
+        }
+    }
+
+    @export_name("X", [*]f16, true);
+    @export_name("W", [*]f16, true);
+    @export_name("res", [*]f16, true);
+
+    @export_name("init_task", fn()void);
+    @export_name("meshgemv_entry", fn()void);
+    @export_name("meshgemv_host", fn(i16, i16)void);
+
+    @export_name("time_memcpy", [*]f32, true);
+    @export_name("time_ref", [*]f32, true);
+    
+    @export_name("f_memcpy_timestamps", fn()void);
+    @export_name("f_reference_timestamps", fn()void);
+}
