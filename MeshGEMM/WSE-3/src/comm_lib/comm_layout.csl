@@ -1,0 +1,146 @@
+param P: i16;
+param x_interleave: [3]color;
+param x_shift_interleave: [3]color;
+param x_shift_re_interleave: [3]color;
+param y_interleave: [3]color;
+
+
+const x_C0 : color = x_interleave[0];
+const x_C1 : color = x_interleave[1];
+const x_C2 : color = x_interleave[2];
+
+const x_shift_C0 : color = x_shift_interleave[0];
+const x_shift_C1 : color = x_shift_interleave[1];
+const x_shift_C2 : color = x_shift_interleave[2];
+
+const x_shift_re_C0 : color = x_shift_re_interleave[0];
+const x_shift_re_C1 : color = x_shift_re_interleave[1];
+const x_shift_re_C2 : color = x_shift_re_interleave[2];
+
+const y_C0 : color = y_interleave[0];
+const y_C1 : color = y_interleave[1];
+const y_C2 : color = y_interleave[2];
+
+fn get_params(px: i16, py: i16) comptime_struct {
+
+    var px_3: i16 = px % 3;
+    var py_3: i16 = py % 3;
+
+    var x_recv_color: color = x_C0;
+    var x_send_color: color = x_C1;
+    var x_tran_color: color = x_C2;
+
+    var x_shift_recv_color: color = x_shift_C0;
+    var x_shift_send_color: color = x_shift_C1;
+    var x_shift_tran_color: color = x_shift_C2;
+
+    var x_shift_re_send_color: color = x_shift_re_C0;
+    var x_shift_re_recv_color: color = x_shift_re_C1;
+    var x_shift_re_tran_color: color = x_shift_re_C2;
+
+    if (px == 0) {
+        x_recv_color = x_C0;
+        x_send_color = x_C1;
+
+        x_shift_recv_color = x_shift_C0;
+        x_shift_send_color = x_shift_C1;
+
+        x_shift_re_send_color = x_shift_re_C0;
+        x_shift_re_recv_color = x_shift_re_C1;
+    } else if (px == P-1) {
+        x_tran_color = x_interleave[(px + 1) % 3];
+
+        x_shift_tran_color = x_shift_interleave[(px + 1) % 3];
+
+        x_shift_re_tran_color = x_shift_re_interleave[(px + 1) % 3];
+        if (P % 2 == 0) {
+            x_recv_color = x_interleave[px_3];
+            x_send_color = x_interleave[(px - 1) % 3];
+
+            x_shift_recv_color = x_shift_interleave[px_3];
+            x_shift_send_color = x_shift_interleave[(px - 1) % 3];
+
+            x_shift_re_send_color = x_shift_re_interleave[px_3];
+            x_shift_re_recv_color = x_shift_re_interleave[(px - 1) % 3];
+        } else {
+            x_recv_color = x_interleave[(px - 1) % 3];
+            x_send_color = x_interleave[px_3];
+
+            x_shift_recv_color = x_shift_interleave[(px - 1) % 3];
+            x_shift_send_color = x_shift_interleave[px_3];
+
+            x_shift_re_send_color = x_shift_re_interleave[(px - 1) % 3];
+            x_shift_re_recv_color = x_shift_re_interleave[px_3];
+        }
+    } else {
+        x_tran_color = x_interleave[px_3];
+
+        x_shift_tran_color = x_shift_interleave[px_3];
+
+        x_shift_re_tran_color = x_shift_re_interleave[px_3];
+        if (px % 2 == 0) {
+            x_send_color = x_interleave[(px + 1) % 3];
+            x_recv_color = x_interleave[(px - 1) % 3];
+
+            x_shift_send_color = x_shift_interleave[(px + 1) % 3];
+            x_shift_recv_color = x_shift_interleave[(px - 1) % 3];
+
+            x_shift_re_recv_color = x_shift_re_interleave[(px + 1) % 3];
+            x_shift_re_send_color = x_shift_re_interleave[(px - 1) % 3];
+        } else {  
+            x_send_color = x_interleave[(px - 1) % 3];
+            x_recv_color = x_interleave[(px + 1) % 3];
+
+            x_shift_send_color = x_shift_interleave[(px - 1) % 3];
+            x_shift_recv_color = x_shift_interleave[(px + 1) % 3];
+
+            x_shift_re_recv_color = x_shift_re_interleave[(px - 1) % 3];
+            x_shift_re_send_color = x_shift_re_interleave[(px + 1) % 3];
+        }
+    }
+
+
+    var y_recv_color: color = y_C0;
+    var y_send_color: color = y_C1;
+    var y_tran_color: color = y_C2;
+
+    if (py == 0) {
+        y_recv_color = y_C0;
+        y_send_color = y_C1;
+    } else if (py == P-1) {
+        if (P % 2 == 0) {
+            y_recv_color = y_interleave[py_3];
+            y_send_color = y_interleave[(py - 1) % 3];
+        } else {
+            y_recv_color = y_interleave[(py - 1) % 3];
+            y_send_color = y_interleave[py_3];
+        }
+    } else {
+        y_tran_color = y_interleave[py_3];
+        if (py % 2 == 0) {
+            y_send_color = y_interleave[(py + 1) % 3];
+            y_recv_color = y_interleave[(py - 1) % 3];
+        } else {  
+            y_send_color = y_interleave[(py - 1) % 3];
+            y_recv_color = y_interleave[(py + 1) % 3];
+        }
+    }
+
+    return .{
+        .x_send_color = x_send_color,
+        .x_recv_color = x_recv_color,
+        .x_tran_color = x_tran_color,
+
+        .x_shift_send_color = x_shift_send_color,
+        .x_shift_recv_color = x_shift_recv_color,
+        .x_shift_tran_color = x_shift_tran_color,
+
+        .x_shift_re_send_color = x_shift_re_send_color,
+        .x_shift_re_recv_color = x_shift_re_recv_color,
+        .x_shift_re_tran_color = x_shift_re_tran_color,
+
+        .y_send_color = y_send_color,
+        .y_recv_color = y_recv_color,
+        .y_tran_color = y_tran_color,
+    };
+}
