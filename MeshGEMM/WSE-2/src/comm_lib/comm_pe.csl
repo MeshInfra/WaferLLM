@@ -86,12 +86,12 @@ const x_shift_out_dsd = @get_dsd(fabout_dsd, .{
 
 // reverse
 const x_shift_re_in_dsd = @get_dsd(fabin_dsd, .{
-    .fabric_color = x_shift_re_recv_color, .extent = _Kt_Nt,
+    .fabric_color = x_shift_re_recv_color, .extent = _Mt_Kt,
     .input_queue = @get_input_queue(2),
     .simd_mode = .{ .simd_64 = true }
 });
 const x_shift_re_out_dsd = @get_dsd(fabout_dsd, .{
-    .fabric_color = x_shift_re_send_color, .extent = _Kt_Nt,
+    .fabric_color = x_shift_re_send_color, .extent = _Mt_Kt,
     .output_queue = @get_output_queue(3),
     .simd_mode = .{ .simd_64 = true }
 });

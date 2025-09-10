@@ -162,6 +162,4 @@ comptime {
     @export_symbol(init_task);
     @export_symbol(meshgemv_entry);
     @export_symbol(meshgemv_host);
-
-    @rpc(@get_data_task_id(sys_mod.LAUNCH));
 }

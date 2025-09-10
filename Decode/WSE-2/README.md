@@ -1,8 +1,8 @@
-# Prefill
+# Decode
 
 ## Overview
 
-This folder contains the implementation of the **Prefill** algorithm for transformer model inference on Cerebras WSE-2. The prefill phase processes the initial input sequence in parallel before transitioning to the decode phase.
+This folder contains the implementation of the **Decode** algorithm for transformer model inference on Cerebras WSE-2.
 
 ## Platform
 
@@ -12,23 +12,24 @@ This folder contains the implementation of the **Prefill** algorithm for transfo
 
 ## Configuration
 
-The Prefill implementation uses JSON configuration files to specify model parameters. Example configuration files can be found in `WSE-2/model_config/`.
+The Decode implementation uses JSON configuration files to specify model parameters. Example configuration files can be found in `model_config/`.
 
 **Configuration Parameters:**
-- `P`: Number of PEs in each dimension (creates P×P PE grid)
+- `P`: Number of PEs in each dimension (creates PÃ—P PE grid)
+- `group_num`: Number of PE groups for parallel execution
+- `bsz`: Batch size
 - `dim`: Model hidden dimension
 - `n_heads`: Number of attention heads
 - `n_kv_heads`: Number of key-value heads (for grouped-query attention)
 - `head_dim`: Dimension per attention head
-- `seq_len`: Sequence length to prefill
+- `seq_len`: Maximum sequence length
 - `ffn_dim`: Feed-forward network hidden dimension
 
 ## Run with Simulator
 
-The simulator allows you to test and debug your Prefill implementation before deploying to actual hardware.
+The simulator allows you to test and debug your Decode implementation before deploying to actual hardware.
 
 ```bash
-cd ./WSE-2
 # ./run_sim.sh [config_file]
 # If no config file is specified, uses config.json or default values
 # Example with test configuration
@@ -39,10 +40,9 @@ bash ./run_sim.sh model_config/test.json
 
 ## Run with Cerebras
 
-Deploy and execute your Prefill algorithm on the actual WSE-2 hardware.
+Deploy and execute your Decode algorithm on the actual WSE-2 hardware.
 
 ```bash
-cd ./WSE-2
 # ./run_device.sh [config_file]
 # If no config file is specified, uses config.json or default values
 # Example with test configuration
@@ -57,6 +57,6 @@ bash ./run_device.sh model_config/test.json
 **Performance Considerations:**
 - The WSE-2 provides massive parallelism with thousands of cores
 - Optimal performance is achieved when dimensions are divisible by P
-- Prefill phase benefits from parallel processing of the entire input sequence
-- Consider memory constraints when selecting sequence length and model dimensions
-- The implementation supports both warmup runs and multiple repeat runs for accurate performance measurement
+- Consider memory constraints when selecting batch size and sequence length
+- Decode phase is memory-bandwidth bound, so efficient data layout is crucial
+- The `group_num` parameter allows for a trade-off between routing resources and allreduce latency
