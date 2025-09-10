@@ -241,8 +241,8 @@ fn two_tree_allreduce_y(vector_buf_ptr: [*]f16) void {
 }
 
 comptime {
-    // @block(c_down_recv);
-    // @block(c_up_recv);
+    @block(reduce_1st_down_recv_queue_id);
+    @block(reduce_1st_up_recv_queue_id);
 
     if (@is_arch("wse3")) {
         @initialize_queue(reduce_1st_up_recv_queue_id, .{.color = c_up_recv});
