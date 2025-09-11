@@ -26,7 +26,6 @@ const C_Y_down_reduce_1: color = @get_color(16);
 const memcpy = @import_module( "<memcpy/get_params>", .{
     .width = P,
     .height = P,
-    .LAUNCH = LAUNCH
 });
 
 const comm = @import_module("comm_lib/comm_layout.csl", .{
