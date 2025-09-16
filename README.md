@@ -64,10 +64,10 @@ We provide two main execution scripts for each module:
 
 Each module has specific parameters that can be configured. Please refer to the individual README files in each module directory:
 
-- [MeshGEMV/WSE-*/README.md](./MeshGEMV/README.md) - Matrix-vector multiplication parameters
-- [MeshGEMM/WSE-*/README.md](./MeshGEMM/README.md) - Matrix-matrix multiplication parameters
-- [Prefill/WSE-*/README.md](./Prefill/README.md) - Prefill phase configuration
-- [Decode/WSE-*/README.md](./Decode/README.md) - Decode phase configuration
+- `MeshGEMV/WSE-*/README.md` - Matrix-vector multiplication parameters
+- `MeshGEMM/WSE-*/README.md` - Matrix-matrix multiplication parameters
+- `Prefill/WSE-*/README.md` - Prefill phase configuration
+- `Decode/WSE-*/README.md` - Decode phase configuration
 
 ### Communication Library
 
