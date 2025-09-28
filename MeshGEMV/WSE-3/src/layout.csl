@@ -7,7 +7,7 @@ param pe_num_group: i16;
 param root_1st_phase: i16;
 param root_2nd_phase: i16;
 
-const LAUNCH: color = @get_color(0);
+// const LAUNCH: color = @get_color(0);
 
 const C_D_0: color = @get_color(5);
 const C_D_1: color = @get_color(6);
@@ -15,7 +15,7 @@ const C_U_0: color = @get_color(7);
 const C_U_1: color = @get_color(8);
 
 const C_U_B: color = @get_color(9);
-const C_D_B: color = @get_color(10);
+const C_D_B: color = @get_color(12);
 
 const C_Y_up_reduce_0: color = @get_color(13);
 const C_Y_up_reduce_1: color = @get_color(14);
