@@ -25,6 +25,12 @@ param y_send_color: color;
 param y_recv_color: color;
 param y_tran_color: color;
 
+const ut1 = @get_ut_id(1);
+const ut2 = @get_ut_id(2);
+
+const ut3 = @get_ut_id(3);
+const ut4 = @get_ut_id(4);
+
 const x_send_queue_id = @get_output_queue(2);
 const x_recv_queue_id = @get_input_queue(2);
 
@@ -127,8 +133,10 @@ task x_shift_finish() void {
 }
 
 comptime {
-    @load_to_dsr(x_shift_out_dsr, x_shift_out_dsd, .{.async=true, .unblock=x_shift_finish_id});
-    @load_to_dsr(x_shift_re_out_dsr, x_shift_re_out_dsd, .{.async=true, .unblock=x_shift_finish_id});
+    @load_to_dsr(x_shift_out_dsr, x_shift_out_dsd, .{.async=true, .unblock=x_shift_finish_id, .ut_id = ut1});
+    @load_to_dsr(x_shift_in_dsr, x_shift_in_dsd, .{.async=true, .activate=x_shift_finish_id, .ut_id = ut2});
+    @load_to_dsr(x_shift_re_out_dsr, x_shift_re_out_dsd, .{.async=true, .unblock=x_shift_finish_id, .ut_id = ut1});
+    @load_to_dsr(x_shift_re_in_dsr, x_shift_re_in_dsd, .{.async=true, .activate=x_shift_finish_id, .ut_id = ut2});
 }
 
 fn left_matrix_shift(left_matrix_send_buffer_ptr: [*]f16, left_matrix_recv_buffer_ptr: [*]f16) void {
@@ -141,7 +149,6 @@ fn left_matrix_shift(left_matrix_send_buffer_ptr: [*]f16, left_matrix_recv_buffe
 
     @mov16(x_shift_out_dsr, left_send_dsr, .{.async=true, .unblock=x_shift_finish_id});
     @mov16(left_recv_dsr, x_shift_in_dsd, .{.async=true, .activate=x_shift_finish_id});
-
 }
 
 fn left_matrix_shift_reverse(left_matrix_send_buffer_ptr: [*]f16, left_matrix_recv_buffer_ptr: [*]f16) void {
@@ -166,21 +173,18 @@ comptime {
     @initialize_queue(y_recv_queue_id, .{.color = y_recv_color});
     @initialize_queue(y_send_queue_id, .{.color = y_send_color});
 
-    @load_to_dsr(x_in_dsr, x_in_dsd, .{.async=true, .activate=x_finish_id});
-    @load_to_dsr(x_out_dsr, x_out_dsd, .{.async=true, .unblock=x_finish_id});
+    @load_to_dsr(x_in_dsr, x_in_dsd, .{.async=true, .activate=x_finish_id, .ut_id = ut1});
+    @load_to_dsr(x_out_dsr, x_out_dsd, .{.async=true, .unblock=x_finish_id, .ut_id = ut2});
 
-    @load_to_dsr(y_in_dsr, y_in_dsd, .{.async=true, .activate=y_finish_id});
-    @load_to_dsr(y_out_dsr, y_out_dsd, .{.async=true, .unblock=y_finish_id});
+    @load_to_dsr(y_in_dsr, y_in_dsd, .{.async=true, .activate=y_finish_id, .ut_id = ut3});
+    @load_to_dsr(y_out_dsr, y_out_dsd, .{.async=true, .unblock=y_finish_id, .ut_id = ut4});
 }
 
 fn two_hop_comm(left_matrix_send_buffer_ptr: [*]f16, right_matrix_send_buffer_ptr: [*]f16, left_matrix_recv_buffer_ptr: [*]f16, right_matrix_recv_buffer_ptr: [*]f16) void {
 
     left_matrix_send_dsd = @set_dsd_base_addr(left_matrix_send_dsd, left_matrix_send_buffer_ptr);
-
     right_matrix_send_dsd = @set_dsd_base_addr(right_matrix_send_dsd, right_matrix_send_buffer_ptr);
-
     left_matrix_recv_dsd = @set_dsd_base_addr(left_matrix_recv_dsd, left_matrix_recv_buffer_ptr);
-
     right_matrix_recv_dsd = @set_dsd_base_addr(right_matrix_recv_dsd, right_matrix_recv_buffer_ptr);
     
     @load_to_dsr(left_send_dsr, left_matrix_send_dsd);
@@ -193,12 +197,9 @@ fn two_hop_comm(left_matrix_send_buffer_ptr: [*]f16, right_matrix_send_buffer_pt
 
     @mov16(y_out_dsr, right_send_dsr, .{.async=true, .unblock=y_finish_id});
     @mov16(right_recv_dsr, y_in_dsr, .{.async=true, .activate=y_finish_id});
-
-    return;
 }
 
 comptime {
-
     @block(x_recv_queue_id);
     @block(y_recv_queue_id);
     @block(x_shift_recv_queue_id);

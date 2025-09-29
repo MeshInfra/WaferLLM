@@ -3,28 +3,27 @@ param Mt: i16;
 param Kt: i16;
 param Nt: i16;
 
-const LAUNCH: color = @get_color(0);
+// const LAUNCH: color = @get_color(0);
 
-const X_0: color = @get_color(9);
-const X_1: color = @get_color(10);
-const X_2: color = @get_color(11);
+const X_0: color = @get_color(1);
+const X_1: color = @get_color(2);
+const X_2: color = @get_color(3);
 
-const Y_0: color = @get_color(12);
-const Y_1: color = @get_color(13);
-const Y_2: color = @get_color(14);
+const Y_0: color = @get_color(4);
+const Y_1: color = @get_color(5);
+const Y_2: color = @get_color(6);
 
-const X_shift_re_0: color = @get_color(15);
-const X_shift_re_1: color = @get_color(16);
-const X_shift_re_2: color = @get_color(17);
+const X_shift_re_0: color = @get_color(7);
+const X_shift_re_1: color = @get_color(8);
+const X_shift_re_2: color = @get_color(9);
 
-const X_shift_0: color = @get_color(18);
-const X_shift_1: color = @get_color(19);
-const X_shift_2: color = @get_color(20);
+const X_shift_0: color = @get_color(12);
+const X_shift_1: color = @get_color(13);
+const X_shift_2: color = @get_color(16);
 
 const memcpy = @import_module( "<memcpy/get_params>", .{
     .width = P,
     .height = P,
-    .LAUNCH = LAUNCH
 });
 
 const comm = @import_module("comm_lib/comm_layout.csl", .{
