@@ -188,13 +188,17 @@ fn two_hop_comm(left_matrix_send_buffer_ptr: [*]f16, right_matrix_send_buffer_pt
     @load_to_dsr(right_send_dsr, right_matrix_send_dsd);
     @load_to_dsr(right_recv_dsr, right_matrix_recv_dsd);
 
-    @mov16(x_out_dsr, left_send_dsr, .{.async=true, .unblock=x_finish_id});
-    @mov16(left_recv_dsr, x_in_dsr, .{.async=true, .activate=x_finish_id});
+    // @mov16(x_out_dsr, left_send_dsr, .{.async=true, .unblock=x_finish_id});
+    // @mov16(left_recv_dsr, x_in_dsr, .{.async=true, .activate=x_finish_id});
 
-    @mov16(y_out_dsr, right_send_dsr, .{.async=true, .unblock=y_finish_id});
-    @mov16(right_recv_dsr, y_in_dsr, .{.async=true, .activate=y_finish_id});
+    // @mov16(y_out_dsr, right_send_dsr, .{.async=true, .unblock=y_finish_id});
+    // @mov16(right_recv_dsr, y_in_dsr, .{.async=true, .activate=y_finish_id});
 
-    return;
+    @unblock(x_finish_id);
+    @activate(x_finish_id);
+
+    @unblock(y_finish_id);
+    @activate(y_finish_id);
 }
 
 comptime {

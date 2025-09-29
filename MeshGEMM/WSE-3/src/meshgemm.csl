@@ -133,6 +133,7 @@ fn mm_compute() void {
     if (step < P) {
 
         comm_mod.two_hop_comm(ptr_X_send, ptr_W_send, ptr_X_recv, ptr_W_recv);
+        // @unblock(next_step_id);
 
         X_dsd = @set_dsd_base_addr(X_dsd, ptr_X_send);
         W_dsd = @set_dsd_base_addr(W_dsd, ptr_W_send);
