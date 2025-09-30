@@ -146,17 +146,17 @@ def main():
         runner.memcpy_h2d(sym_W, W_u32, 0, 0, P, P, Kt*Nt, \
                         streaming=False, data_type=io_dtype, order=memcpy_order, nonblock=False)
         
-        # runner.launch('init_task', nonblock=False)
-        # total_warmup_times, total_repeat_times = 0, 1
-        # runner.launch('meshgemm_host', np.int16(total_warmup_times), np.int16(total_repeat_times), nonblock=False)
+        runner.launch('init_task', nonblock=False)
+        total_warmup_times, total_repeat_times = 0, 1
+        runner.launch('meshgemm_host', np.int16(total_warmup_times), np.int16(total_repeat_times), nonblock=False)
         
-        # res3_1d_u32 = np.zeros(M*N, dtype=np.uint32)
-        # runner.memcpy_d2h(res3_1d_u32, sym_res, 0, 0, P, P, Mt*Nt, \
-        #                 streaming=False, data_type=io_dtype, order=memcpy_order, nonblock=False)
-        # res3_1d_fp16 = sdk_utils.memcpy_view(res3_1d_u32, np.dtype(np.float16))
-        # res3 = res3_1d_fp16.reshape((P, P, Nt, Mt))
-        # res2 = res3.transpose(0, 3, 1, 2)
-        # res = res2.reshape(M, N)
+        res3_1d_u32 = np.zeros(M*N, dtype=np.uint32)
+        runner.memcpy_d2h(res3_1d_u32, sym_res, 0, 0, P, P, Mt*Nt, \
+                        streaming=False, data_type=io_dtype, order=memcpy_order, nonblock=False)
+        res3_1d_fp16 = sdk_utils.memcpy_view(res3_1d_u32, np.dtype(np.float16))
+        res3 = res3_1d_fp16.reshape((P, P, Nt, Mt))
+        res2 = res3.transpose(0, 3, 1, 2)
+        res = res2.reshape(M, N)
         
         runner.launch('init_task', nonblock=False)
         total_warmup_times, total_repeat_times = 5, 50
@@ -180,7 +180,7 @@ def main():
                         order=MemcpyOrder.ROW_MAJOR, data_type=MemcpyDataType.MEMCPY_32BIT, nonblock=False)
         time_ref_hwl = np.reshape(time_ref_1d_f32, (P, P, 2), order='C')
         
-    print(res)
+    # print(res)
         
     time_start = np.zeros((P, P)).astype(int)
     time_end = np.zeros((P, P)).astype(int)
