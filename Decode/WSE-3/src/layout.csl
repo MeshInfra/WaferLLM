@@ -1,0 +1,114 @@
+// This diagram represents a 2D coordinate system with labeled axes of the mesh-like PEs-array.
+// The x-axis and y-axis intersect at the origin, dividing the plane into four quadrants.
+//
+//        |  
+//  Head  |  
+//        |  
+// -------+------> x-axis
+//        |  
+//        |  Tail
+//        v
+//     y-axis
+//
+// - "Head" and "Tail" are used to describe the relative position between any two PEs in the y,x-plane.
+// - "Head" denotes the PE with the smaller coordinate value (x,y) then the center PE.
+// - "Tail" denotes the PE with the larger coordinate value (x,y) then the center PE.
+
+param P: i16;
+param bsz: i16;
+param dim_p_pe: i16;
+param pes_p_head: i16;
+param pes_p_kv_head: i16;
+param head_dim_p_pe: i16;
+param seq_len_p_pe: i16;
+param ffn_dim_p_pe: i16;
+
+param pe_num_p_group: i16;
+param root_1st_phase: i16;
+param root_2nd_phase: i16;
+
+const C_1st_RD_0: color = @get_color(8);
+const C_1st_RD_1: color = @get_color(7);
+const C_2nd_RD_0: color = @get_color(6);
+const C_2nd_RD_1: color = @get_color(5);
+
+const C_BD: color = @get_color(9);
+
+const memcpy = @import_module( "<memcpy/get_params>", .{
+    .width = P,
+    .height = P,
+});
+
+const math = @import_module("<math>");
+
+const comm = @import_module("comm_lib/comm_layout.csl", .{
+    .P = P, .pe_num_p_group = pe_num_p_group,
+    .root_1st_phase = root_1st_phase,
+    .root_2nd_phase = root_2nd_phase,
+    .broadcast_color = C_BD,
+    .reduce_1st_color = [2]color{C_1st_RD_0, C_1st_RD_1},
+    .reduce_2nd_color = [2]color{C_2nd_RD_0, C_2nd_RD_1},
+});
+
+layout {
+    @set_rectangle(P, P);
+
+    var px: i16 = 0;
+    var py: i16 = 0;
+
+    px = 0;
+    while (px < P) : (px += 1) {
+
+        const quotient_x: i16 = @as(i16, math.floor_f16(@as(f16, px) / @as(f16, pe_num_p_group)));
+        const remainder_x: i16 = px - quotient_x * pe_num_p_group;
+
+        const memcpy_params = memcpy.get_params(px);
+
+        py = 0;
+        while (py < P) : (py += 1) {
+
+            const quotient_y: i16 = @as(i16, math.floor_f16(@as(f16, py) / @as(f16, pe_num_p_group)));
+            const remainder_y: i16 = py - quotient_y * pe_num_p_group;
+            
+            const comm_params = comm.get_params(px, quotient_x, remainder_x, py, quotient_y, remainder_y);
+
+            @set_tile_code(px, py, "decode.csl", .{
+                .memcpy_params = memcpy_params,
+                .comm_params = comm_params,
+
+                .P = P, .bsz = bsz, .dim_p_pe = dim_p_pe, 
+                .pes_p_head = pes_p_head, 
+                .pes_p_kv_head = pes_p_kv_head,
+                .head_dim_p_pe = head_dim_p_pe,
+                .seq_len_p_pe = seq_len_p_pe,
+                .ffn_dim_p_pe = ffn_dim_p_pe,
+
+                .pe_num_p_group = pe_num_p_group,
+                .root_1st_phase = root_1st_phase,
+                .root_2nd_phase = root_2nd_phase,
+            });
+        }
+    }
+
+
+    @export_name("X", [*]f16, true);
+    @export_name("W", [*]f16, true);
+    @export_name("Q_weight", [*]f16, true);
+    @export_name("K_weight", [*]f16, true);
+    @export_name("V_weight", [*]f16, true);
+    @export_name("freqs_sin", [*]f16, true);
+    @export_name("freqs_cos", [*]f16, true);
+    @export_name("XKCache", [*]f16, true);
+    @export_name("XVCache", [*]f16, true);
+    @export_name("O_weight", [*]f16, true);
+    @export_name("UP_weight", [*]f16, true);
+    @export_name("GATE_weight", [*]f16, true);
+    @export_name("DOWN_weight", [*]f16, true);
+
+    @export_name("init_task", fn()void);
+    @export_name("decode_host", fn(i16, i16)void);
+
+    @export_name("timer_buf", [*]f32, true);
+    @export_name("time_ref", [*]f32, true);
+    @export_name("debug", [*]f16, true);
+}

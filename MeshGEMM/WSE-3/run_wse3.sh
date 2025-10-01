@@ -14,7 +14,7 @@ fi
 python compile.py "$P" "$Mt" "$Kt" "$Nt" "$simulator"
 
 if [ "$simulator" == "true" ]; then
-    python launch_device.py --P "$1" --M "$2" --K "$3" --N "$4" --simulator
+    python launch_wse3.py --P "$1" --M "$2" --K "$3" --N "$4" --simulator
 else
-    python launch_device.py --P "$1" --M "$2" --K "$3" --N "$4"
+    python launch_wse3.py --P "$1" --M "$2" --K "$3" --N "$4"
 fi

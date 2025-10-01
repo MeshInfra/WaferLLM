@@ -1,0 +1,406 @@
+param P: i16;
+param pe_num_p_group: i16;
+param root_1st_phase: i16;
+param root_2nd_phase: i16;
+
+param broadcast_color: color;
+param reduce_1st_color: [2]color;
+param reduce_2nd_color: [2]color;
+
+fn get_params(px: i16, quotient_x: i16, remainder_x: i16, py: i16, quotient_y: i16, remainder_y: i16) comptime_struct {
+
+    var X_1st_RD_0 = .{ .rx = RAMP, .tx = [1]direction{ RAMP } };
+    var X_1st_RD_1 = .{ .rx = RAMP, .tx = [1]direction{ RAMP } };
+    var Y_1st_RD_0 = .{ .rx = RAMP, .tx = [1]direction{ RAMP } };
+    var Y_1st_RD_1 = .{ .rx = RAMP, .tx = [1]direction{ RAMP } };
+
+    var X_2nd_RD_0 = .{ .rx = RAMP, .tx = [1]direction{ RAMP } };
+    var X_2nd_RD_1 = .{ .rx = RAMP, .tx = [1]direction{ RAMP } };
+    var Y_2nd_RD_0 = .{ .rx = RAMP, .tx = [1]direction{ RAMP } };
+    var Y_2nd_RD_1 = .{ .rx = RAMP, .tx = [1]direction{ RAMP } };
+
+    // Phase 1 reduceFn:
+        // remainder_x or remainder_y == root_1st_phase:
+            // Even-numbered remainder_x or remainder_y: color 0 receives from HEAD, color 1 receives from TAIL
+            // Odd-numbered remainder_x or remainder_y: color 1 receives from HEAD, color 0 receives from TAIL
+        // (remainder_x or remainder_y < root_1st_phase):
+            // Even-numbered remainder_x or remainder_y: color 0 receives from HEAD, color 1 sends to TAIL
+            // Odd-numbered remainder_x or remainder_y: color 1 receives from HEAD, color 0 sends to TAIL
+        // (remainder_x or remainder_y > root_1st_phase):
+            // Even-numbered remainder_x or remainder_y: color 1 receives from TAIL, color 0 sends to HEAD
+            // Odd-numbered remainder_x or remainder_y: color 0 receives from TAIL, color 1 sends to HEAD
+
+    // Phase 2 reduceFn:
+        // px or py == root_2nd_phase:
+            // Even-numbered quotient_x or quotient_y: color 0 receives from HEAD, color 1 receives from TAIL
+            // Odd-numbered quotient_x or quotient_y: color 1 receives from HEAD, color 0 receives from TAIL
+        // (px or py < root_2nd_phase) and (remainder_x or remainder_y == root_1st_phase):
+            // Even-numbered quotient_x or quotient_y: color 0 receives from HEAD, color 1 sends to TAIL
+            // Odd-numbered quotient_x or quotient_y: color 1 receives from HEAD, color 0 sends to TAIL
+        // (px or py > root_2nd_phase) and (remainder_x or remainder_y == root_1st_phase):
+            // Even-numbered quotient_x or quotient_y: color 1 receives from TAIL, color 0 sends to HEAD
+            // Odd-numbered quotient_x or quotient_y: color 0 receives from TAIL, color 1 sends to HEAD
+
+        // HEAD: WEST, NORTH
+        // TAIL: EAST, SOUTH
+
+    if (remainder_x == root_1st_phase) {
+        if (remainder_x % 2 == 0) {
+            X_1st_RD_0 = .{
+                .rx = WEST, .tx = [1]direction{ RAMP },
+            };
+            X_1st_RD_1 = .{
+                .rx = EAST, .tx = [1]direction{ RAMP },
+            };
+        } else {
+            X_1st_RD_1 = .{
+                .rx = WEST, .tx = [1]direction{ RAMP },
+            };
+            X_1st_RD_0 = .{
+                .rx = EAST, .tx = [1]direction{ RAMP },
+            };
+        }
+    } else if (remainder_x < root_1st_phase) {
+        if (remainder_x % 2 == 0) {
+            X_1st_RD_0 = .{
+                .rx = WEST, .tx = [1]direction{ RAMP },
+            };
+            X_1st_RD_1 = .{
+                .rx = RAMP, .tx = [1]direction{ EAST },
+            };
+        } else {
+            // remainder_x % 2 == 1
+            X_1st_RD_1 = .{
+                .rx = WEST, .tx = [1]direction{ RAMP },
+            };
+            X_1st_RD_0 = .{
+                .rx = RAMP, .tx = [1]direction{ EAST },
+            };
+        }
+    } else {
+        // remainder_x > root_1st_phase
+        if (remainder_x % 2 == 0) {
+            X_1st_RD_1 = .{
+                .rx = EAST, .tx = [1]direction{ RAMP },
+            };
+            X_1st_RD_0 = .{
+                .rx = RAMP, .tx = [1]direction{ WEST },
+            };
+        } else {
+            // remainder_x % 2 == 1
+            X_1st_RD_0 = .{
+                .rx = EAST, .tx = [1]direction{ RAMP },
+            };
+            X_1st_RD_1 = .{
+                .rx = RAMP, .tx = [1]direction{ WEST },
+            };
+        }
+    }
+
+    if (remainder_y == root_1st_phase) {
+        if (remainder_y % 2 == 0) {
+            Y_1st_RD_0 = .{
+                .rx = NORTH, .tx = [1]direction{ RAMP },
+            };
+            Y_1st_RD_1 = .{
+                .rx = SOUTH, .tx = [1]direction{ RAMP },
+            };
+        } else {
+            Y_1st_RD_1 = .{
+                .rx = NORTH, .tx = [1]direction{ RAMP },
+            };
+            Y_1st_RD_0 = .{
+                .rx = SOUTH, .tx = [1]direction{ RAMP },
+            };
+        }
+    } else if (remainder_y < root_1st_phase) {
+        if (remainder_y % 2 == 0) {
+            Y_1st_RD_0 = .{
+                .rx = NORTH, .tx = [1]direction{ RAMP },
+            };
+            Y_1st_RD_1 = .{
+                .rx = RAMP, .tx = [1]direction{ SOUTH },
+            };
+        } else {
+            // remainder_y % 2 == 1
+            Y_1st_RD_1 = .{
+                .rx = NORTH, .tx = [1]direction{ RAMP },
+            };
+            Y_1st_RD_0 = .{
+                .rx = RAMP, .tx = [1]direction{ SOUTH },
+            };
+        }
+    } else {
+        // remainder_y > root_1st_phase
+        if (remainder_y % 2 == 0) {
+            Y_1st_RD_1 = .{
+                .rx = SOUTH, .tx = [1]direction{ RAMP },
+            };
+            Y_1st_RD_0 = .{
+                .rx = RAMP, .tx = [1]direction{ NORTH },
+            };
+        } else {
+            // remainder_y % 2 == 1
+            Y_1st_RD_0 = .{
+                .rx = SOUTH, .tx = [1]direction{ RAMP },
+            };
+            Y_1st_RD_1 = .{
+                .rx = RAMP, .tx = [1]direction{ NORTH },
+            };
+        }
+    }
+
+    if (px == root_2nd_phase) {
+
+        if (quotient_x % 2 == 0) {
+            X_2nd_RD_0 = .{
+                .rx = WEST, .tx = [1]direction{ RAMP },
+            };
+
+            X_2nd_RD_1 = .{
+                .rx = EAST, .tx = [1]direction{ RAMP },
+            };
+        } else {
+            // quotient_x % 2 == 1
+            X_2nd_RD_1 = .{
+                .rx = WEST, .tx = [1]direction{ RAMP },
+            };
+
+            X_2nd_RD_0 = .{
+                .rx = EAST, .tx = [1]direction{ RAMP },
+            };
+        }
+
+    } else if (px < root_2nd_phase) {
+
+        if (remainder_x == root_1st_phase) {
+
+            if (quotient_x % 2 == 0) {
+                X_2nd_RD_0 = .{
+                    .rx = WEST, .tx = [1]direction{ RAMP },
+                };
+
+                X_2nd_RD_1 = .{
+                    .rx = RAMP, .tx = [1]direction{ EAST },
+                };
+            } else {
+                // quotient_x % 2 == 1
+                X_2nd_RD_1 = .{
+                    .rx = WEST, .tx = [1]direction{ RAMP },
+                };
+
+                X_2nd_RD_0 = .{
+                    .rx = RAMP, .tx = [1]direction{ EAST },
+                };
+            }
+
+        } else {
+            X_2nd_RD_0 = .{
+                .rx = WEST, .tx = [1]direction{ EAST },
+            };
+
+            X_2nd_RD_1 = .{
+                .rx = WEST, .tx = [1]direction{ EAST },
+            };
+        }
+
+    } else {
+        // px > root_2nd_phase
+        if (remainder_x == root_1st_phase) {
+
+            if (quotient_x % 2 == 0) {
+                X_2nd_RD_1 = .{
+                    .rx = EAST, .tx = [1]direction{ RAMP },
+                };
+
+                X_2nd_RD_0 = .{
+                    .rx = RAMP, .tx = [1]direction{ WEST },
+                };
+            } else {
+                // quotient_x % 2 == 1
+                X_2nd_RD_0 = .{
+                    .rx = EAST, .tx = [1]direction{ RAMP },
+                };
+
+                X_2nd_RD_1 = .{
+                    .rx = RAMP, .tx = [1]direction{ WEST },
+                };
+            }
+
+        } else {
+            X_2nd_RD_0 = .{
+                .rx = EAST, .tx = [1]direction{ WEST },
+            };
+
+            X_2nd_RD_1 = .{
+                .rx = EAST, .tx = [1]direction{ WEST },
+            };
+        }
+    }
+
+    if (py == root_2nd_phase) {
+
+        if (quotient_y % 2 == 0) {
+            Y_2nd_RD_0 = .{
+                .rx = NORTH, .tx = [1]direction{ RAMP },
+            };
+
+            Y_2nd_RD_1 = .{
+                .rx = SOUTH, .tx = [1]direction{ RAMP },
+            };
+        } else {
+            // quotient_y % 2 == 1
+            Y_2nd_RD_1 = .{
+                .rx = NORTH, .tx = [1]direction{ RAMP },
+            };
+
+            Y_2nd_RD_0 = .{
+                .rx = SOUTH, .tx = [1]direction{ RAMP },
+            };
+        }
+
+    } else if (py < root_2nd_phase) {
+        if (remainder_y == root_1st_phase) {
+            if (quotient_y % 2 == 0) {
+                Y_2nd_RD_0 = .{
+                    .rx = NORTH, .tx = [1]direction{ RAMP },
+                };
+
+                Y_2nd_RD_1 = .{
+                    .rx = RAMP, .tx = [1]direction{ SOUTH },
+                };
+            } else {
+                // quotient_y % 2 == 1
+                Y_2nd_RD_1 = .{
+                    .rx = NORTH, .tx = [1]direction{ RAMP },
+                };
+
+                Y_2nd_RD_0 = .{
+                    .rx = RAMP, .tx = [1]direction{ SOUTH },
+                };
+            }
+        } else {
+            Y_2nd_RD_0 = .{
+                .rx = NORTH, .tx = [1]direction{ SOUTH },
+            };
+
+            Y_2nd_RD_1 = .{
+                .rx = NORTH, .tx = [1]direction{ SOUTH },
+            };
+        }
+    } else {
+        // py > root_2nd_phase
+        if (remainder_y == root_1st_phase) {
+
+            if (quotient_y % 2 == 0) {
+                Y_2nd_RD_1 = .{
+                    .rx = SOUTH, .tx = [1]direction{ RAMP },
+                };
+
+                Y_2nd_RD_0 = .{
+                    .rx = RAMP, .tx = [1]direction{ NORTH },
+                };
+            } else {
+                // quotient_x % 2 == 1
+                Y_2nd_RD_0 = .{
+                    .rx = SOUTH, .tx = [1]direction{ RAMP },
+                };
+
+                Y_2nd_RD_1 = .{
+                    .rx = RAMP, .tx = [1]direction{ NORTH },
+                };
+            }
+
+        } else {
+            Y_2nd_RD_0 = .{
+                .rx = SOUTH, .tx = [1]direction{ NORTH },
+            };
+
+            Y_2nd_RD_1 = .{
+                .rx = SOUTH, .tx = [1]direction{ NORTH },
+            };
+        }
+    }
+
+    var X_BD_ht = .{ .rx = RAMP, .tx = [1]direction{ RAMP } };
+    var X_BD = .{ .rx = RAMP, .tx = [2]direction{ RAMP, RAMP } };
+    var Y_BD = .{ .rx = RAMP, .tx = [2]direction{ RAMP, RAMP } };
+    var Y_BD_ht = .{ .rx = RAMP, .tx = [1]direction{ RAMP } };
+
+    if (px == root_2nd_phase) {
+        X_BD = .{
+            .rx = RAMP, .tx = [2]direction{ WEST, EAST },
+        };
+    } else if (px < root_2nd_phase) {
+        if (px == 0) {
+            X_BD_ht = .{
+                .rx = EAST, .tx = [1]direction{ RAMP },
+            };
+        } else {
+            X_BD = .{
+                .rx = EAST, .tx = [2]direction{ WEST, RAMP },
+            };
+        }
+    } else {
+        // px > root_2nd_phase
+        if (px == P - 1) {
+            X_BD_ht = .{
+                .rx = WEST, .tx = [1]direction{ RAMP },
+            };
+        } else {
+            X_BD = .{
+                .rx = WEST, .tx = [2]direction{ RAMP, EAST },
+            };
+        }
+    }
+
+    if (py == root_2nd_phase) {
+        Y_BD = .{
+            .rx = RAMP, .tx = [2]direction{ NORTH, SOUTH },
+        };
+    } else if (py < root_2nd_phase) {
+        if (py == 0) {
+            Y_BD_ht = .{
+                .rx = SOUTH, .tx = [1]direction{ RAMP },
+            };
+        } else {
+            Y_BD = .{
+                .rx = SOUTH, .tx = [2]direction{ NORTH, RAMP },
+            };
+        }
+    } else {
+        // py > root_2nd_phase
+        if (py == P - 1) {
+            Y_BD_ht = .{
+                .rx = NORTH, .tx = [1]direction{ RAMP },
+            };
+        } else {
+            Y_BD = .{
+                .rx = NORTH, .tx = [2]direction{ RAMP, SOUTH },
+            };
+        }
+    }
+
+    return .{
+        .X_1st_RD_0 = X_1st_RD_0,
+        .X_1st_RD_1 = X_1st_RD_1,
+        .Y_1st_RD_0 = Y_1st_RD_0,
+        .Y_1st_RD_1 = Y_1st_RD_1,
+
+        .X_2nd_RD_0 = X_2nd_RD_0,
+        .X_2nd_RD_1 = X_2nd_RD_1,
+        .Y_2nd_RD_0 = Y_2nd_RD_0,
+        .Y_2nd_RD_1 = Y_2nd_RD_1,
+
+        .X_BD = if (px == 0 or px == P - 1) X_BD_ht else X_BD,
+        .Y_BD = if (py == 0 or py == P - 1) Y_BD_ht else Y_BD,
+        
+        .reduce_1st_color_0 = reduce_1st_color[0],
+        .reduce_1st_color_1 = reduce_1st_color[1],
+
+        .reduce_2nd_color_0 = reduce_2nd_color[0],
+        .reduce_2nd_color_1 = reduce_2nd_color[1],
+
+        .broadcast_color = broadcast_color,
+    };
+}

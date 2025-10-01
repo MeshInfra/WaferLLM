@@ -23,7 +23,7 @@ echo "P=$1, M=$2, N=$3, group_num=$4, pe_num_group=$pe_num_group, root_1st_phase
 python compile.py "$P" "$Mt" "$Nt" "$group_num" "$pe_num_group" "$root_1st_phase" "$root_2nd_phase" "$simulator"
 
 if [ "$simulator" == "true" ]; then
-    python launch_device.py --P "$1" --M "$2" --N "$3" --group_num "$4" --simulator
+    python launch_wse3.py --P "$1" --M "$2" --N "$3" --group_num "$4" --simulator
 else
-    python launch_device.py --P "$1" --M "$2" --N "$3" --group_num "$4"
+    python launch_wse3.py --P "$1" --M "$2" --N "$3" --group_num "$4"
 fi
