@@ -13,3 +13,10 @@ wsjob-*.json
 run_meta.json
 
 wio_flows*/
+
+*.log
+*/log/*
+!*/log/.gitkeep
+
+*/compile_out/*
+!*/compile_out/.gitkeep

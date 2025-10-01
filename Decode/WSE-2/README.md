@@ -30,7 +30,7 @@ The Decode implementation uses JSON configuration files to specify model paramet
 The simulator allows you to test and debug your Decode implementation before deploying to actual hardware.
 
 ```bash
-# ./run_sim.sh [config_file]
+# bash ./run_sim.sh [config_file]
 # If no config file is specified, uses config.json or default values
 # Example with test configuration
 bash ./run_sim.sh model_config/test.json
@@ -43,10 +43,10 @@ bash ./run_sim.sh model_config/test.json
 Deploy and execute your Decode algorithm on the actual WSE-2 hardware.
 
 ```bash
-# ./run_device.sh [config_file]
+# bash ./run_wse2.sh [config_file]
 # If no config file is specified, uses config.json or default values
 # Example with test configuration
-bash ./run_device.sh model_config/test.json
+bash ./run_wse2.sh model_config/test.json
 ```
 
 **Prerequisites:**
