@@ -764,35 +764,39 @@ fn ffn_residual_add() void {
 
 fn decode_struct() void {
 
-    rmsnorm_x();
+    // // Self-attention module
 
-    xq_matvec_mult();
-    xk_matvec_mult();
-    xv_matvec_mult();
-    comm_mod.all_reduce_bsz_dim_QKV_fusion(py, quotient_y, remainder_y, ptr_QKV_tile);
+    // rmsnorm_x();
 
-    comm_mod.reconfig_allreduce_axis(0); // 0: px row-wise, 1: py col-wise
+    // xq_matvec_mult();
+    // xk_matvec_mult();
+    // xv_matvec_mult();
+    // comm_mod.all_reduce_bsz_dim_QKV_fusion(py, quotient_y, remainder_y, ptr_QKV_tile);
 
-    xq_rope();
-    xk_rope();
+    // comm_mod.reconfig_allreduce_axis(0); // 0: px row-wise, 1: py col-wise
 
-    score_matvec_mult();
+    // xq_rope();
+    // xk_rope();
 
-    comm_mod.reconfig_allreduce_axis(1);
+    // score_matvec_mult();
 
-    softmax_score();
+    // comm_mod.reconfig_allreduce_axis(1);
 
-    output_matvec_mult();
+    // softmax_score();
 
-    comm_mod.reconfig_allreduce_axis(0);
+    // output_matvec_mult();
 
-    o_matvec_mult();
+    // comm_mod.reconfig_allreduce_axis(0);
 
-    attn_residual_add();
+    // o_matvec_mult();
 
-    comm_mod.reconfig_allreduce_axis(1);
+    // attn_residual_add();
 
-    rmsnorm_z();
+    // comm_mod.reconfig_allreduce_axis(1);
+
+    // rmsnorm_z();
+
+    // Feed-forward module
 
     up_matvec_mult();
     gate_matvec_mult();
