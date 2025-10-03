@@ -32,6 +32,7 @@ class Config:
         self.head_dim = 64
         self.seq_len = 64
         self.ffn_dim = 64
+        self.layer_num = 8
         
 def parse_args():
     parser = argparse.ArgumentParser(description="Decode on WSE-2")
@@ -55,7 +56,7 @@ def main():
     dim = config.dim
     seq_len = config.seq_len
     ffn_dim = config.ffn_dim
-    
+    layer_num = config.layer_num
     dim_p_pe = dim // P
     seq_len_p_pe = seq_len // P
     ffn_dim_p_pe = ffn_dim // P
@@ -256,17 +257,16 @@ def main():
             
     time_start = time_start - time_ref
     time_end = time_end - time_ref
-    
-    min_time_start = time_start.min()
-    max_time_end = time_end.max()
-    
-    print(f"\nRepeat count: {total_repeat_times}")
-    print(f"Mean cycle count: {np.mean(time_end - time_start)/total_repeat_times}")
-    print(f"Max Cycle count: {(max_time_end - min_time_start)/total_repeat_times}")
-    
+
     freq_ghz = 1.1
-    time = (max_time_end - min_time_start) / total_repeat_times / (freq_ghz*1e6)
-    print(f"Time: {time} ms")
+    
+    cycles_count_mean_per_step = np.mean(time_end - time_start)/total_repeat_times
+    print(f"\nRepeat count: {total_repeat_times}")
+    print(f"Mean cycle count: {cycles_count_mean_per_step}")
+    # print(f"Max Cycle count: {(max_time_end - min_time_start)/total_repeat_times}")
+    
+    throughput_p_request = 1 / ((cycles_count_mean_per_step*layer_num) / (freq_ghz*1e9))
+    print(f"Throughput_p_request: {throughput_p_request}")
     
 if __name__ == "__main__":
     main()

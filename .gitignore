@@ -8,15 +8,14 @@ simconfig.json
 wio_flow.json
 
 artifact_*.json
-compile_out/
 wsjob-*.json
 run_meta.json
 
 wio_flows*/
 
 *.log
-*/log/*
+**/log/*
 !*/log/.gitkeep
 
-*/compile_out/*
-!*/compile_out/.gitkeep
+**/compile_out/*
+!**/compile_out/.gitkeep

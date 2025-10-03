@@ -275,10 +275,11 @@ def main():
 
     cycles_count_mean = cycles_count.mean()
     cycles_count_mean_per_step = cycles_count_mean / total_repeat_times
-    print(f"Host: mean cycles count: {cycles_count_mean_per_step*layer_num}")
+    print(f"\nRepeat count: {total_repeat_times}")
+    print(f"Mean cycles count: {cycles_count_mean_per_step*layer_num}")
 
     throughput_p_request = 1 / ((cycles_count_mean_per_step*layer_num) / (freq_ghz*1e9))
-    print(f"Host: throughput_p_request: {throughput_p_request}")
+    print(f"Throughput_p_request: {throughput_p_request}")
     
 if __name__ == "__main__":
     main()
