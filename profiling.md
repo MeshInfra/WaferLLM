@@ -1,19 +1,25 @@
 # Profiling Instructions
+**env check**
+
+```bash
+cd ./Decode/WSE-3
+bash preflight_wse3.sh
+```
 
 **mvp**
 ```bash
 cd ./Decode/WSE-3
-bash run_profiling_batch.sh --preset smoke --out profiling_runs/smoke_real
+bash run_profiling_batch_wse3.sh --preset smoke --out profiling_runs/smoke_real
 ```
 
-after running the above command, please keep this directory for you:
+after running the above command, please keep this directory:
 - `profiling_runs/smoke_real`
 
 **P sweep**
 
 ```bash
 cd ./Decode/WSE-3
-bash run_profiling_batch.sh --preset llama_p_sweep --out profiling_runs/llama_p_sweep_real
+bash run_profiling_batch_wse3.sh --preset llama_p_sweep --out profiling_runs/llama_p_sweep_real
 ```
 
 after running the above command, please keep this directory:
