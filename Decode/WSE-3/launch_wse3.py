@@ -239,7 +239,7 @@ def main():
         data = json.load(f)
         artifact_path = data["artifact_id"]
 
-    with SdkRuntime(artifact_path, simulator=args.simulator) as runner:
+    with SdkRuntime(artifact_path, simulator=args.simulator, disable_version_check=True) as runner:
         sym_X = runner.get_id("X")
         sym_W = runner.get_id("W")
         sym_Q_weight = runner.get_id("Q_weight")

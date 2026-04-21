@@ -72,20 +72,19 @@ fi
 if [[ -z "$OUTPUT_DIR" ]]; then
     batch_name="${PRESET:-custom}"
     timestamp=$(date +"%Y%m%d_%H%M%S")
-    OUTPUT_DIR="profiling_runs/${batch_name}_batch_${timestamp}"
+    OUTPUT_DIR="profiling_runs/${batch_name}_wse3_batch_${timestamp}"
 fi
 
 mkdir -p "$OUTPUT_DIR"
 
 RUNS_TSV="$OUTPUT_DIR/runs.tsv"
-RUNS_TXT="$OUTPUT_DIR/runs.txt"
 COMPLETED_TSV="$OUTPUT_DIR/completed.tsv"
 echo -e "config\tartifact_dir" > "$RUNS_TSV"
 echo -e "config\tartifact_dir" > "$COMPLETED_TSV"
-: > "$RUNS_TXT"
 
 echo "Running batch profiling..."
 echo "Output dir: $OUTPUT_DIR"
+echo "Simulator: false"
 echo "Config count: ${#CONFIGS[@]}"
 
 for config in "${CONFIGS[@]}"; do
@@ -103,10 +102,9 @@ for config in "${CONFIGS[@]}"; do
     echo "Artifact dir: $artifact_dir"
     echo "============================================================"
 
+    mkdir -p "$artifact_dir"
     echo -e "${config}\t${artifact_dir}" >> "$RUNS_TSV"
-    echo "$artifact_dir" >> "$RUNS_TXT"
-
-    bash run_profiling.sh "$config" "$artifact_dir"
+    bash run_wse3.sh "$config" false |& tee "$artifact_dir/run.log"
 
     echo -e "${config}\t${artifact_dir}" >> "$COMPLETED_TSV"
 done
