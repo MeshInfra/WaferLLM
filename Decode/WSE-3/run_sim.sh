@@ -2,10 +2,19 @@ set -e
 
 # export SINGULARITYENV_SIMFABRIC_DEBUG=router
 CONFIG=$1
+ARTIFACT_DIR=$2
 
 if [ -z "$CONFIG" ]; then
     CONFIG="config.json"
 fi
+
+if [ -z "$ARTIFACT_DIR" ]; then
+    config_name=$(basename "$CONFIG" .json)
+    timestamp=$(date +"%Y%m%d_%H%M%S")
+    ARTIFACT_DIR="profiling_runs/${config_name}_${timestamp}"
+fi
+
+mkdir -p "$ARTIFACT_DIR"
 
 # if config.json exists
 if [ -f $CONFIG ]; then
@@ -64,9 +73,18 @@ cslc --arch=wse3 ./src/layout.csl --fabric-dims="$FABRIC_W","$FABRIC_H" --fabric
     --params=P:"$P",bsz:"$BSZ",dim_p_pe:"$dim_p_pe",pes_p_head:"$pes_p_head",pes_p_kv_head:"$pes_p_kv_head",head_dim_p_pe:"$head_dim_p_pe",seq_len_p_pe:"$seq_len_p_pe",ffn_dim_p_pe:"$ffn_dim_p_pe",pe_num_p_group:"$pe_num_p_group",root_1st_phase:"$root_1st_phase",root_2nd_phase:"$root_2nd_phase" \
     -o out --memcpy --channels 1
 
-cs_python launch_sim.py --config $CONFIG
+cs_python launch_sim.py --config "$CONFIG" --artifact-dir "$ARTIFACT_DIR"
 
-rm -rf simfab_traces
+if [ -d simfab_traces ]; then
+    mv simfab_traces "$ARTIFACT_DIR"/
+fi
+
+for file in wsjob-*.json run_meta.json; do
+    if [ -e "$file" ]; then
+        mv "$file" "$ARTIFACT_DIR"/
+    fi
+done
+
 rm -rf wio_flows_tmpdir.*
-rm wsjob-*.json
-rm run_meta.json
+
+echo "Profiling artifacts saved to: $ARTIFACT_DIR"

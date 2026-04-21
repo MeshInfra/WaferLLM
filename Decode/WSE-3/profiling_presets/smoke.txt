@@ -1,0 +1,2 @@
+model_config/smoke_p8.json
+model_config/smoke_p16.json

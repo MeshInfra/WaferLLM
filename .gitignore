@@ -19,3 +19,7 @@ wio_flows*/
 
 **/compile_out/*
 !**/compile_out/.gitkeep
+
+**/profiling_runs/*
+
+.codex

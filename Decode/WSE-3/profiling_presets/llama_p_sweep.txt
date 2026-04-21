@@ -1,0 +1,3 @@
+model_config/llama8B_4k_1_240.json
+model_config/llama8B_4k_1_360.json
+model_config/llama8B_4k_1_480.json
