@@ -1,0 +1,12 @@
+{
+    "P": 480,
+    "group_num": 20,
+    "bsz": 1,
+    "dim": 4320,
+    "n_heads": 1,
+    "n_kv_heads": 1,
+    "head_dim": 4320,
+    "seq_len": 4320,
+    "ffn_dim": 14400,
+    "layer_num": 32
+}
