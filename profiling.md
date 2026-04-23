@@ -1,68 +1,93 @@
-# Profiling Instructions
-**env check**
+# Decode/WSE-3 Profiling Instructions
+
+目前只考虑 `Decode/WSE-3`，只考虑 `P` 的变化，**不考虑 batch size**。
+
+## Goal
+
+本轮 profiling 的目标是做 **weak scaling**，不是 strong scaling。
+
+这里的 weak scaling 定义是：
+
+- `P` 增大时，全局问题也按比例增大
+- 每个 PE 的本地工作量尽量保持不变
+
+对当前 `Decode/WSE-3` kernel，我们固定下面这些局部量：
+
+- `dim_p_pe = dim / P = 9`
+- `seq_len_p_pe = seq_len / P = 9`
+- `ffn_dim_p_pe = ffn_dim / P = 30`
+- `pe_num_p_group = P / group_num = 24`
+
+所以本轮 weak-scaling 配置只使用这三组：
+
+- `model_config/llama8B_weak_1_240.json`
+- `model_config/llama8B_weak_1_360.json`
+- `model_config/llama8B_weak_1_480.json`
+
+对应的 preset 是：
+
+- `profiling_presets/llama_p_weak_sweep.txt`
+
+## 1. Environment Check
+
+先做环境检查：
 
 ```bash
 cd ./Decode/WSE-3
 bash preflight_wse3.sh
 ```
 
-**MVP smoke test**
+## 2. Smoke Run
+
+先跑最小验证，确认环境、编译和 artifact 导出都没问题：
+
 ```bash
 cd ./Decode/WSE-3
 bash run_profiling_batch_wse3.sh --preset smoke --out profiling_runs/smoke_real
 ```
 
-after running the above command, please keep this directory:
+跑完后请保留目录：
+
 - `profiling_runs/smoke_real`
 
-**Controlled P sweep**
+## 3. Weak-Scaling P Sweep
 
-This preset is the strict single-variable `P` sweep. It fixes:
-- `group_num = 20`
-- `bsz = 1`
-- `dim = head_dim = seq_len = 4320`
-- `ffn_dim = 14400`
-- `n_heads = n_kv_heads = 1`
-- `layer_num = 32`
-
-Only `P` changes: `240 / 360 / 480 / 720`.
+正式 weak scaling 只跑下面这条命令：
 
 ```bash
 cd ./Decode/WSE-3
-bash run_profiling_batch_wse3.sh --preset llama_p_sweep_controlled --out profiling_runs/llama_p_sweep_controlled_real
+bash run_profiling_batch_wse3.sh --preset llama_p_weak_sweep --out profiling_runs/llama_p_weak_sweep_real
 ```
 
-after running the above command, please keep this directory:
-- `profiling_runs/llama_p_sweep_controlled_real`
+跑完后请保留目录：
 
-**Controlled batch-size sweep**
+- `profiling_runs/llama_p_weak_sweep_real`
 
-This preset is the strict single-variable batch sweep. It fixes:
-- `P = 360`
-- `group_num = 20`
-- `dim = head_dim = seq_len = 4320`
-- `ffn_dim = 14400`
-- `n_heads = n_kv_heads = 1`
-- `layer_num = 32`
+## 4. Optional: Simulator Check
 
-Only `bsz` changes: `1 / 2 / 4 / 8 / 16`.
+如果想先在 simulator 上验证同一组 weak-scaling config，也可以运行：
 
 ```bash
 cd ./Decode/WSE-3
-bash run_profiling_batch_wse3.sh --preset llama_bsz_sweep_controlled --out profiling_runs/llama_bsz_sweep_controlled_real
+bash run_profiling_batch.sh --preset llama_p_weak_sweep --out profiling_runs/llama_p_weak_sweep_sim
 ```
 
-after running the above command, please keep this directory:
-- `profiling_runs/llama_bsz_sweep_controlled_real`
+## 5. Expected Artifacts
 
-**Legacy presets**
+每个 batch 目录里应包含：
 
-- `llama_p_sweep` is not a strict `P`-only sweep because `dim` and `seq_len` also vary across configs.
-- `llama_bsz_sweep` is usable, but it uses the older `group_num = 18` setup and larger batch points.
+- `runs.tsv`
+- `completed.tsv`
 
-**Results**
-For every batch directory, we will have the following files:
+每个配置子目录里应包含：
 
-- `runs.tsv`：plan to run which configuration
-- `completed.tsv`：really ran which configuration
-- for every subdirectory, we will have the following files: `metrics.json`、`phase_summary.json`、`category_summary.json`、`cycles_count.npy`
+- `manifest.json`
+- `metrics.json`
+- `phase_summary.json`
+- `phase_group_summary.json`
+- `category_summary.json`
+- `cycles_count.npy`
+- `phase_cycles.npy`
+- `timer_buf_time_hwl.npy`
+- `run.log`
+

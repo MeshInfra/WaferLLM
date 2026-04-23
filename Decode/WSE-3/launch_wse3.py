@@ -13,6 +13,19 @@ def cast_tensor_u32(tensor):
     return np.uint32(tensor.view(np.uint16))
 
 
+def calculate_cycles_from_words(words_u32):
+    w0 = int(words_u32[0])
+    w1 = int(words_u32[1])
+    w2 = int(words_u32[2])
+
+    start = w0 + ((w1 & 0xFFFF) << 32)
+    end = ((w1 >> 16) & 0xFFFF) + ((w2 & 0xFFFF) << 16) + (((w2 >> 16) & 0xFFFF) << 32)
+
+    if end < start:
+        end += 1 << 48
+    return float(end - start)
+
+
 def write_json(path, payload):
     with open(path, "w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2, sort_keys=True)
@@ -382,7 +395,8 @@ def main():
             timer_buf_1d_u32, symbol_timer_buf, 0, 0, P, P, 3, streaming=False,
             data_type=MemcpyDataType.MEMCPY_32BIT, order=MemcpyOrder.ROW_MAJOR, nonblock=False
         )
-        timer_buf_time_hwl = timer_buf_1d_u32.view(np.float32).reshape((P, P, 3))
+        timer_buf_words_u32 = timer_buf_1d_u32.reshape((P, P, 3))
+        timer_buf_time_hwl = timer_buf_words_u32.view(np.float32).reshape((P, P, 3))
 
         phase_cycles_1d_f32 = np.zeros((P * P * len(PHASE_NAMES)), dtype=np.float32)
         runner.memcpy_d2h(
@@ -403,7 +417,7 @@ def main():
     cycles_count = np.zeros((P, P))
     for pe_x in range(P):
         for pe_y in range(P):
-            cycles_count[pe_y, pe_x] = sdk_utils.calculate_cycles(timer_buf_time_hwl[pe_y, pe_x, :])
+            cycles_count[pe_y, pe_x] = calculate_cycles_from_words(timer_buf_words_u32[pe_y, pe_x, :])
 
     cycles_per_step = cycles_count / repeat_steps
     cycles_flat = cycles_per_step.ravel()

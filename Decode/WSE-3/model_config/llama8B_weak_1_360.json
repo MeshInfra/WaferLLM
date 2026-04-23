@@ -1,0 +1,12 @@
+{
+    "P": 360,
+    "group_num": 15,
+    "bsz": 1,
+    "dim": 3240,
+    "n_heads": 1,
+    "n_kv_heads": 1,
+    "head_dim": 3240,
+    "seq_len": 3240,
+    "ffn_dim": 10800,
+    "layer_num": 32
+}

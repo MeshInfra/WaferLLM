@@ -110,8 +110,9 @@ for config in "${CONFIGS[@]}"; do
     echo "Artifact dir: $artifact_dir"
     echo "============================================================"
 
+    mkdir -p "$artifact_dir"
     echo -e "${config}\t${artifact_dir}" >> "$RUNS_TSV"
-    bash run_profiling_wse3.sh "$config" "$SIMULATOR" "$artifact_dir"
+    bash run_profiling_wse3.sh "$config" "$SIMULATOR" "$artifact_dir" 2>&1 | tee "$artifact_dir/run.log"
     echo -e "${config}\t${artifact_dir}" >> "$COMPLETED_TSV"
 done
 
