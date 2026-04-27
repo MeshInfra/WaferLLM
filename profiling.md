@@ -6,6 +6,16 @@
 
 本轮 profiling 的目标是做 **weak scaling**，不是 strong scaling。
 
+重要说明：`llama8B_weak_*` 不是仓库原本就有的一组三个真实
+llama8B 模型点。它们是从仓库已有的
+`Decode/WSE-3/model_config/llama8B_4k_1_480.json` 派生出来的
+controlled weak-scaling microbenchmark。也就是说：
+
+- `P=480` 点等价于仓库已有的 `llama8B_4k_1_480`
+- `P=240/360` 点是为了 weak scaling 反推得到的缩小问题规模
+- 除了 `controlled` 和 `weak` 这两个实验维度外，比例关系来自已有
+  `llama8B_4k_1_480` 配置，而不是任意编造
+
 这里的 weak scaling 定义是：
 
 - `P` 增大时，全局问题也按比例增大
@@ -18,7 +28,7 @@
 - `ffn_dim_p_pe = ffn_dim / P = 30`
 - `pe_num_p_group = P / group_num = 24`
 
-所以本轮 weak-scaling 配置只使用这三组：
+所以本轮 weak-scaling 配置只使用这三组派生配置：
 
 - `model_config/llama8B_weak_1_240.json`
 - `model_config/llama8B_weak_1_360.json`
@@ -27,6 +37,11 @@
 对应的 preset 是：
 
 - `profiling_presets/llama_p_weak_sweep.txt`
+
+如果实验要求“所有 config 都必须是仓库原始已有点”，那么当前仓库里没有
+一组严格满足 weak scaling 的 llama8B `P` sweep；只能做原始
+`llama8B_4k_1_*` sweep 或 fixed-problem controlled sweep，但那不是 weak
+scaling。
 
 ## 1. Environment Check
 
@@ -90,4 +105,3 @@ bash run_profiling_batch.sh --preset llama_p_weak_sweep --out profiling_runs/lla
 - `phase_cycles.npy`
 - `timer_buf_time_hwl.npy`
 - `run.log`
-
