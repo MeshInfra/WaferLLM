@@ -124,7 +124,6 @@ const two32_f32: f32 = 4294967296.0;
 
 var phase_cycles_f32 = @zeros([phase_count]f32);
 var ptr_phase_cycles: [*]f32 = &phase_cycles_f32;
-const ptr_comm_subphase_cycles = comm_mod.ptr_comm_subphase_cycles;
 
 var phase_tsc_start_buf = @zeros([timestamp.tsc_size_words]u16);
 var phase_tsc_end_buf = @zeros([timestamp.tsc_size_words]u16);
@@ -1060,6 +1059,6 @@ comptime {
     @export_symbol(ptr_timer_buf, "timer_buf");
     @export_symbol(ptr_time_ref, "time_ref");
     @export_symbol(ptr_phase_cycles, "phase_cycles");
-    @export_symbol(ptr_comm_subphase_cycles, "comm_subphase_cycles");
+    @export_symbol(comm_mod.ptr_comm_subphase_cycles, "comm_subphase_cycles");
     @export_symbol(ptr_debug, "debug");
 }
