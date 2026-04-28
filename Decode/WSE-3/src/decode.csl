@@ -107,11 +107,24 @@ const phase_silu_mul: i16 = 18;
 const phase_down_local: i16 = 19;
 const phase_down_comm: i16 = 20;
 const phase_ffn_residual: i16 = 21;
+const comm_phase_count: i16 = 9;
+const comm_subphase_count: i16 = comm_phase_count * 2;
+
+const comm_phase_rmsnorm_x: i16 = 0;
+const comm_phase_qkv: i16 = 1;
+const comm_phase_score: i16 = 2;
+const comm_phase_softmax: i16 = 3;
+const comm_phase_output: i16 = 4;
+const comm_phase_o: i16 = 5;
+const comm_phase_rmsnorm_z: i16 = 6;
+const comm_phase_upgate: i16 = 7;
+const comm_phase_down: i16 = 8;
 
 const two32_f32: f32 = 4294967296.0;
 
 var phase_cycles_f32 = @zeros([phase_count]f32);
 var ptr_phase_cycles: [*]f32 = &phase_cycles_f32;
+const ptr_comm_subphase_cycles = comm_mod.ptr_comm_subphase_cycles;
 
 var phase_tsc_start_buf = @zeros([timestamp.tsc_size_words]u16);
 var phase_tsc_end_buf = @zeros([timestamp.tsc_size_words]u16);
@@ -147,11 +160,20 @@ fn reset_phase_cycles() void {
     for (@range(i16, phase_count)) |i| {
         phase_cycles_f32[i] = 0.0;
     }
+    comm_mod.reset_comm_subphase_cycles();
 }
 
 fn phase_start() void {
     if (repeat_times > total_warmup_times) {
         timestamp.get_timestamp(&phase_tsc_start_buf);
+    }
+}
+
+fn profiling_enabled() i16 {
+    if (repeat_times > total_warmup_times) {
+        return 1;
+    } else {
+        return 0;
     }
 }
 
@@ -467,7 +489,7 @@ fn rmsnorm_x() void {
     phase_stop(phase_rmsnorm_x_local);
 
     phase_start();
-    comm_mod.all_reduce_bsz(py, quotient_y, remainder_y, ptr_local_sum);
+    comm_mod.all_reduce_bsz(py, quotient_y, remainder_y, ptr_local_sum, comm_phase_rmsnorm_x, profiling_enabled());
     phase_stop(phase_rmsnorm_x_comm);
 
     phase_start();
@@ -661,7 +683,7 @@ fn softmax_score() void {
 
     phase_stop(phase_softmax_local);
     phase_start();
-    comm_mod.all_reduceMax_bsz(py, quotient_y, remainder_y, ptr_local_max);
+    comm_mod.all_reduceMax_bsz(py, quotient_y, remainder_y, ptr_local_max, comm_phase_softmax, profiling_enabled());
     phase_stop(phase_softmax_comm);
 
     phase_start();
@@ -686,7 +708,7 @@ fn softmax_score() void {
 
     phase_stop(phase_softmax_local);
     phase_start();
-    comm_mod.all_reduce_bsz(py, quotient_y, remainder_y, ptr_local_sum);
+    comm_mod.all_reduce_bsz(py, quotient_y, remainder_y, ptr_local_sum, comm_phase_softmax, profiling_enabled());
     phase_stop(phase_softmax_comm);
 
     phase_start();
@@ -757,7 +779,7 @@ fn rmsnorm_z() void {
 
     phase_stop(phase_rmsnorm_z_local);
     phase_start();
-    comm_mod.all_reduce_bsz(py, quotient_y, remainder_y, ptr_local_sum);
+    comm_mod.all_reduce_bsz(py, quotient_y, remainder_y, ptr_local_sum, comm_phase_rmsnorm_z, profiling_enabled());
     phase_stop(phase_rmsnorm_z_comm);
 
     phase_start();
@@ -875,7 +897,7 @@ fn decode_struct() void {
     phase_stop(phase_qkv_local);
 
     phase_start();
-    comm_mod.all_reduce_bsz_dim_QKV_fusion(py, quotient_y, remainder_y, ptr_QKV_tile);
+    comm_mod.all_reduce_bsz_dim_QKV_fusion(py, quotient_y, remainder_y, ptr_QKV_tile, comm_phase_qkv, profiling_enabled());
     phase_stop(phase_qkv_comm);
 
     comm_mod.reconfig_allreduce_axis(0); // 0: px row-wise, 1: py col-wise
@@ -887,7 +909,7 @@ fn decode_struct() void {
 
     score_matvec_mult();
     phase_start();
-    comm_mod.all_reduce_bsz_seq_len(px, quotient_x, remainder_x, ptr_score);
+    comm_mod.all_reduce_bsz_seq_len(px, quotient_x, remainder_x, ptr_score, comm_phase_score, profiling_enabled());
     phase_stop(phase_score_comm);
 
     comm_mod.reconfig_allreduce_axis(1);
@@ -896,14 +918,14 @@ fn decode_struct() void {
 
     output_matvec_mult();
     phase_start();
-    comm_mod.all_reduce_bsz_dim(py, quotient_y, remainder_y, ptr_output);
+    comm_mod.all_reduce_bsz_dim(py, quotient_y, remainder_y, ptr_output, comm_phase_output, profiling_enabled());
     phase_stop(phase_output_comm);
 
     comm_mod.reconfig_allreduce_axis(0);
 
     o_matvec_mult();
     phase_start();
-    comm_mod.all_reduce_bsz_dim(px, quotient_x, remainder_x, ptr_h1);
+    comm_mod.all_reduce_bsz_dim(px, quotient_x, remainder_x, ptr_h1, comm_phase_o, profiling_enabled());
     phase_stop(phase_o_comm);
 
     attn_residual_add();
@@ -918,7 +940,7 @@ fn decode_struct() void {
     phase_stop(phase_upgate_local);
 
     phase_start();
-    comm_mod.all_reduce_bsz_ffn_dim_ZZ_fusion(py, quotient_y, remainder_y, ptr_ZZ_tile);
+    comm_mod.all_reduce_bsz_ffn_dim_ZZ_fusion(py, quotient_y, remainder_y, ptr_ZZ_tile, comm_phase_upgate, profiling_enabled());
     phase_stop(phase_upgate_comm);
 
     z2_silu();
@@ -929,7 +951,7 @@ fn decode_struct() void {
 
     down_matvec_mult();
     phase_start();
-    comm_mod.all_reduce_bsz_dim(px, quotient_x, remainder_x, ptr_h2);
+    comm_mod.all_reduce_bsz_dim(px, quotient_x, remainder_x, ptr_h2, comm_phase_down, profiling_enabled());
     phase_stop(phase_down_comm);
 
     ffn_residual_add();
@@ -1038,5 +1060,6 @@ comptime {
     @export_symbol(ptr_timer_buf, "timer_buf");
     @export_symbol(ptr_time_ref, "time_ref");
     @export_symbol(ptr_phase_cycles, "phase_cycles");
+    @export_symbol(ptr_comm_subphase_cycles, "comm_subphase_cycles");
     @export_symbol(ptr_debug, "debug");
 }

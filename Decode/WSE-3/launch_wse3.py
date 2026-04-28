@@ -57,6 +57,27 @@ PHASE_NAMES = [
     "ffn_residual",
 ]
 
+COMM_SUBPHASE_NAMES = [
+    "rmsnorm_x_reduce",
+    "rmsnorm_x_broadcast",
+    "qkv_reduce",
+    "qkv_broadcast",
+    "score_reduce",
+    "score_broadcast",
+    "softmax_reduce",
+    "softmax_broadcast",
+    "output_reduce",
+    "output_broadcast",
+    "o_reduce",
+    "o_broadcast",
+    "rmsnorm_z_reduce",
+    "rmsnorm_z_broadcast",
+    "upgate_reduce",
+    "upgate_broadcast",
+    "down_reduce",
+    "down_broadcast",
+]
+
 GROUP_SPECS = [
     (
         "RMSNorm+QKV",
@@ -269,6 +290,7 @@ def main():
 
         symbol_timer_buf = runner.get_id("timer_buf")
         symbol_phase_cycles = runner.get_id("phase_cycles")
+        symbol_comm_subphase_cycles = runner.get_id("comm_subphase_cycles")
         sym_debug = runner.get_id("debug")
 
         X_u32 = cast_tensor_u32(tensor_X.ravel())
@@ -414,6 +436,22 @@ def main():
         )
         phase_cycles = phase_cycles_1d_f32.reshape((P, P, len(PHASE_NAMES)))
 
+        comm_subphase_cycles_1d_f32 = np.zeros((P * P * len(COMM_SUBPHASE_NAMES)), dtype=np.float32)
+        runner.memcpy_d2h(
+            comm_subphase_cycles_1d_f32,
+            symbol_comm_subphase_cycles,
+            0,
+            0,
+            P,
+            P,
+            len(COMM_SUBPHASE_NAMES),
+            streaming=False,
+            data_type=MemcpyDataType.MEMCPY_32BIT,
+            order=MemcpyOrder.ROW_MAJOR,
+            nonblock=False,
+        )
+        comm_subphase_cycles = comm_subphase_cycles_1d_f32.reshape((P, P, len(COMM_SUBPHASE_NAMES)))
+
     cycles_count = np.zeros((P, P))
     for pe_x in range(P):
         for pe_y in range(P):
@@ -432,6 +470,11 @@ def main():
     phase_cycles_per_step = phase_cycles / repeat_steps
     phase_means = phase_cycles_per_step.mean(axis=(0, 1))
     phase_summary = {name: float(phase_means[idx]) for idx, name in enumerate(PHASE_NAMES)}
+    comm_subphase_cycles_per_step = comm_subphase_cycles / repeat_steps
+    comm_subphase_means = comm_subphase_cycles_per_step.mean(axis=(0, 1))
+    comm_subphase_summary = {
+        name: float(comm_subphase_means[idx]) for idx, name in enumerate(COMM_SUBPHASE_NAMES)
+    }
     phase_bars, category_totals, measured_phase_cycles, other_cycles = aggregate_phase_groups(
         phase_means,
         cycles_count_mean,
@@ -452,6 +495,9 @@ def main():
     print("Host: mean phase cycles:")
     for name in PHASE_NAMES:
         print(f"  - {name}: {phase_summary[name]:.3f}")
+    print("Host: mean communication subphase cycles:")
+    for name in COMM_SUBPHASE_NAMES:
+        print(f"  - {name}: {comm_subphase_summary[name]:.3f}")
     print(f"Host: measured phase sum: {measured_phase_cycles:.3f}")
     print(f"Host: residual other cycles: {other_cycles:.3f}")
 
@@ -500,6 +546,7 @@ def main():
         write_json(os.path.join(artifact_dir, "manifest.json"), manifest)
         write_json(os.path.join(artifact_dir, "metrics.json"), metrics)
         write_json(os.path.join(artifact_dir, "phase_summary.json"), phase_summary)
+        write_json(os.path.join(artifact_dir, "comm_subphase_summary.json"), comm_subphase_summary)
         write_json(os.path.join(artifact_dir, "category_summary.json"), category_totals)
         write_json(os.path.join(artifact_dir, "phase_group_summary.json"), phase_bars)
         np.save(os.path.join(artifact_dir, "cycles_count.npy"), cycles_per_step)
@@ -510,12 +557,21 @@ def main():
             fmt="%.6f",
         )
         np.save(os.path.join(artifact_dir, "phase_cycles.npy"), phase_cycles_per_step)
+        np.save(os.path.join(artifact_dir, "comm_subphase_cycles.npy"), comm_subphase_cycles_per_step)
         np.savetxt(
             os.path.join(artifact_dir, "phase_cycles_mean.csv"),
             phase_means.reshape(1, -1),
             delimiter=",",
             fmt="%.6f",
             header=",".join(PHASE_NAMES),
+            comments="",
+        )
+        np.savetxt(
+            os.path.join(artifact_dir, "comm_subphase_cycles_mean.csv"),
+            comm_subphase_means.reshape(1, -1),
+            delimiter=",",
+            fmt="%.6f",
+            header=",".join(COMM_SUBPHASE_NAMES),
             comments="",
         )
         np.save(os.path.join(artifact_dir, "timer_buf_time_hwl.npy"), timer_buf_time_hwl)
