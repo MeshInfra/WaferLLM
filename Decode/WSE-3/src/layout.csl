@@ -111,5 +111,6 @@ layout {
     @export_name("timer_buf", [*]f32, true);
     @export_name("time_ref", [*]f32, true);
     @export_name("phase_cycles", [*]f32, true);
+    @export_name("comm_subphase_cycles", [*]f32, true);
     @export_name("debug", [*]f16, true);
 }
