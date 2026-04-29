@@ -275,6 +275,9 @@ def main():
     symbol_timer_buf = runner.get_id("timer_buf")
     symbol_timer_ref = runner.get_id("time_ref")
     symbol_phase_cycles = runner.get_id("phase_cycles")
+    symbol_phase_flop_equiv = runner.get_id("phase_flop_equiv")
+    symbol_phase_local_mem_bytes = runner.get_id("phase_local_mem_bytes")
+    symbol_phase_working_set_bytes = runner.get_id("phase_working_set_bytes")
     symbol_comm_subphase_cycles = runner.get_id("comm_subphase_cycles")
     sym_debug = runner.get_id("debug")
 
@@ -425,6 +428,54 @@ def main():
     )
     phase_cycles = phase_cycles_1d_f32.reshape((P, P, len(PHASE_NAMES)))
 
+    phase_flop_equiv_1d_f32 = np.zeros((P * P * len(PHASE_NAMES)), dtype=np.float32)
+    runner.memcpy_d2h(
+        phase_flop_equiv_1d_f32,
+        symbol_phase_flop_equiv,
+        0,
+        0,
+        P,
+        P,
+        len(PHASE_NAMES),
+        streaming=False,
+        data_type=MemcpyDataType.MEMCPY_32BIT,
+        order=MemcpyOrder.ROW_MAJOR,
+        nonblock=False,
+    )
+    phase_flop_equiv = phase_flop_equiv_1d_f32.reshape((P, P, len(PHASE_NAMES)))
+
+    phase_local_mem_bytes_1d_f32 = np.zeros((P * P * len(PHASE_NAMES)), dtype=np.float32)
+    runner.memcpy_d2h(
+        phase_local_mem_bytes_1d_f32,
+        symbol_phase_local_mem_bytes,
+        0,
+        0,
+        P,
+        P,
+        len(PHASE_NAMES),
+        streaming=False,
+        data_type=MemcpyDataType.MEMCPY_32BIT,
+        order=MemcpyOrder.ROW_MAJOR,
+        nonblock=False,
+    )
+    phase_local_mem_bytes = phase_local_mem_bytes_1d_f32.reshape((P, P, len(PHASE_NAMES)))
+
+    phase_working_set_bytes_1d_f32 = np.zeros((P * P * len(PHASE_NAMES)), dtype=np.float32)
+    runner.memcpy_d2h(
+        phase_working_set_bytes_1d_f32,
+        symbol_phase_working_set_bytes,
+        0,
+        0,
+        P,
+        P,
+        len(PHASE_NAMES),
+        streaming=False,
+        data_type=MemcpyDataType.MEMCPY_32BIT,
+        order=MemcpyOrder.ROW_MAJOR,
+        nonblock=False,
+    )
+    phase_working_set_bytes = phase_working_set_bytes_1d_f32.reshape((P, P, len(PHASE_NAMES)))
+
     comm_subphase_cycles_1d_f32 = np.zeros((P * P * len(COMM_SUBPHASE_NAMES)), dtype=np.float32)
     runner.memcpy_d2h(
         comm_subphase_cycles_1d_f32,
@@ -489,6 +540,24 @@ def main():
     phase_cycles_per_step = phase_cycles / repeat_steps
     phase_means = phase_cycles_per_step.mean(axis=(0, 1))
     phase_summary = {name: float(phase_means[idx]) for idx, name in enumerate(PHASE_NAMES)}
+    phase_flop_equiv_per_step = phase_flop_equiv / repeat_steps
+    phase_local_mem_bytes_per_step = phase_local_mem_bytes / repeat_steps
+    phase_working_set_bytes_per_step = phase_working_set_bytes / repeat_steps
+    phase_flop_equiv_means = phase_flop_equiv_per_step.mean(axis=(0, 1))
+    phase_local_mem_bytes_means = phase_local_mem_bytes_per_step.mean(axis=(0, 1))
+    phase_working_set_bytes_means = phase_working_set_bytes_per_step.mean(axis=(0, 1))
+    phase_property_summary = {}
+    for idx, name in enumerate(PHASE_NAMES):
+        flop_equiv = float(phase_flop_equiv_means[idx])
+        local_mem_bytes = float(phase_local_mem_bytes_means[idx])
+        working_set_bytes = float(phase_working_set_bytes_means[idx])
+        phase_property_summary[name] = {
+            "flop_equiv": flop_equiv,
+            "local_mem_bytes": local_mem_bytes,
+            "working_set_bytes": working_set_bytes,
+            "intensity_flop_per_byte": float(flop_equiv / local_mem_bytes) if local_mem_bytes else 0.0,
+            "sram_fit_pct_of_48kb": float(100.0 * working_set_bytes / 49152.0),
+        }
     comm_subphase_cycles_per_step = comm_subphase_cycles / repeat_steps
     comm_subphase_means = comm_subphase_cycles_per_step.mean(axis=(0, 1))
     comm_subphase_summary = {
@@ -502,6 +571,14 @@ def main():
     print("Host: mean phase cycles:")
     for name in PHASE_NAMES:
         print(f"  - {name}: {phase_summary[name]:.3f}")
+    print("Host: mean local-phase properties:")
+    for name in PHASE_NAMES:
+        props = phase_property_summary[name]
+        print(
+            f"  - {name}: flop_equiv={props['flop_equiv']:.3f}, "
+            f"local_mem_bytes={props['local_mem_bytes']:.3f}, "
+            f"working_set_bytes={props['working_set_bytes']:.3f}"
+        )
     print("Host: mean communication subphase cycles:")
     for name in COMM_SUBPHASE_NAMES:
         print(f"  - {name}: {comm_subphase_summary[name]:.3f}")
@@ -531,6 +608,7 @@ def main():
                 "ffn_dim_p_pe": ffn_dim_p_pe,
                 "repeat_steps": repeat_steps,
                 "warmup_steps": warmup_steps,
+                "phase_property_method": "runtime-accounted kernel formulas exported by decode.csl; cycles are measured, flop/byte/working-set properties are code-accounted rather than hardware perf counters",
             },
         }
         metrics = {
@@ -548,6 +626,7 @@ def main():
         write_json(os.path.join(artifact_dir, "manifest.json"), manifest)
         write_json(os.path.join(artifact_dir, "metrics.json"), metrics)
         write_json(os.path.join(artifact_dir, "phase_summary.json"), phase_summary)
+        write_json(os.path.join(artifact_dir, "phase_property_summary.json"), phase_property_summary)
         write_json(os.path.join(artifact_dir, "comm_subphase_summary.json"), comm_subphase_summary)
         write_json(os.path.join(artifact_dir, "category_summary.json"), category_totals)
         write_json(os.path.join(artifact_dir, "phase_group_summary.json"), phase_bars)
@@ -559,10 +638,37 @@ def main():
             fmt="%.6f",
         )
         np.save(os.path.join(artifact_dir, "phase_cycles.npy"), phase_cycles_per_step)
+        np.save(os.path.join(artifact_dir, "phase_flop_equiv.npy"), phase_flop_equiv_per_step)
+        np.save(os.path.join(artifact_dir, "phase_local_mem_bytes.npy"), phase_local_mem_bytes_per_step)
+        np.save(os.path.join(artifact_dir, "phase_working_set_bytes.npy"), phase_working_set_bytes_per_step)
         np.save(os.path.join(artifact_dir, "comm_subphase_cycles.npy"), comm_subphase_cycles_per_step)
         np.savetxt(
             os.path.join(artifact_dir, "phase_cycles_mean.csv"),
             phase_means.reshape(1, -1),
+            delimiter=",",
+            fmt="%.6f",
+            header=",".join(PHASE_NAMES),
+            comments="",
+        )
+        np.savetxt(
+            os.path.join(artifact_dir, "phase_flop_equiv_mean.csv"),
+            phase_flop_equiv_means.reshape(1, -1),
+            delimiter=",",
+            fmt="%.6f",
+            header=",".join(PHASE_NAMES),
+            comments="",
+        )
+        np.savetxt(
+            os.path.join(artifact_dir, "phase_local_mem_bytes_mean.csv"),
+            phase_local_mem_bytes_means.reshape(1, -1),
+            delimiter=",",
+            fmt="%.6f",
+            header=",".join(PHASE_NAMES),
+            comments="",
+        )
+        np.savetxt(
+            os.path.join(artifact_dir, "phase_working_set_bytes_mean.csv"),
+            phase_working_set_bytes_means.reshape(1, -1),
             delimiter=",",
             fmt="%.6f",
             header=",".join(PHASE_NAMES),

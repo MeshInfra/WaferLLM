@@ -121,9 +121,45 @@ const comm_phase_upgate: i16 = 7;
 const comm_phase_down: i16 = 8;
 
 const two32_f32: f32 = 4294967296.0;
+const f16_bytes_f32: f32 = 2.0;
+
+const elem_bsz_f32: f32 = @as(f32, bsz);
+const elem_dim_f32: f32 = @as(f32, dim_p_pe);
+const elem_half_dim_f32: f32 = @as(f32, _dim_p_pe / 2);
+const elem_seq_f32: f32 = @as(f32, seq_len_p_pe);
+const elem_ffn_f32: f32 = @as(f32, ffn_dim_p_pe);
+
+const elem_bsz_dim_f32: f32 = elem_bsz_f32 * elem_dim_f32;
+const elem_bsz_seq_f32: f32 = elem_bsz_f32 * elem_seq_f32;
+const elem_bsz_ffn_f32: f32 = elem_bsz_f32 * elem_ffn_f32;
+const elem_qkv_f32: f32 = elem_bsz_f32 * 3.0 * elem_dim_f32;
+const elem_zz_f32: f32 = elem_bsz_f32 * 2.0 * elem_ffn_f32;
+const elem_weight_dd_f32: f32 = elem_dim_f32 * elem_dim_f32;
+const elem_weight_df_f32: f32 = elem_dim_f32 * elem_ffn_f32;
+const elem_cache_ds_f32: f32 = elem_dim_f32 * elem_seq_f32;
+
+const bytes_bsz_f32: f32 = elem_bsz_f32 * f16_bytes_f32;
+const bytes_dim_f32: f32 = elem_dim_f32 * f16_bytes_f32;
+const bytes_half_dim_f32: f32 = elem_half_dim_f32 * f16_bytes_f32;
+const bytes_seq_f32: f32 = elem_seq_f32 * f16_bytes_f32;
+const bytes_ffn_f32: f32 = elem_ffn_f32 * f16_bytes_f32;
+const bytes_bsz_dim_f32: f32 = elem_bsz_dim_f32 * f16_bytes_f32;
+const bytes_bsz_seq_f32: f32 = elem_bsz_seq_f32 * f16_bytes_f32;
+const bytes_bsz_ffn_f32: f32 = elem_bsz_ffn_f32 * f16_bytes_f32;
+const bytes_qkv_f32: f32 = elem_qkv_f32 * f16_bytes_f32;
+const bytes_zz_f32: f32 = elem_zz_f32 * f16_bytes_f32;
+const bytes_weight_dd_f32: f32 = elem_weight_dd_f32 * f16_bytes_f32;
+const bytes_weight_df_f32: f32 = elem_weight_df_f32 * f16_bytes_f32;
+const bytes_cache_ds_f32: f32 = elem_cache_ds_f32 * f16_bytes_f32;
 
 var phase_cycles_f32 = @zeros([phase_count]f32);
 var ptr_phase_cycles: [*]f32 = &phase_cycles_f32;
+var phase_flop_equiv_f32 = @zeros([phase_count]f32);
+var ptr_phase_flop_equiv: [*]f32 = &phase_flop_equiv_f32;
+var phase_local_mem_bytes_f32 = @zeros([phase_count]f32);
+var ptr_phase_local_mem_bytes: [*]f32 = &phase_local_mem_bytes_f32;
+var phase_working_set_bytes_f32 = @zeros([phase_count]f32);
+var ptr_phase_working_set_bytes: [*]f32 = &phase_working_set_bytes_f32;
 
 var phase_tsc_start_buf = @zeros([timestamp.tsc_size_words]u16);
 var phase_tsc_end_buf = @zeros([timestamp.tsc_size_words]u16);
@@ -158,6 +194,9 @@ fn init_task() void {
 fn reset_phase_cycles() void {
     for (@range(i16, phase_count)) |i| {
         phase_cycles_f32[i] = 0.0;
+        phase_flop_equiv_f32[i] = 0.0;
+        phase_local_mem_bytes_f32[i] = 0.0;
+        phase_working_set_bytes_f32[i] = 0.0;
     }
     comm_mod.reset_comm_subphase_cycles();
 }
@@ -197,6 +236,14 @@ fn phase_stop(phase_id: i16) void {
         }
 
         phase_cycles_f32[phase_id] += delta_hi_f32 * two32_f32 + delta_lo_f32;
+    }
+}
+
+fn account_phase_properties(phase_id: i16, flop_equiv: f32, local_mem_bytes: f32, working_set_bytes: f32) void {
+    if (repeat_times > total_warmup_times) {
+        phase_flop_equiv_f32[phase_id] += flop_equiv;
+        phase_local_mem_bytes_f32[phase_id] += local_mem_bytes;
+        phase_working_set_bytes_f32[phase_id] += working_set_bytes;
     }
 }
 
@@ -506,6 +553,13 @@ fn rmsnorm_x() void {
     @load_to_dsr(src0_dsr_1, dim_p_pe_dsd_1, .{ .save_address = true});
     @map(fmulh_norm_func, local_sum_dsd);
     phase_stop(phase_rmsnorm_x_local);
+
+    account_phase_properties(
+        phase_rmsnorm_x_local,
+        8.0 * elem_bsz_dim_f32,
+        9.0 * bytes_bsz_dim_f32 + bytes_bsz_f32,
+        2.0 * bytes_bsz_dim_f32 + bytes_dim_f32 + bytes_bsz_f32,
+    );
 }
 
 fn xq_matvec_mult() void {
@@ -668,6 +722,13 @@ fn score_matvec_mult() void {
     @load_to_dsr(src0_dsr_1, score_dsd);
     @fmulh(dest_dsr_1, src0_dsr_1, alpha);
     phase_stop(phase_score_local);
+
+    account_phase_properties(
+        phase_score_local,
+        2.0 * elem_bsz_dim_f32 * elem_seq_f32 + elem_bsz_seq_f32,
+        bytes_bsz_dim_f32 + bytes_cache_ds_f32 + 5.0 * bytes_bsz_seq_f32,
+        bytes_qkv_f32 + bytes_cache_ds_f32 + bytes_bsz_seq_f32,
+    );
 }
 
 fn softmax_score() void {
@@ -716,6 +777,13 @@ fn softmax_score() void {
     @load_to_dsr(src0_dsr_1, seq_len_p_pe_dsd_1, .{ .save_address = true });
     @map(fmulh_softmax_func, local_sum_dsd);
     phase_stop(phase_softmax_local);
+
+    account_phase_properties(
+        phase_softmax_local,
+        9.0 * elem_bsz_seq_f32,
+        8.0 * bytes_bsz_seq_f32 + 2.0 * bytes_bsz_f32,
+        2.0 * bytes_bsz_seq_f32 + 2.0 * bytes_bsz_f32,
+    );
 }
 
 fn output_matvec_mult() void {
@@ -733,6 +801,13 @@ fn output_matvec_mult() void {
 
     vecmat_computation();
     phase_stop(phase_output_local);
+
+    account_phase_properties(
+        phase_output_local,
+        2.0 * elem_bsz_seq_f32 * elem_dim_f32,
+        bytes_bsz_seq_f32 + bytes_cache_ds_f32 + 4.0 * bytes_bsz_dim_f32,
+        bytes_bsz_seq_f32 + bytes_cache_ds_f32 + bytes_bsz_dim_f32,
+    );
 }
 
 fn o_matvec_mult() void {
@@ -750,6 +825,13 @@ fn o_matvec_mult() void {
 
     vecmat_computation();
     phase_stop(phase_o_local);
+
+    account_phase_properties(
+        phase_o_local,
+        2.0 * elem_bsz_dim_f32 * elem_dim_f32,
+        bytes_bsz_dim_f32 + bytes_weight_dd_f32 + 4.0 * bytes_bsz_dim_f32,
+        2.0 * bytes_bsz_dim_f32 + bytes_weight_dd_f32,
+    );
 }
 
 fn attn_residual_add() void {
@@ -759,6 +841,13 @@ fn attn_residual_add() void {
     @load_to_dsr(src1_dsr_1, h1_dsd);
     @faddh(dest_dsr_1, src0_dsr_1, src1_dsr_1);
     phase_stop(phase_attn_residual);
+
+    account_phase_properties(
+        phase_attn_residual,
+        elem_bsz_dim_f32,
+        4.0 * bytes_bsz_dim_f32,
+        3.0 * bytes_bsz_dim_f32,
+    );
 }
 
 fn rmsnorm_z() void {
@@ -796,6 +885,13 @@ fn rmsnorm_z() void {
     @load_to_dsr(src0_dsr_1, seq_len_p_pe_dsd_1, .{ .save_address = true });
     @map(fmulh_norm_func, local_sum_dsd);
     phase_stop(phase_rmsnorm_z_local);
+
+    account_phase_properties(
+        phase_rmsnorm_z_local,
+        8.0 * elem_bsz_dim_f32,
+        9.0 * bytes_bsz_dim_f32 + bytes_bsz_f32,
+        2.0 * bytes_bsz_dim_f32 + bytes_dim_f32 + bytes_bsz_f32,
+    );
 }
 
 fn up_matvec_mult() void {
@@ -874,6 +970,13 @@ fn down_matvec_mult() void {
 
     vecmat_computation();
     phase_stop(phase_down_local);
+
+    account_phase_properties(
+        phase_down_local,
+        2.0 * elem_bsz_ffn_f32 * elem_dim_f32,
+        bytes_bsz_ffn_f32 + bytes_weight_df_f32 + 4.0 * bytes_bsz_dim_f32,
+        bytes_bsz_ffn_f32 + bytes_weight_df_f32 + bytes_bsz_dim_f32,
+    );
 }
 
 fn ffn_residual_add() void {
@@ -883,6 +986,13 @@ fn ffn_residual_add() void {
     @load_to_dsr(src1_dsr_1, h2_dsd);
     @faddh(dest_dsr_1, src0_dsr_1, src1_dsr_1);
     phase_stop(phase_ffn_residual);
+
+    account_phase_properties(
+        phase_ffn_residual,
+        elem_bsz_dim_f32,
+        4.0 * bytes_bsz_dim_f32,
+        2.0 * bytes_bsz_dim_f32,
+    );
 }
 
 fn decode_struct() void {
@@ -894,6 +1004,12 @@ fn decode_struct() void {
     xk_matvec_mult();
     xv_matvec_mult();
     phase_stop(phase_qkv_local);
+    account_phase_properties(
+        phase_qkv_local,
+        6.0 * elem_bsz_dim_f32 * elem_dim_f32,
+        3.0 * bytes_weight_dd_f32 + 15.0 * bytes_bsz_dim_f32,
+        bytes_bsz_dim_f32 + bytes_weight_dd_f32 + bytes_qkv_f32,
+    );
 
     phase_start();
     comm_mod.all_reduce_bsz_dim_QKV_fusion(py, quotient_y, remainder_y, ptr_QKV_tile, comm_phase_qkv, profiling_enabled());
@@ -905,6 +1021,12 @@ fn decode_struct() void {
     xq_rope();
     xk_rope();
     phase_stop(phase_rope);
+    account_phase_properties(
+        phase_rope,
+        6.0 * elem_bsz_dim_f32,
+        12.0 * bytes_bsz_dim_f32,
+        bytes_qkv_f32 + 6.0 * bytes_half_dim_f32,
+    );
 
     score_matvec_mult();
     phase_start();
@@ -937,6 +1059,12 @@ fn decode_struct() void {
     up_matvec_mult();
     gate_matvec_mult();
     phase_stop(phase_upgate_local);
+    account_phase_properties(
+        phase_upgate_local,
+        4.0 * elem_bsz_dim_f32 * elem_ffn_f32,
+        2.0 * bytes_bsz_dim_f32 + 2.0 * bytes_weight_df_f32 + 8.0 * bytes_bsz_ffn_f32,
+        bytes_bsz_dim_f32 + bytes_weight_df_f32 + bytes_zz_f32,
+    );
 
     phase_start();
     comm_mod.all_reduce_bsz_ffn_dim_ZZ_fusion(py, quotient_y, remainder_y, ptr_ZZ_tile, comm_phase_upgate, profiling_enabled());
@@ -945,6 +1073,12 @@ fn decode_struct() void {
     z2_silu();
 
     z3_mat();
+    account_phase_properties(
+        phase_silu_mul,
+        6.0 * elem_bsz_dim_f32 + elem_bsz_ffn_f32,
+        2.0 * bytes_bsz_dim_f32 + 4.0 * bytes_bsz_ffn_f32,
+        bytes_zz_f32 + bytes_bsz_ffn_f32,
+    );
 
     comm_mod.reconfig_allreduce_axis(0);
 
@@ -1059,6 +1193,9 @@ comptime {
     @export_symbol(ptr_timer_buf, "timer_buf");
     @export_symbol(ptr_time_ref, "time_ref");
     @export_symbol(ptr_phase_cycles, "phase_cycles");
+    @export_symbol(ptr_phase_flop_equiv, "phase_flop_equiv");
+    @export_symbol(ptr_phase_local_mem_bytes, "phase_local_mem_bytes");
+    @export_symbol(ptr_phase_working_set_bytes, "phase_working_set_bytes");
     @export_symbol(comm_mod.ptr_comm_subphase_cycles, "comm_subphase_cycles");
     @export_symbol(ptr_debug, "debug");
 }
