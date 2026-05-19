@@ -13,6 +13,8 @@ if [ -n "$2" ]; then
     simulator=$2
 fi
 
+LAUNCH_ARGS=("${@:3}")
+
 # if config.json exists
 if [ -f $CONFIG ]; then
     echo "Use config values from $CONFIG."
@@ -70,11 +72,12 @@ echo "Simulator: $simulator"
 
 python compile.py $P $BSZ $dim_p_pe $pes_p_head $pes_p_kv_head $head_dim_p_pe $seq_len_p_pe $ffn_dim_p_pe $pe_num_p_group $root_1st_phase $root_2nd_phase $simulator
 
+LAUNCH_CMD=(python launch_wse3.py --config "$CONFIG")
 if [ "$simulator" == "true" ]; then
-    python launch_wse3.py --config $CONFIG --simulator
-else
-    python launch_wse3.py --config $CONFIG
+    LAUNCH_CMD+=(--simulator)
 fi
+LAUNCH_CMD+=("${LAUNCH_ARGS[@]}")
+"${LAUNCH_CMD[@]}"
 
 rm -rf simfab_traces
 rm -rf wio_flows_tmpdir.*

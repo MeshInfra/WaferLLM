@@ -1,6 +1,9 @@
 import json
 import os
 import argparse
+import csv
+import time
+from time import perf_counter_ns
 import numpy as np
 
 from cerebras.appliance.pb.sdk.sdk_common_pb2 import MemcpyDataType, MemcpyOrder
@@ -30,6 +33,257 @@ def write_json(path, payload):
     with open(path, "w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2, sort_keys=True)
         f.write("\n")
+
+
+def parse_size(value):
+    raw = value.strip()
+    lower = raw.lower()
+    multipliers = {
+        "kib": 1024,
+        "kb": 1000,
+        "mib": 1024 * 1024,
+        "mb": 1000 * 1000,
+        "b": 1,
+    }
+    for suffix, mult in multipliers.items():
+        if lower.endswith(suffix):
+            return int(float(raw[: -len(suffix)].strip()) * mult)
+    return int(raw)
+
+
+def parse_int_list(value):
+    return [int(item.strip()) for item in value.split(",") if item.strip()]
+
+
+def parse_size_list(value):
+    return [parse_size(item) for item in value.split(",") if item.strip()]
+
+
+def parse_bool_list(value):
+    if value == "true":
+        return [True]
+    if value == "false":
+        return [False]
+    return [False, True]
+
+
+def fmt_size(num_bytes):
+    if num_bytes % (1024 * 1024) == 0:
+        return f"{num_bytes // (1024 * 1024)}MiB"
+    if num_bytes % 1024 == 0:
+        return f"{num_bytes // 1024}KiB"
+    return f"{num_bytes}B"
+
+
+def payload_to_local_len(payload_bytes, P, dtype_bytes=2):
+    bytes_per_local_element = P * P * dtype_bytes
+    if payload_bytes % bytes_per_local_element != 0:
+        raise ValueError(
+            f"payload_bytes={payload_bytes} must be divisible by "
+            f"P*P*dtype_bytes={bytes_per_local_element}"
+        )
+    local_len = payload_bytes // bytes_per_local_element
+    if local_len < 1:
+        raise ValueError("payload maps to less than one local element per PE")
+    return local_len
+
+
+def make_h2d_bench_points(args):
+    nonblocks = parse_bool_list(args.h2d_nonblock)
+    points = []
+    payloads = (
+        parse_size_list(args.h2d_payload_bytes)
+        if args.h2d_payload_bytes
+        else [
+            4 * 1024,
+            8 * 1024,
+            16 * 1024,
+            32 * 1024,
+            64 * 1024,
+            128 * 1024,
+            256 * 1024,
+            512 * 1024,
+            1024 * 1024,
+            2 * 1024 * 1024,
+            4 * 1024 * 1024,
+            8 * 1024 * 1024,
+        ]
+    )
+
+    if args.h2d_preset == "smoke":
+        for nonblock in nonblocks:
+            points.append(("smoke_64KiB", 64 * 1024, 1, 1, nonblock))
+            points.append(("smoke_1MiB", 1024 * 1024, 1, 1, nonblock))
+    elif args.h2d_preset == "payload-sweep":
+        for payload in payloads:
+            for loop_count in parse_int_list(args.h2d_loop_counts):
+                for nonblock in nonblocks:
+                    points.append((f"payload_{fmt_size(payload)}", payload, 1, loop_count, nonblock))
+    elif args.h2d_preset == "chunk-size":
+        same_total_bytes = parse_size(args.h2d_same_total_bytes)
+        for payload in [4 * 1024, 64 * 1024, 1024 * 1024, 8 * 1024 * 1024]:
+            if same_total_bytes % payload != 0:
+                continue
+            for nonblock in nonblocks:
+                points.append((f"chunk_{fmt_size(payload)}", payload, 1, same_total_bytes // payload, nonblock))
+    elif args.h2d_preset == "multi-stream":
+        payload = parse_size(args.h2d_stream_payload_bytes)
+        for streams in parse_int_list(args.h2d_streams):
+            for nonblock in nonblocks:
+                points.append((f"streams_{streams}", payload, streams, 1, nonblock))
+    elif args.h2d_preset == "all":
+        original = args.h2d_preset
+        for preset in ["payload-sweep", "chunk-size", "multi-stream"]:
+            args.h2d_preset = preset
+            points.extend(make_h2d_bench_points(args))
+        args.h2d_preset = original
+    return points
+
+
+def write_csv(path, rows):
+    if not rows:
+        return
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def read_timer_words(runner, symbol_timer_buf, P):
+    timer_buf_1d_u32 = np.zeros((P * P * 3), dtype=np.uint32)
+    runner.memcpy_d2h(
+        timer_buf_1d_u32,
+        symbol_timer_buf,
+        0,
+        0,
+        P,
+        P,
+        3,
+        streaming=False,
+        data_type=MemcpyDataType.MEMCPY_32BIT,
+        order=MemcpyOrder.ROW_MAJOR,
+        nonblock=False,
+    )
+    return timer_buf_1d_u32.reshape((P, P, 3))
+
+
+def issue_h2d_copies(runner, symbol_ids, data_u32, P, local_len, count, nonblock, io_dtype, memcpy_order):
+    for idx in range(count):
+        symbol_id = symbol_ids[idx % len(symbol_ids)]
+        runner.memcpy_h2d(
+            symbol_id,
+            data_u32,
+            0,
+            0,
+            P,
+            P,
+            local_len,
+            streaming=False,
+            data_type=io_dtype,
+            order=memcpy_order,
+            nonblock=nonblock,
+        )
+
+
+def run_h2d_bench(runner, symbol_map, symbol_timer_buf, args, P, io_dtype, memcpy_order):
+    selected_names = [name.strip() for name in args.h2d_symbols.split(",") if name.strip()]
+    missing = [name for name in selected_names if name not in symbol_map]
+    if missing:
+        raise ValueError(f"Unknown H2D symbols: {missing}. Available: {sorted(symbol_map)}")
+
+    selected = [symbol_map[name] for name in selected_names]
+    max_local_len = min(item["local_len"] for item in selected)
+    max_payload_bytes = P * P * max_local_len * 2
+    points = make_h2d_bench_points(args)
+    rows = []
+
+    output_dir = args.h2d_output_dir
+    if output_dir is None:
+        output_dir = os.path.join("h2d_bench_runs", "h2d_" + time.strftime("%Y%m%d_%H%M%S"))
+    output_dir = os.path.abspath(output_dir)
+    os.makedirs(output_dir, exist_ok=True)
+
+    runner.launch("init_task", nonblock=False)
+
+    for case_name, payload_bytes, streams, loop_count, nonblock in points:
+        local_len = payload_to_local_len(payload_bytes, P, dtype_bytes=2)
+        if local_len > max_local_len:
+            raise ValueError(
+                f"{case_name}: payload {fmt_size(payload_bytes)} requires local_len={local_len}, "
+                f"but selected symbols {selected_names} only support local_len <= {max_local_len} "
+                f"({fmt_size(max_payload_bytes)} max payload)."
+            )
+
+        total_elements = P * P * local_len
+        data_u32 = cast_tensor_u32(np.zeros(total_elements, dtype=np.float16))
+        symbol_ids = [item["id"] for item in selected]
+        h2d_count = streams * loop_count
+        total_bytes = payload_bytes * h2d_count
+
+        if args.h2d_warmup:
+            runner.launch("h2d_bench_tic", nonblock=False)
+            issue_h2d_copies(runner, symbol_ids, data_u32, P, local_len, args.h2d_warmup, False, io_dtype, memcpy_order)
+            runner.launch("h2d_bench_toc", nonblock=False)
+
+        for sample in range(args.h2d_samples):
+            runner.launch("h2d_bench_tic", nonblock=False)
+
+            host_issue_start_ns = perf_counter_ns()
+            issue_h2d_copies(runner, symbol_ids, data_u32, P, local_len, h2d_count, nonblock, io_dtype, memcpy_order)
+            host_issue_end_ns = perf_counter_ns()
+
+            host_wall_start_ns = host_issue_start_ns
+            runner.launch("h2d_bench_toc", nonblock=False)
+            host_wall_end_ns = perf_counter_ns()
+
+            timer_words_u32 = read_timer_words(runner, symbol_timer_buf, P)
+            cycles = np.zeros((P, P), dtype=np.float64)
+            for pe_y in range(P):
+                for pe_x in range(P):
+                    cycles[pe_y, pe_x] = calculate_cycles_from_words(timer_words_u32[pe_y, pe_x, :])
+
+            device_tsc_us = float(cycles.max() / args.h2d_tsc_mhz)
+            host_issue_us = float((host_issue_end_ns - host_issue_start_ns) / 1000.0)
+            host_wall_us = float((host_wall_end_ns - host_wall_start_ns) / 1000.0)
+
+            row = {
+                "case": case_name,
+                "sample": sample,
+                "P": P,
+                "symbols": ",".join(selected_names),
+                "payload_bytes": payload_bytes,
+                "local_len": local_len,
+                "streams": streams,
+                "loop_count": loop_count,
+                "h2d_count": h2d_count,
+                "nonblock": nonblock,
+                "total_bytes": total_bytes,
+                "host_issue_us": host_issue_us,
+                "host_wall_us": host_wall_us,
+                "device_tsc_us": device_tsc_us,
+                "effective_bandwidth_GBps": total_bytes / host_wall_us / 1000.0 if host_wall_us else 0.0,
+                "device_bandwidth_GBps": total_bytes / device_tsc_us / 1000.0 if device_tsc_us else 0.0,
+            }
+            rows.append(row)
+            print(
+                f"H2D bench {case_name} sample={sample} payload={fmt_size(payload_bytes)} "
+                f"streams={streams} loops={loop_count} nonblock={nonblock} "
+                f"host_wall={host_wall_us:.3f}us device={device_tsc_us:.3f}us",
+                flush=True,
+            )
+
+    metadata = {
+        "config": os.path.abspath(args.config),
+        "simulator": args.simulator,
+        "preset": args.h2d_preset,
+        "symbols": selected_names,
+        "max_payload_bytes": max_payload_bytes,
+        "tsc_mhz": args.h2d_tsc_mhz,
+    }
+    write_json(os.path.join(output_dir, "h2d_bench_manifest.json"), metadata)
+    write_json(os.path.join(output_dir, "h2d_bench_results.json"), {"metadata": metadata, "rows": rows})
+    write_csv(os.path.join(output_dir, "h2d_bench_results.csv"), rows)
+    print(f"Host: H2D benchmark results: {output_dir}", flush=True)
 
 
 PHASE_NAMES = [
@@ -189,6 +443,23 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Decode WSE-3 launcher")
     parser.add_argument("--config", default="config.json", type=str, help="Config file")
     parser.add_argument("--simulator", action="store_true", help="Runs on appliance simulator")
+    parser.add_argument("--h2d-bench", action="store_true", help="Run WaferLLM-integrated H2D copy benchmark instead of decode")
+    parser.add_argument(
+        "--h2d-preset",
+        choices=["smoke", "payload-sweep", "chunk-size", "multi-stream", "all"],
+        default="smoke",
+    )
+    parser.add_argument("--h2d-symbols", default="XKCache", help="Comma-separated existing WaferLLM symbols to copy into")
+    parser.add_argument("--h2d-payload-bytes", default=None, help="Comma-separated payload sizes, e.g. 4KiB,64KiB,1MiB")
+    parser.add_argument("--h2d-loop-counts", default="1,4,16,64", help="Comma-separated loop counts")
+    parser.add_argument("--h2d-same-total-bytes", default="8MiB", help="Total bytes for chunk-size preset")
+    parser.add_argument("--h2d-stream-payload-bytes", default="8MiB", help="Per-stream payload for multi-stream preset")
+    parser.add_argument("--h2d-streams", default="1,2,4,8,16", help="Comma-separated stream counts")
+    parser.add_argument("--h2d-nonblock", choices=["false", "true", "both"], default="both")
+    parser.add_argument("--h2d-samples", type=int, default=3)
+    parser.add_argument("--h2d-warmup", type=int, default=1)
+    parser.add_argument("--h2d-tsc-mhz", type=float, default=850.0)
+    parser.add_argument("--h2d-output-dir", default=None, type=str)
     parser.add_argument(
         "--artifact-dir",
         default=None,
@@ -241,6 +512,34 @@ def main():
 
     io_dtype = MemcpyDataType.MEMCPY_16BIT
     memcpy_order = MemcpyOrder.ROW_MAJOR
+    _dim_p_pe = dim_p_pe
+    if (dim_p_pe % 2) == 1:
+        _dim_p_pe = dim_p_pe - 1
+
+    with open(f"{out_path}/artifact_{P}_{P // pe_num_p_group}.json", "r", encoding="utf8") as f:
+        data = json.load(f)
+        artifact_path = data["artifact_id"]
+
+    if args.h2d_bench:
+        with SdkRuntime(artifact_path, simulator=args.simulator, disable_version_check=True) as runner:
+            h2d_symbol_map = {
+                "X": {"id": runner.get_id("X"), "local_len": bsz * dim_p_pe},
+                "W": {"id": runner.get_id("W"), "local_len": dim_p_pe},
+                "Q_weight": {"id": runner.get_id("Q_weight"), "local_len": dim_p_pe * dim_p_pe},
+                "K_weight": {"id": runner.get_id("K_weight"), "local_len": dim_p_pe * dim_p_pe},
+                "V_weight": {"id": runner.get_id("V_weight"), "local_len": dim_p_pe * dim_p_pe},
+                "freqs_sin": {"id": runner.get_id("freqs_sin"), "local_len": _dim_p_pe // 2},
+                "freqs_cos": {"id": runner.get_id("freqs_cos"), "local_len": _dim_p_pe // 2},
+                "XKCache": {"id": runner.get_id("XKCache"), "local_len": dim_p_pe * seq_len_p_pe},
+                "XVCache": {"id": runner.get_id("XVCache"), "local_len": seq_len_p_pe * dim_p_pe},
+                "O_weight": {"id": runner.get_id("O_weight"), "local_len": dim_p_pe * dim_p_pe},
+                "UP_weight": {"id": runner.get_id("UP_weight"), "local_len": dim_p_pe * ffn_dim_p_pe},
+                "GATE_weight": {"id": runner.get_id("GATE_weight"), "local_len": dim_p_pe * ffn_dim_p_pe},
+                "DOWN_weight": {"id": runner.get_id("DOWN_weight"), "local_len": ffn_dim_p_pe * dim_p_pe},
+            }
+            symbol_timer_buf = runner.get_id("timer_buf")
+            run_h2d_bench(runner, h2d_symbol_map, symbol_timer_buf, args, P, io_dtype, memcpy_order)
+        return
 
     X = np.random.rand(1, bsz * dim).astype(np.float16)
     tensor_X = np.tile(X.reshape(P, bsz * dim_p_pe), reps=(1, P))
@@ -251,10 +550,6 @@ def main():
     tensor_q_weight = np.random.rand(dim, dim).astype(np.float16)
     tensor_k_weight = np.random.rand(dim, dim).astype(np.float16)
     tensor_v_weight = np.random.rand(dim, dim).astype(np.float16)
-
-    _dim_p_pe = dim_p_pe
-    if (dim_p_pe % 2) == 1:
-        _dim_p_pe = dim_p_pe - 1
 
     freqs_sin = np.random.rand(1, P * _dim_p_pe // 2).astype(np.float16)
     tensor_freqs_sin = np.tile(freqs_sin.reshape(P, _dim_p_pe // 2), reps=(1, P))
@@ -268,10 +563,6 @@ def main():
     tensor_up_weight = np.random.rand(dim, ffn_dim).astype(np.float16)
     tensor_gate_weight = np.random.rand(dim, ffn_dim).astype(np.float16)
     tensor_down_weight = np.random.rand(ffn_dim, dim).astype(np.float16)
-
-    with open(f"{out_path}/artifact_{P}_{P // pe_num_p_group}.json", "r", encoding="utf8") as f:
-        data = json.load(f)
-        artifact_path = data["artifact_id"]
 
     with SdkRuntime(artifact_path, simulator=args.simulator, disable_version_check=True) as runner:
         sym_X = runner.get_id("X")

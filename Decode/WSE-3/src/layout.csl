@@ -107,6 +107,8 @@ layout {
 
     @export_name("init_task", fn()void);
     @export_name("decode_host", fn(i16, i16)void);
+    @export_name("h2d_bench_tic", fn()void);
+    @export_name("h2d_bench_toc", fn()void);
 
     @export_name("timer_buf", [*]f32, true);
     @export_name("time_ref", [*]f32, true);

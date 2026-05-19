@@ -1129,6 +1129,19 @@ fn decode_entry() void {
 }
 
 
+fn h2d_bench_tic() void {
+    timestamp.enable_tsc();
+    timestamp.get_timestamp(&tsc_start_buf);
+    sys_mod.unblock_cmd_stream();
+}
+
+fn h2d_bench_toc() void {
+    timestamp.get_timestamp(&tsc_end_buf);
+    f_memcpy_timestamps();
+    sys_mod.unblock_cmd_stream();
+}
+
+
 // -------------------------------------------------------------------------- //
 // ------------------------------- Timer Funcs ------------------------------ //
 // -------------------------------------------------------------------------- //
@@ -1187,6 +1200,8 @@ comptime {
 comptime {
     @export_symbol(init_task, "init_task");
     @export_symbol(decode_host, "decode_host");
+    @export_symbol(h2d_bench_tic, "h2d_bench_tic");
+    @export_symbol(h2d_bench_toc, "h2d_bench_toc");
 }
 
 comptime {
