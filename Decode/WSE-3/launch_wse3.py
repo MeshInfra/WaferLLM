@@ -3,17 +3,56 @@ import os
 import argparse
 import csv
 import time
+from contextlib import contextmanager
 from time import perf_counter_ns
 import numpy as np
 
-from cerebras.appliance.pb.sdk.sdk_common_pb2 import MemcpyDataType, MemcpyOrder
-from cerebras.sdk.client import SdkRuntime, sdk_utils
+try:
+    from cerebras.appliance.pb.sdk.sdk_common_pb2 import MemcpyDataType, MemcpyOrder
+    from cerebras.sdk.client import SdkRuntime, sdk_utils
+    RUNTIME_BACKEND = "client"
+except ModuleNotFoundError:
+    from cerebras.sdk.runtime.sdkruntimepybind import SdkRuntime
+    from cerebras.sdk.runtime.sdkruntimepybind import MemcpyDataType, MemcpyOrder
+    sdk_utils = None
+    RUNTIME_BACKEND = "sdkruntimepybind"
 
 out_path = "compile_out"
 
 
 def cast_tensor_u32(tensor):
     return np.uint32(tensor.view(np.uint16))
+
+
+def memcpy_view_f16(data_u32):
+    if sdk_utils is not None:
+        return sdk_utils.memcpy_view(data_u32, np.dtype(np.float16))
+    return data_u32.view(np.uint16).view(np.float16)
+
+
+@contextmanager
+def open_runtime(artifact_path, args):
+    if RUNTIME_BACKEND == "client":
+        with SdkRuntime(artifact_path, simulator=args.simulator, disable_version_check=True) as runner:
+            yield runner
+        return
+
+    if not args.simulator and not args.cmaddr:
+        raise ValueError("sdkruntimepybind real WSE runs require --cmaddr <IP:port>")
+
+    runtime_kwargs = {}
+    if args.cmaddr:
+        runtime_kwargs["cmaddr"] = args.cmaddr
+    else:
+        runtime_kwargs.update({"simfab_numthreads": args.simfab_numthreads, "msg_level": args.msg_level})
+
+    runner = SdkRuntime(artifact_path, **runtime_kwargs)
+    runner.load()
+    runner.run()
+    try:
+        yield runner
+    finally:
+        runner.stop()
 
 
 def calculate_cycles_from_words(words_u32):
@@ -88,7 +127,7 @@ def payload_to_local_len(payload_bytes, P, dtype_bytes=2):
     return local_len
 
 
-def make_h2d_bench_points(args):
+def make_h2d_bench_points(args, symbols_per_round=1):
     nonblocks = parse_bool_list(args.h2d_nonblock)
     points = []
     payloads = (
@@ -131,6 +170,18 @@ def make_h2d_bench_points(args):
         for streams in parse_int_list(args.h2d_streams):
             for nonblock in nonblocks:
                 points.append((f"streams_{streams}", payload, streams, 1, nonblock))
+    elif args.h2d_preset == "cache-blocks":
+        payload = parse_size(args.h2d_cache_symbol_payload_bytes)
+        per_round_bytes = payload * symbols_per_round
+        for total_bytes in parse_size_list(args.h2d_cache_block_bytes):
+            if total_bytes % per_round_bytes != 0:
+                raise ValueError(
+                    f"cache block {fmt_size(total_bytes)} is not divisible by one H2D round "
+                    f"({fmt_size(payload)} * {symbols_per_round} symbols = {fmt_size(per_round_bytes)})"
+                )
+            loop_count = total_bytes // per_round_bytes
+            for nonblock in nonblocks:
+                points.append((f"cache_block_{fmt_size(total_bytes)}", payload, 1, loop_count, nonblock))
     return points
 
 
@@ -141,6 +192,47 @@ def write_csv(path, rows):
         writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
         writer.writeheader()
         writer.writerows(rows)
+
+
+def summarize_h2d_rows(rows):
+    group_fields = [
+        "case",
+        "P",
+        "symbols",
+        "payload_bytes",
+        "local_len",
+        "streams",
+        "loop_count",
+        "h2d_rounds",
+        "h2d_count",
+        "nonblock",
+        "total_bytes",
+    ]
+    metric_fields = [
+        "host_issue_us",
+        "host_wall_us",
+        "device_tsc_us",
+        "effective_bandwidth_GBps",
+        "device_bandwidth_GBps",
+    ]
+    grouped = {}
+    for row in rows:
+        key = tuple(row[field] for field in group_fields)
+        grouped.setdefault(key, []).append(row)
+
+    summary = []
+    for key, group in grouped.items():
+        item = {field: value for field, value in zip(group_fields, key)}
+        item["samples"] = len(group)
+        for metric in metric_fields:
+            values = np.array([float(row[metric]) for row in group], dtype=np.float64)
+            item[f"{metric}_median"] = float(np.median(values))
+            item[f"{metric}_min"] = float(values.min())
+            item[f"{metric}_max"] = float(values.max())
+        summary.append(item)
+
+    summary.sort(key=lambda row: (int(row["total_bytes"]), str(row["case"]), str(row["nonblock"])))
+    return summary
 
 
 def read_timer_words(runner, symbol_timer_buf, P):
@@ -188,7 +280,7 @@ def run_h2d_bench(runner, symbol_map, symbol_timer_buf, args, P, io_dtype, memcp
     selected = [symbol_map[name] for name in selected_names]
     max_local_len = min(item["local_len"] for item in selected)
     max_payload_bytes = P * P * max_local_len * 2
-    points = make_h2d_bench_points(args)
+    points = make_h2d_bench_points(args, symbols_per_round=len(selected_names))
     rows = []
 
     output_dir = args.h2d_output_dir
@@ -271,14 +363,18 @@ def run_h2d_bench(runner, symbol_map, symbol_timer_buf, args, P, io_dtype, memcp
     metadata = {
         "config": os.path.abspath(args.config),
         "simulator": args.simulator,
+        "runtime_backend": RUNTIME_BACKEND,
         "preset": args.h2d_preset,
         "symbols": selected_names,
         "max_payload_bytes": max_payload_bytes,
         "tsc_mhz": args.h2d_tsc_mhz,
     }
+    summary_rows = summarize_h2d_rows(rows)
     write_json(os.path.join(output_dir, "h2d_bench_manifest.json"), metadata)
     write_json(os.path.join(output_dir, "h2d_bench_results.json"), {"metadata": metadata, "rows": rows})
+    write_json(os.path.join(output_dir, "h2d_bench_summary.json"), {"metadata": metadata, "rows": summary_rows})
     write_csv(os.path.join(output_dir, "h2d_bench_results.csv"), rows)
+    write_csv(os.path.join(output_dir, "h2d_bench_summary.csv"), summary_rows)
     print(f"Host: H2D benchmark results: {output_dir}", flush=True)
 
 
@@ -421,73 +517,6 @@ def aggregate_phase_groups(phase_means, total_cycles_mean):
     return bars, category_totals, measured_total, other_cycles
 
 
-def build_comm_hop_summary(
-    comm_subphase_summary,
-    P,
-    group_num,
-    bsz,
-    dim_p_pe,
-    seq_len_p_pe,
-    freq_ghz,
-):
-    pe_num_p_group = P // group_num
-    root_1st_phase = pe_num_p_group // 2
-    root_2nd_phase = ((group_num // 2) * pe_num_p_group) + root_1st_phase
-    last_group_root = ((group_num - 1) * pe_num_p_group) + root_1st_phase
-
-    reduce_hops = max(root_1st_phase, pe_num_p_group - 1 - root_1st_phase)
-    reduce_hops += max(root_2nd_phase - root_1st_phase, last_group_root - root_2nd_phase)
-    broadcast_hops = max(root_2nd_phase, P - 1 - root_2nd_phase)
-
-    payload_elements = {
-        "score": bsz * seq_len_p_pe,
-        "softmax": bsz,
-        "output": bsz * dim_p_pe,
-    }
-    rows = []
-
-    for name, cycles in comm_subphase_summary.items():
-        phase, subphase = name.rsplit("_", 1)
-        if phase not in payload_elements:
-            continue
-        collectives = 2 if phase == "softmax" else 1
-        hops_per_collective = reduce_hops if subphase == "reduce" else broadcast_hops
-        effective_hops = hops_per_collective * collectives
-        cycles_per_hop = cycles / effective_hops if effective_hops else None
-        ns_per_hop = cycles_per_hop / freq_ghz if cycles_per_hop is not None else None
-        bytes_per_collective = payload_elements.get(phase, 0) * 2
-
-        rows.append(
-            {
-                "name": name,
-                "phase": phase,
-                "subphase": subphase,
-                "cycles": float(cycles),
-                "collectives": collectives,
-                "critical_hops_per_collective": hops_per_collective,
-                "effective_critical_hops": effective_hops,
-                "cycles_per_hop": float(cycles_per_hop) if cycles_per_hop is not None else None,
-                "ns_per_hop": float(ns_per_hop) if ns_per_hop is not None else None,
-                "payload_bytes_per_pe_per_collective": bytes_per_collective,
-                "logical_payload_bytes_per_pe": bytes_per_collective * collectives,
-            }
-        )
-
-    metadata = {
-        "method": "effective per-hop estimate from existing WaferLLM collective profiling",
-        "freq_ghz": freq_ghz,
-        "P": P,
-        "group_num": group_num,
-        "pe_num_p_group": pe_num_p_group,
-        "root_1st_phase": root_1st_phase,
-        "root_2nd_phase": root_2nd_phase,
-        "reduce_critical_hops_per_collective": reduce_hops,
-        "broadcast_critical_hops_per_collective": broadcast_hops,
-        "note": "This is not isolated physical link latency; it is collective cycles divided by estimated critical-path hops.",
-    }
-    return metadata, rows
-
-
 class Config:
     def __init__(self):
         self.P = 8
@@ -506,10 +535,14 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Decode WSE-3 launcher")
     parser.add_argument("--config", default="config.json", type=str, help="Config file")
     parser.add_argument("--simulator", action="store_true", help="Runs on appliance simulator")
+    parser.add_argument("--cmaddr", default=None, help="CS system address for sdkruntimepybind real WSE runs")
+    parser.add_argument("--artifact-path", default=None, help="Use an existing artifact instead of compile_out/artifact_*.json")
+    parser.add_argument("--simfab-numthreads", type=int, default=64)
+    parser.add_argument("--msg-level", default="INFO")
     parser.add_argument("--h2d-bench", action="store_true", help="Run WaferLLM-integrated H2D copy benchmark instead of decode")
     parser.add_argument(
         "--h2d-preset",
-        choices=["smoke", "payload-sweep", "chunk-size", "multi-stream"],
+        choices=["smoke", "payload-sweep", "chunk-size", "multi-stream", "cache-blocks"],
         default="smoke",
     )
     parser.add_argument("--h2d-symbols", default="XKCache", help="Comma-separated existing WaferLLM symbols to copy into")
@@ -518,6 +551,8 @@ def parse_args():
     parser.add_argument("--h2d-same-total-bytes", default="8MiB", help="Total bytes for chunk-size preset")
     parser.add_argument("--h2d-stream-payload-bytes", default="8MiB", help="Per-stream payload for multi-stream preset")
     parser.add_argument("--h2d-streams", default="1,2,4,8,16", help="Comma-separated stream counts")
+    parser.add_argument("--h2d-cache-symbol-payload-bytes", default="4MiB", help="Per-symbol payload for cache-blocks preset")
+    parser.add_argument("--h2d-cache-block-bytes", default="8MiB,64MiB,144MiB,288MiB", help="Total H2D bytes for cache-blocks preset")
     parser.add_argument("--h2d-nonblock", choices=["false", "true", "both"], default="both")
     parser.add_argument("--h2d-samples", type=int, default=3)
     parser.add_argument("--h2d-warmup", type=int, default=1)
@@ -579,12 +614,15 @@ def main():
     if (dim_p_pe % 2) == 1:
         _dim_p_pe = dim_p_pe - 1
 
-    with open(f"{out_path}/artifact_{P}_{P // pe_num_p_group}.json", "r", encoding="utf8") as f:
-        data = json.load(f)
-        artifact_path = data["artifact_id"]
+    if args.artifact_path:
+        artifact_path = args.artifact_path
+    else:
+        with open(f"{out_path}/artifact_{P}_{P // pe_num_p_group}.json", "r", encoding="utf8") as f:
+            data = json.load(f)
+            artifact_path = data["artifact_id"]
 
     if args.h2d_bench:
-        with SdkRuntime(artifact_path, simulator=args.simulator, disable_version_check=True) as runner:
+        with open_runtime(artifact_path, args) as runner:
             h2d_symbol_map = {
                 "XKCache": {"id": runner.get_id("XKCache"), "local_len": dim_p_pe * seq_len_p_pe},
                 "XVCache": {"id": runner.get_id("XVCache"), "local_len": seq_len_p_pe * dim_p_pe},
@@ -616,7 +654,7 @@ def main():
     tensor_gate_weight = np.random.rand(dim, ffn_dim).astype(np.float16)
     tensor_down_weight = np.random.rand(ffn_dim, dim).astype(np.float16)
 
-    with SdkRuntime(artifact_path, simulator=args.simulator, disable_version_check=True) as runner:
+    with open_runtime(artifact_path, args) as runner:
         sym_X = runner.get_id("X")
         sym_W = runner.get_id("W")
         sym_Q_weight = runner.get_id("Q_weight")
@@ -755,7 +793,7 @@ def main():
             debug_1d_u32, sym_debug, 0, 0, P, P, bsz * dim_p_pe,
             streaming=False, data_type=io_dtype, order=memcpy_order, nonblock=False
         )
-        debug = sdk_utils.memcpy_view(debug_1d_u32, np.dtype(np.float16))
+        debug = memcpy_view_f16(debug_1d_u32)
         debug = debug.reshape(P, bsz * dim)
 
         timer_buf_1d_u32 = np.zeros((P * P * 3), dtype=np.uint32)
@@ -893,15 +931,6 @@ def main():
     )
 
     freq_ghz = 1.1
-    comm_hop_metadata, comm_hop_rows = build_comm_hop_summary(
-        comm_subphase_summary,
-        P,
-        group_num,
-        bsz,
-        dim_p_pe,
-        seq_len_p_pe,
-        freq_ghz,
-    )
     model_cycles_mean = cycles_count_mean * layer_num
     throughput_p_request = 1 / (model_cycles_mean / (freq_ghz * 1e9))
 
@@ -927,9 +956,6 @@ def main():
     print("Host: mean communication subphase cycles:")
     for name in COMM_SUBPHASE_NAMES:
         print(f"  - {name}: {comm_subphase_summary[name]:.3f}")
-    print("Host: estimated attention communication ns per critical hop:")
-    for row in comm_hop_rows:
-        print(f"  - {row['name']}: {row['ns_per_hop']:.3f}")
     print(f"Host: measured phase sum: {measured_phase_cycles:.3f}")
     print(f"Host: residual other cycles: {other_cycles:.3f}")
 
@@ -981,11 +1007,6 @@ def main():
         write_json(os.path.join(artifact_dir, "phase_summary.json"), phase_summary)
         write_json(os.path.join(artifact_dir, "phase_property_summary.json"), phase_property_summary)
         write_json(os.path.join(artifact_dir, "comm_subphase_summary.json"), comm_subphase_summary)
-        write_json(
-            os.path.join(artifact_dir, "comm_hop_summary.json"),
-            {"metadata": comm_hop_metadata, "rows": comm_hop_rows},
-        )
-        write_csv(os.path.join(artifact_dir, "comm_hop_summary.csv"), comm_hop_rows)
         write_json(os.path.join(artifact_dir, "category_summary.json"), category_totals)
         write_json(os.path.join(artifact_dir, "phase_group_summary.json"), phase_bars)
         np.save(os.path.join(artifact_dir, "cycles_count.npy"), cycles_per_step)
