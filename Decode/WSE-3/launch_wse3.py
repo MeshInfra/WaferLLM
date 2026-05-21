@@ -131,12 +131,6 @@ def make_h2d_bench_points(args):
         for streams in parse_int_list(args.h2d_streams):
             for nonblock in nonblocks:
                 points.append((f"streams_{streams}", payload, streams, 1, nonblock))
-    elif args.h2d_preset == "all":
-        original = args.h2d_preset
-        for preset in ["payload-sweep", "chunk-size", "multi-stream"]:
-            args.h2d_preset = preset
-            points.extend(make_h2d_bench_points(args))
-        args.h2d_preset = original
     return points
 
 
@@ -167,22 +161,22 @@ def read_timer_words(runner, symbol_timer_buf, P):
     return timer_buf_1d_u32.reshape((P, P, 3))
 
 
-def issue_h2d_copies(runner, symbol_ids, data_u32, P, local_len, count, nonblock, io_dtype, memcpy_order):
-    for idx in range(count):
-        symbol_id = symbol_ids[idx % len(symbol_ids)]
-        runner.memcpy_h2d(
-            symbol_id,
-            data_u32,
-            0,
-            0,
-            P,
-            P,
-            local_len,
-            streaming=False,
-            data_type=io_dtype,
-            order=memcpy_order,
-            nonblock=nonblock,
-        )
+def issue_h2d_copies(runner, symbol_ids, data_u32, P, local_len, rounds, nonblock, io_dtype, memcpy_order):
+    for _ in range(rounds):
+        for symbol_id in symbol_ids:
+            runner.memcpy_h2d(
+                symbol_id,
+                data_u32,
+                0,
+                0,
+                P,
+                P,
+                local_len,
+                streaming=False,
+                data_type=io_dtype,
+                order=memcpy_order,
+                nonblock=nonblock,
+            )
 
 
 def run_h2d_bench(runner, symbol_map, symbol_timer_buf, args, P, io_dtype, memcpy_order):
@@ -217,7 +211,8 @@ def run_h2d_bench(runner, symbol_map, symbol_timer_buf, args, P, io_dtype, memcp
         total_elements = P * P * local_len
         data_u32 = cast_tensor_u32(np.zeros(total_elements, dtype=np.float16))
         symbol_ids = [item["id"] for item in selected]
-        h2d_count = streams * loop_count
+        h2d_rounds = streams * loop_count
+        h2d_count = h2d_rounds * len(symbol_ids)
         total_bytes = payload_bytes * h2d_count
 
         if args.h2d_warmup:
@@ -229,7 +224,7 @@ def run_h2d_bench(runner, symbol_map, symbol_timer_buf, args, P, io_dtype, memcp
             runner.launch("h2d_bench_tic", nonblock=False)
 
             host_issue_start_ns = perf_counter_ns()
-            issue_h2d_copies(runner, symbol_ids, data_u32, P, local_len, h2d_count, nonblock, io_dtype, memcpy_order)
+            issue_h2d_copies(runner, symbol_ids, data_u32, P, local_len, h2d_rounds, nonblock, io_dtype, memcpy_order)
             host_issue_end_ns = perf_counter_ns()
 
             host_wall_start_ns = host_issue_start_ns
@@ -255,6 +250,7 @@ def run_h2d_bench(runner, symbol_map, symbol_timer_buf, args, P, io_dtype, memcp
                 "local_len": local_len,
                 "streams": streams,
                 "loop_count": loop_count,
+                "h2d_rounds": h2d_rounds,
                 "h2d_count": h2d_count,
                 "nonblock": nonblock,
                 "total_bytes": total_bytes,
@@ -267,7 +263,7 @@ def run_h2d_bench(runner, symbol_map, symbol_timer_buf, args, P, io_dtype, memcp
             rows.append(row)
             print(
                 f"H2D bench {case_name} sample={sample} payload={fmt_size(payload_bytes)} "
-                f"streams={streams} loops={loop_count} nonblock={nonblock} "
+                f"streams={streams} loops={loop_count} copies={h2d_count} nonblock={nonblock} "
                 f"host_wall={host_wall_us:.3f}us device={device_tsc_us:.3f}us",
                 flush=True,
             )
@@ -425,6 +421,73 @@ def aggregate_phase_groups(phase_means, total_cycles_mean):
     return bars, category_totals, measured_total, other_cycles
 
 
+def build_comm_hop_summary(
+    comm_subphase_summary,
+    P,
+    group_num,
+    bsz,
+    dim_p_pe,
+    seq_len_p_pe,
+    freq_ghz,
+):
+    pe_num_p_group = P // group_num
+    root_1st_phase = pe_num_p_group // 2
+    root_2nd_phase = ((group_num // 2) * pe_num_p_group) + root_1st_phase
+    last_group_root = ((group_num - 1) * pe_num_p_group) + root_1st_phase
+
+    reduce_hops = max(root_1st_phase, pe_num_p_group - 1 - root_1st_phase)
+    reduce_hops += max(root_2nd_phase - root_1st_phase, last_group_root - root_2nd_phase)
+    broadcast_hops = max(root_2nd_phase, P - 1 - root_2nd_phase)
+
+    payload_elements = {
+        "score": bsz * seq_len_p_pe,
+        "softmax": bsz,
+        "output": bsz * dim_p_pe,
+    }
+    rows = []
+
+    for name, cycles in comm_subphase_summary.items():
+        phase, subphase = name.rsplit("_", 1)
+        if phase not in payload_elements:
+            continue
+        collectives = 2 if phase == "softmax" else 1
+        hops_per_collective = reduce_hops if subphase == "reduce" else broadcast_hops
+        effective_hops = hops_per_collective * collectives
+        cycles_per_hop = cycles / effective_hops if effective_hops else None
+        ns_per_hop = cycles_per_hop / freq_ghz if cycles_per_hop is not None else None
+        bytes_per_collective = payload_elements.get(phase, 0) * 2
+
+        rows.append(
+            {
+                "name": name,
+                "phase": phase,
+                "subphase": subphase,
+                "cycles": float(cycles),
+                "collectives": collectives,
+                "critical_hops_per_collective": hops_per_collective,
+                "effective_critical_hops": effective_hops,
+                "cycles_per_hop": float(cycles_per_hop) if cycles_per_hop is not None else None,
+                "ns_per_hop": float(ns_per_hop) if ns_per_hop is not None else None,
+                "payload_bytes_per_pe_per_collective": bytes_per_collective,
+                "logical_payload_bytes_per_pe": bytes_per_collective * collectives,
+            }
+        )
+
+    metadata = {
+        "method": "effective per-hop estimate from existing WaferLLM collective profiling",
+        "freq_ghz": freq_ghz,
+        "P": P,
+        "group_num": group_num,
+        "pe_num_p_group": pe_num_p_group,
+        "root_1st_phase": root_1st_phase,
+        "root_2nd_phase": root_2nd_phase,
+        "reduce_critical_hops_per_collective": reduce_hops,
+        "broadcast_critical_hops_per_collective": broadcast_hops,
+        "note": "This is not isolated physical link latency; it is collective cycles divided by estimated critical-path hops.",
+    }
+    return metadata, rows
+
+
 class Config:
     def __init__(self):
         self.P = 8
@@ -446,7 +509,7 @@ def parse_args():
     parser.add_argument("--h2d-bench", action="store_true", help="Run WaferLLM-integrated H2D copy benchmark instead of decode")
     parser.add_argument(
         "--h2d-preset",
-        choices=["smoke", "payload-sweep", "chunk-size", "multi-stream", "all"],
+        choices=["smoke", "payload-sweep", "chunk-size", "multi-stream"],
         default="smoke",
     )
     parser.add_argument("--h2d-symbols", default="XKCache", help="Comma-separated existing WaferLLM symbols to copy into")
@@ -523,19 +586,8 @@ def main():
     if args.h2d_bench:
         with SdkRuntime(artifact_path, simulator=args.simulator, disable_version_check=True) as runner:
             h2d_symbol_map = {
-                "X": {"id": runner.get_id("X"), "local_len": bsz * dim_p_pe},
-                "W": {"id": runner.get_id("W"), "local_len": dim_p_pe},
-                "Q_weight": {"id": runner.get_id("Q_weight"), "local_len": dim_p_pe * dim_p_pe},
-                "K_weight": {"id": runner.get_id("K_weight"), "local_len": dim_p_pe * dim_p_pe},
-                "V_weight": {"id": runner.get_id("V_weight"), "local_len": dim_p_pe * dim_p_pe},
-                "freqs_sin": {"id": runner.get_id("freqs_sin"), "local_len": _dim_p_pe // 2},
-                "freqs_cos": {"id": runner.get_id("freqs_cos"), "local_len": _dim_p_pe // 2},
                 "XKCache": {"id": runner.get_id("XKCache"), "local_len": dim_p_pe * seq_len_p_pe},
                 "XVCache": {"id": runner.get_id("XVCache"), "local_len": seq_len_p_pe * dim_p_pe},
-                "O_weight": {"id": runner.get_id("O_weight"), "local_len": dim_p_pe * dim_p_pe},
-                "UP_weight": {"id": runner.get_id("UP_weight"), "local_len": dim_p_pe * ffn_dim_p_pe},
-                "GATE_weight": {"id": runner.get_id("GATE_weight"), "local_len": dim_p_pe * ffn_dim_p_pe},
-                "DOWN_weight": {"id": runner.get_id("DOWN_weight"), "local_len": ffn_dim_p_pe * dim_p_pe},
             }
             symbol_timer_buf = runner.get_id("timer_buf")
             run_h2d_bench(runner, h2d_symbol_map, symbol_timer_buf, args, P, io_dtype, memcpy_order)
@@ -841,6 +893,15 @@ def main():
     )
 
     freq_ghz = 1.1
+    comm_hop_metadata, comm_hop_rows = build_comm_hop_summary(
+        comm_subphase_summary,
+        P,
+        group_num,
+        bsz,
+        dim_p_pe,
+        seq_len_p_pe,
+        freq_ghz,
+    )
     model_cycles_mean = cycles_count_mean * layer_num
     throughput_p_request = 1 / (model_cycles_mean / (freq_ghz * 1e9))
 
@@ -866,6 +927,9 @@ def main():
     print("Host: mean communication subphase cycles:")
     for name in COMM_SUBPHASE_NAMES:
         print(f"  - {name}: {comm_subphase_summary[name]:.3f}")
+    print("Host: estimated attention communication ns per critical hop:")
+    for row in comm_hop_rows:
+        print(f"  - {row['name']}: {row['ns_per_hop']:.3f}")
     print(f"Host: measured phase sum: {measured_phase_cycles:.3f}")
     print(f"Host: residual other cycles: {other_cycles:.3f}")
 
@@ -917,6 +981,11 @@ def main():
         write_json(os.path.join(artifact_dir, "phase_summary.json"), phase_summary)
         write_json(os.path.join(artifact_dir, "phase_property_summary.json"), phase_property_summary)
         write_json(os.path.join(artifact_dir, "comm_subphase_summary.json"), comm_subphase_summary)
+        write_json(
+            os.path.join(artifact_dir, "comm_hop_summary.json"),
+            {"metadata": comm_hop_metadata, "rows": comm_hop_rows},
+        )
+        write_csv(os.path.join(artifact_dir, "comm_hop_summary.csv"), comm_hop_rows)
         write_json(os.path.join(artifact_dir, "category_summary.json"), category_totals)
         write_json(os.path.join(artifact_dir, "phase_group_summary.json"), phase_bars)
         np.save(os.path.join(artifact_dir, "cycles_count.npy"), cycles_per_step)

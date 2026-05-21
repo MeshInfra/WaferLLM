@@ -335,6 +335,46 @@ on-wafer:
   output partial reduction
 ```
 
+## 本次最小实验
+
+这次先只统计两张表，不改 attention kernel：
+
+```text
+1. H2D load:
+   host/off-chip -> XKCache/XVCache
+
+2. on-wafer hop:
+   decode attention 里已有 collective profiling / estimated critical-path hops
+```
+
+第二项不是 isolated physical-link latency，而是：
+
+```text
+effective ns per hop =
+  measured collective cycles / estimated critical-path hops / freq_ghz
+```
+
+对 attention 只看：
+
+```text
+score_reduce / score_broadcast
+softmax_reduce / softmax_broadcast
+output_reduce / output_broadcast
+```
+
+输出文件：
+
+```text
+H2D:
+  h2d_bench_results.csv
+  h2d_bench_results.json
+
+On-wafer:
+  comm_subphase_summary.json
+  comm_hop_summary.csv
+  comm_hop_summary.json
+```
+
 ## 性能模型
 
 单个 tile：
@@ -461,6 +501,26 @@ multi-stream H2D pressure：
 
 ```bash
 --h2d-symbols XKCache,XVCache
+```
+
+每个 H2D round 会拷贝所有 selected symbols。因此 `XKCache,XVCache` 的 measured traffic 是 K+V 两个 symbol 的总量。
+
+on-wafer hop 统计复用正常 decode profiling：
+
+```bash
+./run_wse3.sh model_config/offchip_h2d_p32_fit.json false \
+  --artifact-dir h2d_bench_runs/comm_p32_fit
+```
+
+`comm_hop_summary.csv` 只保留 attention 相关行：
+
+```text
+score_reduce
+score_broadcast
+softmax_reduce
+softmax_broadcast
+output_reduce
+output_broadcast
 ```
 
 ### 输出
