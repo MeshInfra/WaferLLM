@@ -56,8 +56,63 @@ const broadcast_send_queue_id = @get_output_queue(7);
 const ctrl = @import_module("<control>");
 const tile_config = @import_module("<tile_config>");
 const color_config = tile_config.color_config;
+const timestamp = @import_module("<time>");
 
 const dummy = @zeros([1]f16);
+const two32_f32: f32 = 4294967296.0;
+
+const comm_phase_count: i16 = 9;
+const comm_subphase_count: i16 = comm_phase_count * 2;
+
+var comm_subphase_cycles_f32 = @zeros([comm_subphase_count]f32);
+var ptr_comm_subphase_cycles: [*]f32 = &comm_subphase_cycles_f32;
+
+var comm_tsc_start_buf = @zeros([timestamp.tsc_size_words]u16);
+var comm_tsc_end_buf = @zeros([timestamp.tsc_size_words]u16);
+
+fn reset_comm_subphase_cycles() void {
+    for (@range(i16, comm_subphase_count)) |i| {
+        comm_subphase_cycles_f32[i] = 0.0;
+    }
+}
+
+fn comm_reduce_idx(comm_phase_id: i16) i16 {
+    return comm_phase_id * 2;
+}
+
+fn comm_broadcast_idx(comm_phase_id: i16) i16 {
+    return comm_phase_id * 2 + 1;
+}
+
+fn comm_subphase_start(profile_enabled: i16) void {
+    if (profile_enabled != 0) {
+        timestamp.get_timestamp(&comm_tsc_start_buf);
+    }
+}
+
+fn comm_subphase_stop(comm_subphase_id: i16, profile_enabled: i16) void {
+    if (profile_enabled != 0) {
+        var start_lo: u32 = 0;
+        var end_lo: u32 = 0;
+        var delta_lo_f32: f32 = 0.0;
+        var delta_hi_f32: f32 = 0.0;
+
+        timestamp.get_timestamp(&comm_tsc_end_buf);
+
+        start_lo = (@as(u32, comm_tsc_start_buf[1]) << @as(u16, 16)) | @as(u32, comm_tsc_start_buf[0]);
+        end_lo = (@as(u32, comm_tsc_end_buf[1]) << @as(u16, 16)) | @as(u32, comm_tsc_end_buf[0]);
+        delta_hi_f32 = @as(f32, comm_tsc_end_buf[2] - comm_tsc_start_buf[2]);
+
+        if (end_lo >= start_lo) {
+            delta_lo_f32 = @as(f32, end_lo - start_lo);
+        } else {
+            delta_lo_f32 = two32_f32 - @as(f32, start_lo) + @as(f32, end_lo);
+            delta_hi_f32 -= 1.0;
+        }
+
+        comm_subphase_cycles_f32[comm_subphase_id] += delta_hi_f32 * two32_f32 + delta_lo_f32;
+    }
+}
 
 // *************************** RMSNorm bsz ***************************//
 
@@ -538,10 +593,11 @@ fn init() void {
     color_config.reset_routes(broadcast_color, Y_BD);
 }
 
-fn all_reduce_bsz(pe_id: i16, quotient_pe_id: i16, remainder_pe_id: i16, vector_buf_ptr: [*]f16) void {
+fn all_reduce_bsz(pe_id: i16, quotient_pe_id: i16, remainder_pe_id: i16, vector_buf_ptr: [*]f16, comm_phase_id: i16, profile_enabled: i16) void {
     vector_buf_dsd_bsz = @set_dsd_base_addr(vector_buf_dsd_bsz, vector_buf_ptr);
     @load_to_dsr(vector_buf_dsr, vector_buf_dsd_bsz);
 
+    comm_subphase_start(profile_enabled);
     // 1st phase reduce
     if (remainder_pe_id == root_1st_phase) {
         if (root_1st_phase < pe_num_p_group - 1) {
@@ -612,19 +668,23 @@ fn all_reduce_bsz(pe_id: i16, quotient_pe_id: i16, remainder_pe_id: i16, vector_
             }
         }
     }
+    comm_subphase_stop(comm_reduce_idx(comm_phase_id), profile_enabled);
 
+    comm_subphase_start(profile_enabled);
     // Broadcast
     if (pe_id == root_2nd_phase) {
         @mov16(bdcast_send_bsz, vector_buf_dsr);
     } else {
         @mov16(vector_buf_dsd_bsz, bdcast_recv_bsz);
     }
+    comm_subphase_stop(comm_broadcast_idx(comm_phase_id), profile_enabled);
 }
 
-fn all_reduceMax_bsz(pe_id: i16, quotient_pe_id: i16, remainder_pe_id: i16, vector_buf_ptr: [*]f16) void {
+fn all_reduceMax_bsz(pe_id: i16, quotient_pe_id: i16, remainder_pe_id: i16, vector_buf_ptr: [*]f16, comm_phase_id: i16, profile_enabled: i16) void {
     vector_buf_dsd_bsz = @set_dsd_base_addr(vector_buf_dsd_bsz, vector_buf_ptr);
     @load_to_dsr(vector_buf_dsr, vector_buf_dsd_bsz);
 
+    comm_subphase_start(profile_enabled);
     // 1st phase reduce
     if (remainder_pe_id == root_1st_phase) {
         if (root_1st_phase < pe_num_p_group - 1) {
@@ -695,19 +755,23 @@ fn all_reduceMax_bsz(pe_id: i16, quotient_pe_id: i16, remainder_pe_id: i16, vect
             }
         }
     }
+    comm_subphase_stop(comm_reduce_idx(comm_phase_id), profile_enabled);
 
+    comm_subphase_start(profile_enabled);
     // Broadcast
     if (pe_id == root_2nd_phase) {
         @mov16(bdcast_send_bsz, vector_buf_dsr);
     } else {
         @mov16(vector_buf_dsd_bsz, bdcast_recv_bsz);
     }
+    comm_subphase_stop(comm_broadcast_idx(comm_phase_id), profile_enabled);
 }
 
-fn all_reduce_bsz_dim(pe_id: i16, quotient_pe_id: i16, remainder_pe_id: i16, vector_buf_ptr: [*]f16) void {
+fn all_reduce_bsz_dim(pe_id: i16, quotient_pe_id: i16, remainder_pe_id: i16, vector_buf_ptr: [*]f16, comm_phase_id: i16, profile_enabled: i16) void {
     vector_buf_dsd_bsz_dim = @set_dsd_base_addr(vector_buf_dsd_bsz_dim, vector_buf_ptr);
     @load_to_dsr(vector_buf_dsr, vector_buf_dsd_bsz_dim);
 
+    comm_subphase_start(profile_enabled);
     // 1st phase reduce
     if (remainder_pe_id == root_1st_phase) {
         if (root_1st_phase < pe_num_p_group - 1) {
@@ -778,19 +842,23 @@ fn all_reduce_bsz_dim(pe_id: i16, quotient_pe_id: i16, remainder_pe_id: i16, vec
             }
         }
     }
+    comm_subphase_stop(comm_reduce_idx(comm_phase_id), profile_enabled);
 
+    comm_subphase_start(profile_enabled);
     // Broadcast
     if (pe_id == root_2nd_phase) {
         @mov16(bdcast_send_bsz_dim, vector_buf_dsr);
     } else {
         @mov16(vector_buf_dsd_bsz_dim, bdcast_recv_bsz_dim);
     }
+    comm_subphase_stop(comm_broadcast_idx(comm_phase_id), profile_enabled);
 }
 
-fn all_reduce_bsz_dim_QKV_fusion(pe_id: i16, quotient_pe_id: i16, remainder_pe_id: i16, vector_buf_ptr: [*]f16) void {
+fn all_reduce_bsz_dim_QKV_fusion(pe_id: i16, quotient_pe_id: i16, remainder_pe_id: i16, vector_buf_ptr: [*]f16, comm_phase_id: i16, profile_enabled: i16) void {
     vector_buf_dsd_bsz_dim_QKV_fusion = @set_dsd_base_addr(vector_buf_dsd_bsz_dim_QKV_fusion, vector_buf_ptr);
     @load_to_dsr(vector_buf_dsr, vector_buf_dsd_bsz_dim_QKV_fusion);
 
+    comm_subphase_start(profile_enabled);
     // 1st phase reduce
     if (remainder_pe_id == root_1st_phase) {
         if (root_1st_phase < pe_num_p_group - 1) {
@@ -861,19 +929,23 @@ fn all_reduce_bsz_dim_QKV_fusion(pe_id: i16, quotient_pe_id: i16, remainder_pe_i
             }
         }
     }
+    comm_subphase_stop(comm_reduce_idx(comm_phase_id), profile_enabled);
 
+    comm_subphase_start(profile_enabled);
     // Broadcast
     if (pe_id == root_2nd_phase) {
         @mov16(bdcast_send_bsz_dim_QKV_fusion, vector_buf_dsr);
     } else {
         @mov16(vector_buf_dsd_bsz_dim_QKV_fusion, bdcast_recv_bsz_dim_QKV_fusion);
     }
+    comm_subphase_stop(comm_broadcast_idx(comm_phase_id), profile_enabled);
 }
 
-fn all_reduce_bsz_seq_len(pe_id: i16, quotient_pe_id: i16, remainder_pe_id: i16, vector_buf_ptr: [*]f16) void {
+fn all_reduce_bsz_seq_len(pe_id: i16, quotient_pe_id: i16, remainder_pe_id: i16, vector_buf_ptr: [*]f16, comm_phase_id: i16, profile_enabled: i16) void {
     vector_buf_dsd_bsz_seq_len = @set_dsd_base_addr(vector_buf_dsd_bsz_seq_len, vector_buf_ptr);
     @load_to_dsr(vector_buf_dsr, vector_buf_dsd_bsz_seq_len);
 
+    comm_subphase_start(profile_enabled);
     // 1st phase reduce
     if (remainder_pe_id == root_1st_phase) {
         if (root_1st_phase < pe_num_p_group - 1) {
@@ -944,19 +1016,23 @@ fn all_reduce_bsz_seq_len(pe_id: i16, quotient_pe_id: i16, remainder_pe_id: i16,
             }
         }
     }
+    comm_subphase_stop(comm_reduce_idx(comm_phase_id), profile_enabled);
 
+    comm_subphase_start(profile_enabled);
     // Broadcast
     if (pe_id == root_2nd_phase) {
         @mov16(bdcast_send_bsz_seq_len, vector_buf_dsr);
     } else {
         @mov16(vector_buf_dsd_bsz_seq_len, bdcast_recv_bsz_seq_len);
     }
+    comm_subphase_stop(comm_broadcast_idx(comm_phase_id), profile_enabled);
 }
 
-fn all_reduce_bsz_ffn_dim_ZZ_fusion(pe_id: i16, quotient_pe_id: i16, remainder_pe_id: i16, vector_buf_ptr: [*]f16) void {
+fn all_reduce_bsz_ffn_dim_ZZ_fusion(pe_id: i16, quotient_pe_id: i16, remainder_pe_id: i16, vector_buf_ptr: [*]f16, comm_phase_id: i16, profile_enabled: i16) void {
     vector_buf_dsd_bsz_ffn_dim_ZZ_fusion = @set_dsd_base_addr(vector_buf_dsd_bsz_ffn_dim_ZZ_fusion, vector_buf_ptr);
     @load_to_dsr(vector_buf_dsr, vector_buf_dsd_bsz_ffn_dim_ZZ_fusion);
 
+    comm_subphase_start(profile_enabled);
     // 1st phase reduce
     if (remainder_pe_id == root_1st_phase) {
         if (root_1st_phase < pe_num_p_group - 1) {
@@ -1027,13 +1103,16 @@ fn all_reduce_bsz_ffn_dim_ZZ_fusion(pe_id: i16, quotient_pe_id: i16, remainder_p
             }
         }
     }
+    comm_subphase_stop(comm_reduce_idx(comm_phase_id), profile_enabled);
 
+    comm_subphase_start(profile_enabled);
     // Broadcast
     if (pe_id == root_2nd_phase) {
         @mov16(bdcast_send_bsz_ffn_dim_ZZ_fusion, vector_buf_dsr);
     } else {
         @mov16(vector_buf_dsd_bsz_ffn_dim_ZZ_fusion, bdcast_recv_bsz_ffn_dim_ZZ_fusion);
     }
+    comm_subphase_stop(comm_broadcast_idx(comm_phase_id), profile_enabled);
 }
 
 fn reconfig_allreduce_axis(axis: i16) void {

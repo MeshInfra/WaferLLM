@@ -17,5 +17,13 @@ wio_flows*/
 **/log/*
 !*/log/.gitkeep
 
+**/__pycache__/
+**/*.pyc
+
 **/compile_out/*
 !**/compile_out/.gitkeep
+
+**/profiling_runs/*
+**/h2d_bench_runs/*
+
+.codex
