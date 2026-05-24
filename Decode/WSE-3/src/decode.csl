@@ -1,24 +1,41 @@
-param memcpy_params: comptime_struct;
-param comm_params: comptime_struct;
+param memcpy_params;
 
 // -------------------------------------------------------------------------- //
 // ---------------------------- Model Parameters ---------------------------- //
 // -------------------------------------------------------------------------- //
 
-param P: i16;
+param Pw: i16;
+param Ph: i16;
 param bsz: i16;
-param dim_p_pe: i16;
-param pes_p_head: i16;
-param pes_p_kv_head: i16;
-param head_dim_p_pe: i16;
+param h_dim_p_pe: i16;
+param v_dim_p_pe: i16;
 param seq_len_p_pe: i16;
 param ffn_dim_p_pe: i16;
 
-const _dim_p_pe: i16 = (dim_p_pe / 2) * 2;
+const _dim_p_pe: i16 = (h_dim_p_pe / 2) * 2;
 
-param pe_num_p_group: i16;
-param root_1st_phase: i16;
-param root_2nd_phase: i16;
+param pes_p_head: i16;
+param pes_p_kv_head: i16;   // not used now
+param head_dim: i16;
+
+param pe_num_p_h_group: i16;
+param pe_num_p_v_group: i16;
+param pe_num_p_group_in_head: i16;
+
+param pe_num_p_last_h_group: i16;
+param pe_num_p_last_v_group: i16;
+param pe_num_p_last_group_in_head: i16;
+
+param C_1st_RD_0: color;
+param C_1st_RD_1: color;
+param C_2nd_RD_0: color;
+param C_2nd_RD_1: color;
+param C_BD: color;
+
+param is_first_row: bool;
+param is_first_col: bool;
+param is_last_row: bool;
+param is_last_col: bool;
 
 const trace = @import_module(
   "<debug>",
@@ -28,11 +45,27 @@ const trace = @import_module(
 );
 const simprint = @import_module("<simprint>");
 
+const h_group_num: i16 = Pw / pe_num_p_h_group;
+const v_group_num: i16 = Ph / pe_num_p_v_group;
+const group_num_in_head: i16 = pes_p_head / pe_num_p_group_in_head;
+
+const h_remainder: i16 = Pw - h_group_num * pe_num_p_h_group;
+const v_remainder: i16 = Ph - v_group_num * pe_num_p_v_group;
+const head_remainder: i16 = pes_p_head - group_num_in_head * pe_num_p_group_in_head;
+
+const _root_px_1st_phase = pe_num_p_h_group / 2;
+const _root_px_2nd_phase = (h_group_num / 2) * pe_num_p_h_group + _root_px_1st_phase;
+const _root_py_1st_phase = pe_num_p_v_group / 2;
+const _root_py_2nd_phase = (v_group_num / 2) * pe_num_p_v_group + _root_py_1st_phase;
+
+const _root_px_in_head_1st_phase: i16 = pe_num_p_group_in_head / 2;
+const _root_px_in_head_2nd_phase: i16 = (group_num_in_head / 2) * pe_num_p_group_in_head + _root_px_in_head_1st_phase;
+
 // -------------------------------------------------------------------------- //
 // -------------------------------- Task IDs -------------------------------- //
 // -------------------------------------------------------------------------- //
 
-
+const decode_entry_task_id: local_task_id = @get_local_task_id(17);
 
 // -------------------------------------------------------------------------- //
 // ------------------------------ PE Variables ------------------------------ //
@@ -46,10 +79,17 @@ var remainder_x: i16 = 0;
 var quotient_y: i16 = 0;
 var remainder_y: i16 = 0;
 
-var head_dim: f16 = @as(f16,P * head_dim_p_pe);
+var head_idx: i16 = 0;
+var px_in_head: i16 = 0;
+var quotient_x_in_head: i16 = 0;
+var remainder_x_in_head: i16 = 0;
+
+const _head_dim: f16 = @as(f16, head_dim);
+const dim: f16 = @as(f16, (Pw / pes_p_head) * head_dim);
 
 const eps: f16 = 0.000001;
 var alpha: f16 = 0.0;
+var inv_dim: f16 = 0.0;
 
 // -------------------------------------------------------------------------- //
 // --------------------------- WSE3 Modules Parameters ---------------------- //
@@ -59,50 +99,121 @@ const sys_mod = @import_module("<memcpy/memcpy>", memcpy_params);
 const math = @import_module("<math>");
 const layout_mod = @import_module("<layout>");
 
-const comm_mod = @import_module("comm_lib/comm_pe.csl", @concat_structs(comm_params, .{ 
-    .P = P, .bsz = bsz, .dim_p_pe = dim_p_pe,
-    .seq_len_p_pe = seq_len_p_pe,
-    .ffn_dim_p_pe = ffn_dim_p_pe,
-    
-    .pe_num_p_group = pe_num_p_group,
-    .root_1st_phase = root_1st_phase, .root_2nd_phase = root_2nd_phase,
-}));
+// const comm_mod = @import_module("comm_lib/comm_pe.csl", @concat_structs(comm_params, .{ 
+const comm_mod = @import_module("comm_lib/comm_pe.csl", .{ 
+    .Pw = Pw, .Ph = Ph, 
+
+    // for multi-head attention
+    .pes_p_head = pes_p_head,
+
+    .pe_num_p_first_h_group = pe_num_p_h_group,
+    .pe_num_p_first_v_group = pe_num_p_v_group,
+    .pe_num_p_first_group_in_head = pe_num_p_group_in_head,
+    .pe_num_p_last_h_group = pe_num_p_last_h_group,
+    .pe_num_p_last_v_group = pe_num_p_last_v_group,
+    .pe_num_p_last_group_in_head = pe_num_p_last_group_in_head,
+
+    .reduce_1st_color_0 = C_1st_RD_0,
+    .reduce_1st_color_1 = C_1st_RD_1,
+    .reduce_2nd_color_0 = C_2nd_RD_0,
+    .reduce_2nd_color_1 = C_2nd_RD_1,
+    .broadcast_color = C_BD,
+// }));
+});
+
+const sync = @import_module("sync.csl", .{
+    .width = Pw,
+    .height = Ph,
+    .color_1 = @get_color(2),
+    .actvt = decode_entry_task_id,
+    .iq_1 = @get_input_queue(2), .oq_1 = @get_output_queue(2),
+    .is_first_row = is_first_row,
+    .is_first_col = is_first_col,
+    .is_last_row = is_last_row,
+    .is_last_col = is_last_col,
+});
+
 // -------------------------------------------------------------------------- //
 // ------------------------------ Timer Module ------------------------------ //
 // -------------------------------------------------------------------------- //
 
 const timestamp = @import_module("<time>");
-const layout_module = @import_module("<layout>");
 
 var tsc_end_buf = @zeros([timestamp.tsc_size_words]u16);
 var tsc_start_buf = @zeros([timestamp.tsc_size_words]u16);
 
-var timer_buf = @zeros([3]f32);
-var ptr_timer_buf: [*]f32 = &timer_buf;
+// var timer_buf = @zeros([3]f32);
+// var ptr_timer_buf: [*]f32 = &timer_buf;
 
-var tsc_ref_buf = @zeros([timestamp.tsc_size_words]u16);
-var time_ref_f32 = @zeros([2]f32);
-var ptr_time_ref: [*]f32 = &time_ref_f32;
+// var tsc_ref_buf = @zeros([timestamp.tsc_size_words]u16);
+// var time_ref_f32 = @zeros([2]f32);
+// var ptr_time_ref: [*]f32 = &time_ref_f32;
+
+var time_buf_u16 = @zeros([timestamp.tsc_size_words*2]u16);  // 6要素 (start 3 + end 3)
+var ptr_time_buf_u16: [*]u16 = &time_buf_u16;
 
 // -------------------------------------------------------------------------- //
 // --------------------------------- Utils ---------------------------------- //
 // -------------------------------------------------------------------------- //
 
 fn init_task() void {
-    timestamp.enable_tsc();
+    // timestamp.enable_tsc();
 
     px = @as(i16, layout_mod.get_x_coord());
     py = @as(i16, layout_mod.get_y_coord());
 
-    quotient_x = @as(i16, math.floor_f16(@as(f16, px) / @as(f16, pe_num_p_group)));
-    remainder_x = px - quotient_x * pe_num_p_group;
+    // general attention block
+    quotient_x = @as(i16, math.floor_f16(@as(f16, px) / @as(f16, pe_num_p_h_group)));   // group idx
+    remainder_x = px - quotient_x * pe_num_p_h_group;   // local idx (in a group)
 
-    quotient_y = @as(i16, math.floor_f16(@as(f16, py) / @as(f16, pe_num_p_group)));
-    remainder_y = py - quotient_y * pe_num_p_group;
+    quotient_y = @as(i16, math.floor_f16(@as(f16, py) / @as(f16, pe_num_p_v_group)));
+    remainder_y = py - quotient_y * pe_num_p_v_group;
 
-    comm_mod.init();
+    // multi-head attention
+    head_idx = @as(i16, math.floor_f16(@as(f16, px) / @as(f16, pes_p_head)));     // head idx
+    px_in_head = px - head_idx * pes_p_head;     // local idx (in a head)
+    quotient_x_in_head = @as(i16, math.floor_f16(@as(f16, px_in_head) / @as(f16, pe_num_p_group_in_head))); // group idx in a head
+    remainder_x_in_head = px_in_head - quotient_x_in_head * pe_num_p_group_in_head; // local idx (in a group in a head)
 
-    alpha = 1.0 / @as(f16, math.sqrt(head_dim));
+    // effective values for comm_pe.csl (per-PE, may differ from global for fractional groups)
+    const eff_pe_num_p_h_group: i16 = if (quotient_x == h_group_num) h_remainder else pe_num_p_h_group;
+    const root_px_1st_phase: i16 = if (quotient_x == h_group_num) h_remainder / 2 else _root_px_1st_phase;
+    const eff_gnum_x: i16 = h_group_num + (if (h_remainder > 0) @as(i16, 1) else @as(i16, 0));
+    const center_gx: i16 = eff_gnum_x / 2;
+    const center_root_1st_x: i16 = if (center_gx == h_group_num) h_remainder / 2 else _root_px_1st_phase;
+    const root_px_2nd_phase: i16 = center_gx * pe_num_p_h_group + center_root_1st_x;
+
+    const eff_pe_num_p_group_in_head: i16 = if (quotient_x_in_head == group_num_in_head) head_remainder else pe_num_p_group_in_head;
+    const root_px_in_head_1st_phase = if (quotient_x_in_head == group_num_in_head) head_remainder / 2 else _root_px_in_head_1st_phase;
+    const eff_gnum_xh: i16 = group_num_in_head + (if (head_remainder > 0) @as(i16, 1) else @as(i16, 0));
+    const center_gxh: i16 = eff_gnum_xh / 2;
+    const center_root_1st_xh: i16 = if (center_gxh == group_num_in_head) head_remainder / 2 else _root_px_in_head_1st_phase;
+    const root_px_in_head_2nd_phase: i16 = center_gxh * pe_num_p_group_in_head + center_root_1st_xh;
+
+    const eff_pe_num_p_v_group: i16 = if (quotient_y == v_group_num) v_remainder else pe_num_p_v_group;
+    const root_py_1st_phase: i16 = if (quotient_y == v_group_num) v_remainder / 2 else _root_py_1st_phase;
+    const eff_gnum_y: i16 = v_group_num + (if (v_remainder > 0) @as(i16, 1) else @as(i16, 0));
+    const center_gy: i16 = eff_gnum_y / 2;
+    const center_root_1st_y: i16 = if (center_gy == v_group_num) v_remainder / 2 else _root_py_1st_phase;
+    const root_py_2nd_phase: i16 = center_gy * pe_num_p_v_group + center_root_1st_y;
+
+    comm_mod.init(
+        px, quotient_x, remainder_x, 
+        py, quotient_y, remainder_y, 
+        px_in_head, quotient_x_in_head, remainder_x_in_head,
+        eff_pe_num_p_h_group, 
+        eff_pe_num_p_v_group,
+        root_px_1st_phase,
+        root_px_2nd_phase,
+        root_py_1st_phase,
+        root_py_2nd_phase,
+        eff_pe_num_p_group_in_head,
+        root_px_in_head_1st_phase,
+        root_px_in_head_2nd_phase,
+    );
+
+    alpha = 1.0 / @as(f16, math.sqrt(_head_dim));
+    inv_dim = 1.0 / dim;
 
     sys_mod.unblock_cmd_stream();
 }
@@ -123,10 +234,6 @@ const dest_dsr_4 = @get_dsr(dsr_dest, 4);
 const src0_dsr_4 = @get_dsr(dsr_src0, 4);
 const src1_dsr_4 = @get_dsr(dsr_src1, 4);
 
-const dest_dsr_5 = @get_dsr(dsr_dest, 5);
-const src0_dsr_5 = @get_dsr(dsr_src0, 5);
-const src1_dsr_5 = @get_dsr(dsr_src1, 5);
-
 fn gemv_static_step(cur: f16) void {
     @fmach(dest_dsr_1, src0_dsr_1, src1_dsr_1, cur);
 }
@@ -141,7 +248,7 @@ fn fsubh_func(cur: f16) void {
 
 var cur_: f16 = 0.0;
 fn fmulh_norm_func(cur: f16) void {
-    cur_ = cur / head_dim;
+    cur_ = cur * inv_dim;
     cur_ = 1.0 / math.sqrt(cur_ + eps);
     @fmulh(dest_dsr_1, src0_dsr_1, cur_);
 }
@@ -171,15 +278,19 @@ var right_matrix_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &dummy, .extent = 
 var ptr_out_vector: [*]f16 = &dummy;
 var out_vector_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &dummy, .extent = 1 });
 
-var dim_p_pe_dsd_1 = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{dim_p_pe} -> dummy[i] });
-var dim_p_pe_dsd_2 = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{dim_p_pe} -> dummy[i] });
+// var h_dim_p_pe_dsd_1 = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{h_dim_p_pe} -> dummy[i] });   // not used
+// var h_dim_p_pe_dsd_2 = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{h_dim_p_pe} -> dummy[i] });
+var v_dim_p_pe_dsd_1 = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{v_dim_p_pe} -> dummy[i] });
+var v_dim_p_pe_dsd_2 = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{v_dim_p_pe} -> dummy[i] });
 var seq_len_p_pe_dsd_1 = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{seq_len_p_pe} -> dummy[i] });
 var seq_len_p_pe_dsd_2 = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{seq_len_p_pe} -> dummy[i] });
 var ffn_dim_p_pe_dsd_1 = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{ffn_dim_p_pe} -> dummy[i] });
 var ffn_dim_p_pe_dsd_2 = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{ffn_dim_p_pe} -> dummy[i] });
 
-var Kt: i16 = 0;
-var Nt: i16 = 0;
+var size1_chunk_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &dummy, .extent = 1 });
+
+var Kt: i16 = 0;    // in_dimension
+var Nt: i16 = 0;    // out_dimension
 
 fn vecmat_computation() void {
     left_vector_dsd = @set_dsd_length(left_vector_dsd, @bitcast(u16, Kt));
@@ -202,31 +313,222 @@ fn vecmat_computation() void {
 }
 
 // -------------------------------------------------------------------------- //
+// ------------------------- Inline Assembly Functions ---------------------- //
+// -------------------------------------------------------------------------- //
+
+inline fn fh2xp16_to_down(dsr_dest_num: u16, dsr_src0_num: u16) void {
+    asm volatile ("fh2xp16.down [dds%[dsr_dest_num]] = [s0ds%[dsr_src0_num]]"
+                :: [dsr_dest_num] "n" (dsr_dest_num), [dsr_src0_num] "n" (dsr_src0_num), :"memory");
+}
+
+inline fn fminh(dsr_dest_num: u16, dsr_src0_num: u16, dsr_src1_num: u16) void {
+    asm volatile ("fminh.nf [dds%[dsr_dest_num]] = [s0ds%[dsr_src0_num]] [s1ds%[dsr_src1_num]]"
+                :: [dsr_dest_num] "n" (dsr_dest_num), [dsr_src0_num] "n" (dsr_src0_num), [dsr_src1_num] "n" (dsr_src1_num));
+}
+
+inline fn fscaleh(dsr_dest_num: u16, dsr_src0_num: u16, dsr_src1_num: u16) void {
+    asm volatile ("fscaleh [dds%[dsr_dest_num]] = [s0ds%[dsr_src0_num]] [s1ds%[dsr_src1_num]]"
+                :: [dsr_dest_num] "n" (dsr_dest_num), [dsr_src0_num] "n" (dsr_src0_num), [dsr_src1_num] "n" (dsr_src1_num));
+}
+
+inline fn fnormh(dsr_dest_num: u16, dsr_src0_num: u16) void {
+   asm volatile ("fnormh [dds%[dsr_dest_num]] = [s0ds%[dsr_src0_num]]"
+               :: [dsr_dest_num] "n" (dsr_dest_num), [dsr_src0_num] "n" (dsr_src0_num));
+}
+
+inline fn fcpxsh(dsr_dest_num: u16, dsr_src0_num: u16, dsr_src1_num: u16) void {
+    asm volatile ("fcpxsh.nf [dds%[dsr_dest_num]] = [s0ds%[dsr_src0_num]] [s1ds%[dsr_src1_num]]"
+                :: [dsr_dest_num] "n" (dsr_dest_num), [dsr_src0_num] "n" (dsr_src0_num), [dsr_src1_num] "n" (dsr_src1_num));
+}
+
+inline fn fdivsh(dsr_dest_num: u16, dsr_src0_num: u16, dsr_src1_num: u16) void {
+    asm volatile ("fdivsh.nf [dds%[dsr_dest_num]] = [s0ds%[dsr_src0_num]] [s1ds%[dsr_src1_num]]"
+                :: [dsr_dest_num] "n" (dsr_dest_num), [dsr_src0_num] "n" (dsr_src0_num), [dsr_src1_num] "n" (dsr_src1_num));
+}
+
+// -------------------------------------------------------------------------- //
+// ------------------------- Transcendal Math Function ---------------------- //
+// -------------------------------------------------------------------------- //
+
+// Temporary variables for computation
+const buf_size: u16 = if (seq_len_p_pe > ffn_dim_p_pe) bsz * seq_len_p_pe else bsz * ffn_dim_p_pe;
+var i: [buf_size]i16;      // integer exponent (i)
+var f: [buf_size]f16;
+var t: [buf_size]f16;
+var base_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &t, .extent = buf_size });
+
+// constants for vectorized exp/reciprocal implementations
+const threshold_p =  [1]f16 { 18.6355 };
+const threshold_n =  [1]f16 { -18.6355 };
+const constant_mask = [1]u32 { 0x66661166 };  // NaN:-inf,+inf:+0,-inf:-0,+0:-inf,-0:-inf,p:-inf,n:-inf
+const constant_t =  [1]f16 { 2.001953125 };
+const constant_m =  [1]u16 { 0x7794 };
+const constant_one =  [1]f16 { 1.0 };
+var constant_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &threshold_p, .extent = buf_size, .stride = 0 });
+
+fn vectorized_exp_f16(size: u16, vector_in_ptr: [*]f16, vector_out_ptr: [*]f16) void {
+    // set length, reset .save_address flag
+    base_dsd = @set_dsd_length(base_dsd, size);
+    constant_dsd = @set_dsd_length(constant_dsd, size);
+    @load_to_dsr(dest_dsr_1, base_dsd);
+    @load_to_dsr(src0_dsr_1, base_dsd);
+    @load_to_dsr(dest_dsr_2, base_dsd);
+    @load_to_dsr(src0_dsr_2, base_dsd);
+    @load_to_dsr(src1_dsr_2, base_dsd);
+
+    // Step 0: x = fmin(+16.63, x); /* put this first so as to treat NaNs like +INF */
+    //         x = fmax(-16.63, x);
+    @load_to_dsr(src1_dsr_1, constant_dsd);
+    // @set_dsr_base_addr(dest_dsr_1, &t);  // base_dsd already set base_addr to &t
+    @set_dsr_base_addr(src0_dsr_1, vector_in_ptr);
+    fminh(1, 1, 1); // @fminh(dest_dsr_1, src0_dsr_1, src1_dsr_1);
+    @set_dsr_base_addr(src1_dsr_1, &threshold_n);
+    @set_dsr_base_addr(src0_dsr_1, &t);
+    @fmaxh(dest_dsr_1, src0_dsr_1, src1_dsr_1);
+
+    // Step 1: float t = x * 1.442695041f;
+    @fmulh(dest_dsr_1, src0_dsr_1, 1.442695);   // t shares memory with x
+
+    // Step 2: float fi = floorf (t);
+    //         int i = (int)fi;
+    @set_dsr_base_addr(dest_dsr_1, &f);  // fi shares memory with f
+    @load_to_dsr(src1_dsr_1, base_dsd);  // reset stride to 1 (originally 0), length is inherited from constant
+    @set_dsr_base_addr(src1_dsr_1, &f);    
+    @set_dsr_base_addr(dest_dsr_2, &i);
+    @set_dsr_base_addr(src1_dsr_2, &i);
+    fh2xp16_to_down(2, 1);  // @fh2xp16(dest_dsr_2, src0_dsr_1);
+    @xp162fh(dest_dsr_1, src1_dsr_2);
+
+    // Step 3: float f = t - fi;
+    @fsubh(dest_dsr_1, src0_dsr_1, src1_dsr_1);
+
+    // Step 4: float p = f;
+    //         float c = 1.0000063181;
+    @set_dsr_base_addr(src0_dsr_1, &f);
+    @set_dsr_base_addr(dest_dsr_2, vector_out_ptr);
+    @set_dsr_base_addr(dest_dsr_1, &t);  // p shares memory with t
+    @faddh(dest_dsr_1, src0_dsr_1, 0.0);
+    @fmovh(dest_dsr_2, 1.0000063181);
+
+    // Step 5: Polynomial approximation (4th degree Horner method)
+    @set_dsr_base_addr(src1_dsr_1, &t);
+    @set_dsr_base_addr(src0_dsr_2, vector_out_ptr);
+    // c = fmaf(6.9293457270e-01, p, c);
+    @fmach(dest_dsr_2, src0_dsr_2, src1_dsr_1, 6.9293457270e-01);
+    // p *= f; c = fmaf(2.4169936776e-01, p, c);
+    @fmulh(dest_dsr_1, src0_dsr_1, src1_dsr_1);
+    @fmach(dest_dsr_2, src0_dsr_2, src1_dsr_1, 2.4169936776e-01);
+    // p *= f; c = fmaf(5.1688175648e-02, p, c);
+    @fmulh(dest_dsr_1, src0_dsr_1, src1_dsr_1);
+    @fmach(dest_dsr_2, src0_dsr_2, src1_dsr_1, 5.1688175648e-02);
+    // p *= f; c = fmaf(1.3665339909e-02, p, c);
+    @fmulh(dest_dsr_1, src0_dsr_1, src1_dsr_1);
+    @fmach(dest_dsr_2, src0_dsr_2, src1_dsr_1, 1.3665339909e-02);
+    
+    // Step 6: Scale c from the range between 1 and 2
+    //         c = fscale(c, i);
+    fscaleh(2, 2, 2); // @fscaleh(dest_dsr_2, src0_dsr_2, src1_dsr_2);
+}
+
+fn vectorized_reciprocal_f16(size: u16, vector_in_ptr: [*]f16, vector_out_ptr: [*]f16) void {
+  // WARNING: THIS FUNCTION IS DESTRUCTIVE, VECTOR_IN WILL NOT KEEP ITS VALUE
+  // set length, reset .save_address flag
+  base_dsd = @set_dsd_length(base_dsd, size);
+  constant_dsd = @set_dsd_length(constant_dsd, size);
+  @load_to_dsr(dest_dsr_1, base_dsd);
+  @load_to_dsr(src0_dsr_1, base_dsd);
+  @load_to_dsr(dest_dsr_2, base_dsd);
+  @load_to_dsr(src0_dsr_2, base_dsd);
+  @load_to_dsr(src1_dsr_2, base_dsd);
+
+  // Step 0: Division starter for Half precision
+  // if !isfinite(x)
+  //     return Float16(1.0)/x
+  // end # fdivsh e = one,x (division starter function)
+  // (x,e) = frexp(x) # fnormh x = x
+  @load_to_dsr(src1_dsr_1, constant_dsd);
+  @set_dsr_base_addr(dest_dsr_1, &t);
+  @set_dsr_base_addr(src0_dsr_1, vector_in_ptr);
+  @set_dsr_base_addr(src1_dsr_1, &constant_mask);
+  fcpxsh(1, 1, 1);
+  @set_dsr_base_addr(src0_dsr_1, &t);
+  @sar16(dest_dsr_1, src0_dsr_1, 15);
+
+  @load_to_dsr(src1_dsr_1, base_dsd);
+  @load_to_dsr(src0_dsr_3, constant_dsd);
+  @set_dsr_base_addr(dest_dsr_1, &i);   // e uses region of i
+  @set_dsr_base_addr(src0_dsr_3, &constant_one);
+  @set_dsr_base_addr(src1_dsr_1, vector_in_ptr);
+  fdivsh(1, 3, 1); // @fdivsh(dest_dsr_1, src0_dsr_1, src1_dsr_1);
+  @set_dsr_base_addr(dest_dsr_2, vector_in_ptr);
+  @set_dsr_base_addr(src0_dsr_2, vector_in_ptr);
+  fnormh(2, 2);
+
+  // Step 1: Kahan's starting guess, yields rel. err. <0.06
+  @set_dsr_base_addr(dest_dsr_2, vector_out_ptr);
+  @set_dsr_base_addr(src0_dsr_3, &constant_m);
+  @sub16(dest_dsr_2, src0_dsr_3, src1_dsr_1);   // y::Float16 = reinterpret(Float16,M - reinterpret(UInt16,x)) # sub16.nf y = M,x
+
+  // Step 2: First Newton iteration, yields rel. err. <4e-3
+  // d::Float16 = fma(-x,y,t)    # fmsh  d = t,x,y
+  // y *= d                      # fmulh y = y,d
+  @set_dsr_base_addr(dest_dsr_1, &f);   // d uses region of f
+  @set_dsr_base_addr(src1_dsr_1, &f);
+  @set_dsr_base_addr(src1_dsr_2, vector_out_ptr);
+  @set_dsr_base_addr(src0_dsr_1, vector_out_ptr);
+  @set_dsr_base_addr(src0_dsr_3, &constant_t);
+  @fmulh(dest_dsr_1, src0_dsr_2, src1_dsr_2);
+  @fsubh(dest_dsr_1, src0_dsr_3, src1_dsr_1);
+  @fmulh(dest_dsr_2, src0_dsr_1 ,src1_dsr_1);
+
+  // Step 3: Second Newton iteration, yields re. err. ~0.5ulp
+  // d = fma(-x,y,one)           # fmsh d = one,x,y
+  // d *= y                      # fmulh d = d,y
+  // y += d                      # faddh y = y,d
+  @set_dsr_base_addr(src0_dsr_3, &constant_one);
+  @fmulh(dest_dsr_1, src0_dsr_2, src1_dsr_2);
+  @fsubh(dest_dsr_1, src0_dsr_3, src1_dsr_1);
+  @fmulh(dest_dsr_1, src0_dsr_1, src1_dsr_1);
+  @faddh(dest_dsr_2, src0_dsr_1, src1_dsr_1);
+  
+  // Step 4: y = ldexp(y,-e)
+  // fscaleh y = y,e (e has correct sign from fdivsh)
+  // select16 result = y, e (flag set by fdivsh)
+  @set_dsr_base_addr(src1_dsr_2, &i);   // e uses region of i
+  @set_dsr_base_addr(src0_dsr_2, vector_out_ptr);
+  fscaleh(2, 2, 2); // @fscaleh(dest_dsr_2, src0_dsr_2, src1_dsr_2);
+  // select16(2, 2, 2); // UNAVAILABLE because CF is not vectorized 
+  // m = 0xFFFF if (x != inf and x != -inf) else 0x0000
+  @set_dsr_base_addr(src1_dsr_2, &t);
+  @and16(dest_dsr_2, src0_dsr_2, src1_dsr_2);         // y = y & m
+}
+
+// -------------------------------------------------------------------------- //
 // ----------------------------- Model Parameters --------------------------- //
 // -------------------------------------------------------------------------- //
 
 // * X: input
-var X_tile: [bsz * dim_p_pe]f16 = @zeros([bsz * dim_p_pe]f16);
+var X_tile: [bsz * v_dim_p_pe]f16 = @zeros([bsz * v_dim_p_pe]f16);
 var ptr_X: [*]f16 = &X_tile;
-var X_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &X_tile, .extent = bsz * dim_p_pe });
+var X_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &X_tile, .extent = bsz * v_dim_p_pe });
 
 // * W: RMSNorm weights
-var W_tile: [dim_p_pe]f16 = @zeros([dim_p_pe]f16);
+var W_tile: [v_dim_p_pe]f16 = @zeros([v_dim_p_pe]f16);
 var ptr_W: [*]f16 = &W_tile;
-var W_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &W_tile, .extent = dim_p_pe });
+var W_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &W_tile, .extent = v_dim_p_pe });
 
 // * Q_weight, K_weight, V_weight: QKV weights input
-var Q_weight_tile: [dim_p_pe * dim_p_pe]f16 = @zeros([dim_p_pe * dim_p_pe]f16);
+var Q_weight_tile: [v_dim_p_pe * h_dim_p_pe]f16 = @zeros([v_dim_p_pe * h_dim_p_pe]f16);
 var ptr_Q_weight: [*]f16 = &Q_weight_tile;
-var Q_weight_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &Q_weight_tile, .extent = dim_p_pe * dim_p_pe });
+var Q_weight_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &Q_weight_tile, .extent = v_dim_p_pe * h_dim_p_pe });
 
-var K_weight_tile: [dim_p_pe * dim_p_pe]f16 = @zeros([dim_p_pe * dim_p_pe]f16);
+var K_weight_tile: [v_dim_p_pe * h_dim_p_pe]f16 = @zeros([v_dim_p_pe * h_dim_p_pe]f16);
 var ptr_K_weight: [*]f16 = &K_weight_tile;
-var K_weight_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &K_weight_tile, .extent = dim_p_pe * dim_p_pe });
+var K_weight_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &K_weight_tile, .extent = v_dim_p_pe * h_dim_p_pe });
 
-var V_weight_tile: [dim_p_pe * dim_p_pe]f16 = @zeros([dim_p_pe * dim_p_pe]f16);
+var V_weight_tile: [v_dim_p_pe * h_dim_p_pe]f16 = @zeros([v_dim_p_pe * h_dim_p_pe]f16);
 var ptr_V_weight: [*]f16 = &V_weight_tile;
-var V_weight_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &V_weight_tile, .extent = dim_p_pe * dim_p_pe });
+var V_weight_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &V_weight_tile, .extent = v_dim_p_pe * h_dim_p_pe });
 
 var freqs_sin: [_dim_p_pe / 2]f16 = @zeros([_dim_p_pe / 2]f16);
 var ptr_freqs_sin: [*]f16 = &freqs_sin;
@@ -236,37 +538,41 @@ var freqs_cos: [_dim_p_pe / 2]f16 = @zeros([_dim_p_pe / 2]f16);
 var ptr_freqs_cos: [*]f16 = &freqs_cos;
 var freqs_cos_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &freqs_cos, .extent = _dim_p_pe / 2 });
 
-var XKCache_tile: [dim_p_pe * seq_len_p_pe]f16 = @zeros([dim_p_pe * seq_len_p_pe]f16);
+var XKCache_tile: [h_dim_p_pe * seq_len_p_pe]f16 = @zeros([h_dim_p_pe * seq_len_p_pe]f16);
 var ptr_XKCache: [*]f16 = &XKCache_tile;
 // var XKCache_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &XKCache_tile, .extent = seq_len_p_pe });
 
-var XVCache_tile: [seq_len_p_pe * dim_p_pe]f16 = @zeros([seq_len_p_pe * dim_p_pe]f16);
+var score_mask_tile: [seq_len_p_pe]f16 = @zeros([seq_len_p_pe]f16);
+var ptr_score_mask: [*]f16 = &score_mask_tile;
+var score_mask_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &score_mask_tile, .extent = seq_len_p_pe });
+
+var XVCache_tile: [seq_len_p_pe * h_dim_p_pe]f16 = @zeros([seq_len_p_pe * h_dim_p_pe]f16);
 var ptr_XVCache: [*]f16 = &XVCache_tile;
 // var XVCache_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &XVCache_tile, .extent = dim_p_pe });
 
-var O_weight_tile: [dim_p_pe * dim_p_pe]f16 = @zeros([dim_p_pe * dim_p_pe]f16);
+var O_weight_tile: [h_dim_p_pe * v_dim_p_pe]f16 = @zeros([h_dim_p_pe * v_dim_p_pe]f16);
 var ptr_O_weight: [*]f16 = &O_weight_tile;
 // var O_weight_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &O_weight_tile, .extent = dim_p_pe });
 
-var UP_weight_tile: [dim_p_pe * ffn_dim_p_pe]f16 = @zeros([dim_p_pe * ffn_dim_p_pe]f16);
+var UP_weight_tile: [v_dim_p_pe * ffn_dim_p_pe]f16 = @zeros([v_dim_p_pe * ffn_dim_p_pe]f16);
 var ptr_UP_weight: [*]f16 = &UP_weight_tile;
 // var UP_weight_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &UP_weight_tile, .extent = ffn_dim_p_pe });
 
-var GATE_weight_tile: [dim_p_pe * ffn_dim_p_pe]f16 = @zeros([dim_p_pe * ffn_dim_p_pe]f16);
+var GATE_weight_tile: [v_dim_p_pe * ffn_dim_p_pe]f16 = @zeros([v_dim_p_pe * ffn_dim_p_pe]f16);
 var ptr_GATE_weight: [*]f16 = &GATE_weight_tile;
 // var GATE_weight_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &GATE_weight_tile, .extent = ffn_dim_p_pe });
 
-var DOWN_weight_tile: [dim_p_pe * ffn_dim_p_pe]f16 = @zeros([dim_p_pe * ffn_dim_p_pe]f16);
+var DOWN_weight_tile: [ffn_dim_p_pe * v_dim_p_pe]f16 = @zeros([ffn_dim_p_pe * v_dim_p_pe]f16);
 var ptr_DOWN_weight: [*]f16 = &DOWN_weight_tile;
 // var DOWN_weight_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &DOWN_weight_tile, .extent = dim_p_pe });
 
 // ************************ Middle Results ************************ //
 
-var X_tmp: [bsz * dim_p_pe]f16 = @zeros([bsz * dim_p_pe]f16);
+var X_tmp: [bsz * v_dim_p_pe]f16 = @zeros([bsz * v_dim_p_pe]f16);
 var ptr_X_tmp: [*]f16 = &X_tmp;
-var X_tmp_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &X_tmp, .extent = bsz * dim_p_pe });
+var X_tmp_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &X_tmp, .extent = bsz * v_dim_p_pe });
 
-var X_norm_tile: [bsz * dim_p_pe]f16 = @zeros([bsz * dim_p_pe]f16);
+var X_norm_tile: [bsz * v_dim_p_pe]f16 = @zeros([bsz * v_dim_p_pe]f16);
 var ptr_X_norm: [*]f16 = &X_norm_tile;
 // var X_norm_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &X_norm_tile, .extent = bsz * dim_p_pe });
 
@@ -276,6 +582,7 @@ var X_odd_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &dummy, .offset = 1, .ext
 var local_sum: [bsz]f16 = @zeros([bsz]f16);
 var ptr_local_sum: [*]f16 = &local_sum;
 var local_sum_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &local_sum, .extent = bsz });
+var local_sum_element_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &local_sum, .extent = 1 });
 
 var sum: f16 = 0.0;
 var ptr_sum = &sum;
@@ -283,6 +590,7 @@ var ptr_sum = &sum;
 var local_max: [bsz]f16 = @zeros([bsz]f16);
 var ptr_local_max: [*]f16 = &local_max;
 var local_max_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &local_max, .extent = bsz });
+var local_max_element_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &local_max, .extent = 1 });
 
 var max: f16 = 0.0;
 var ptr_max = &max;
@@ -294,14 +602,6 @@ var X_tmp_1_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &X_tmp_1, .extent = _di
 var X_tmp_2: [_dim_p_pe / 2]f16 = @zeros([_dim_p_pe / 2]f16);
 var ptr_X_tmp_2: [*]f16 = &X_tmp_2;
 var X_tmp_2_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &X_tmp_2, .extent = _dim_p_pe / 2 });
-
-var X_tmp_3: [_dim_p_pe / 2]f16 = @zeros([_dim_p_pe / 2]f16);
-var ptr_X_tmp_3: [*]f16 = &X_tmp_3;
-var X_tmp_3_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &X_tmp_3, .extent = _dim_p_pe / 2 });
-
-var X_tmp_4: [_dim_p_pe / 2]f16 = @zeros([_dim_p_pe / 2]f16);
-var ptr_X_tmp_4: [*]f16 = &X_tmp_4;
-var X_tmp_4_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &X_tmp_4, .extent = _dim_p_pe / 2 });
 
 // * XQKV: QKV in decoding
 // * middle result
@@ -317,40 +617,41 @@ var X_tmp_4_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &X_tmp_4, .extent = _di
 // var ptr_V: [*]f16 = &V_tile;
 // var V_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &V_tile, .extent = bsz * dim_p_pe });
 
-var QKV_tile: [bsz*3*dim_p_pe]f16 = @zeros([bsz*3*dim_p_pe]f16);
+var QKV_tile: [bsz*3*h_dim_p_pe]f16 = @zeros([bsz*3*h_dim_p_pe]f16);
 var ptr_QKV_tile: [*]f16 = &QKV_tile;
 
-var Q_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &QKV_tile, .offset = 0, .extent = bsz*dim_p_pe });
-var K_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &QKV_tile, .offset = bsz*dim_p_pe, .extent = bsz*dim_p_pe });
-var V_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &QKV_tile, .offset = 2*bsz*dim_p_pe, .extent = bsz*dim_p_pe });
+var Q_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &QKV_tile, .offset = 0, .extent = bsz*h_dim_p_pe });
+var K_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &QKV_tile, .offset = bsz*h_dim_p_pe, .extent = bsz*h_dim_p_pe });
+var V_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &QKV_tile, .offset = 2*bsz*h_dim_p_pe, .extent = bsz*h_dim_p_pe });
 
 var score: [bsz * seq_len_p_pe]f16 = @zeros([bsz * seq_len_p_pe]f16);
 var ptr_score: [*]f16 = &score;
 var score_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &score, .extent = bsz * seq_len_p_pe });
+var score_batch_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &score, .extent = seq_len_p_pe });
 
 var score_tmp: [bsz * seq_len_p_pe]f16 = @zeros([bsz * seq_len_p_pe]f16);
 var ptr_score_tmp: [*]f16 = &score_tmp;
 var score_tmp_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &score_tmp, .extent = bsz * seq_len_p_pe });
 
-var output_tile: [bsz * dim_p_pe]f16 = @zeros([bsz * dim_p_pe]f16);
+var output_tile: [bsz * h_dim_p_pe]f16 = @zeros([bsz * h_dim_p_pe]f16);
 var ptr_output: [*]f16 = &output_tile;
-var output_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &output_tile, .extent = bsz * dim_p_pe });
+var output_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &output_tile, .extent = bsz * h_dim_p_pe });
 
-var h1_tile: [bsz * dim_p_pe]f16 = @zeros([bsz * dim_p_pe]f16);
+var h1_tile: [bsz * v_dim_p_pe]f16 = @zeros([bsz * v_dim_p_pe]f16);
 var ptr_h1: [*]f16 = &h1_tile;
-var h1_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &h1_tile, .extent = bsz * dim_p_pe });
+var h1_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &h1_tile, .extent = bsz * v_dim_p_pe });
 
-var h2_tile: [bsz * dim_p_pe]f16 = @zeros([bsz * dim_p_pe]f16);
+var h2_tile: [bsz * v_dim_p_pe]f16 = @zeros([bsz * v_dim_p_pe]f16);
 var ptr_h2: [*]f16 = &h2_tile;
-var h2_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &h2_tile, .extent = bsz * dim_p_pe });
+var h2_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &h2_tile, .extent = bsz * v_dim_p_pe });
 
 // var z1_tile: [bsz * ffn_dim_p_pe]f16 = @zeros([bsz * ffn_dim_p_pe]f16);
 // var ptr_z1: [*]f16 = &z1_tile;
 // var z1_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &z1_tile, .extent = bsz * ffn_dim_p_pe });
 
-// var z2_tile: [bsz * ffn_dim_p_pe]f16 = @zeros([bsz * ffn_dim_p_pe]f16);
-// var ptr_z2: [*]f16 = &z2_tile;
-// var z2_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &z2_tile, .extent = bsz * ffn_dim_p_pe });
+var z2_tmp_tile: [bsz * ffn_dim_p_pe]f16 = @zeros([bsz * ffn_dim_p_pe]f16);
+var ptr_z2_tmp: [*]f16 = &z2_tmp_tile;
+var z2_tmp_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &z2_tmp_tile, .extent = bsz * ffn_dim_p_pe });
 
 var ZZ_tile: [bsz * 2 * ffn_dim_p_pe]f16 = @zeros([bsz * 2 * ffn_dim_p_pe]f16);
 var ptr_ZZ_tile: [*]f16 = &ZZ_tile;
@@ -362,54 +663,72 @@ var z3_tile: [bsz * ffn_dim_p_pe]f16 = @zeros([bsz * ffn_dim_p_pe]f16);
 var ptr_z3: [*]f16 = &z3_tile;
 var z3_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &z3_tile, .extent = bsz * ffn_dim_p_pe });
 
-var z_norm_tile: [bsz * dim_p_pe]f16 = @zeros([bsz * dim_p_pe]f16);
+var z_norm_tile: [bsz * v_dim_p_pe]f16 = @zeros([bsz * v_dim_p_pe]f16);
 var ptr_z_norm: [*]f16 = &z_norm_tile;
-var z_norm_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &z_norm_tile, .extent = bsz * dim_p_pe });
+var z_norm_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &z_norm_tile, .extent = bsz * v_dim_p_pe });
 
-var Z_tile: [bsz * dim_p_pe]f16 = @zeros([bsz * dim_p_pe]f16);
+var Z_tile: [bsz * v_dim_p_pe]f16 = @zeros([bsz * v_dim_p_pe]f16);
 var ptr_Z: [*]f16 = &Z_tile;
-var Z_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &Z_tile, .extent = bsz * dim_p_pe });
+var Z_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &Z_tile, .extent = bsz * v_dim_p_pe });
 
-var ptr_debug: [*]f16 = &X_tile;
+var ptr_debug: [*]f16 = &X_norm_tile;    // list: &X_tile, &Z_tile, &X_norm_tile, &QKV_tile, &QKV_tile[bsz*dim_p_pe], &QKV_tile[2*bsz*dim_p_pe], &score, &output_tile, &h1_tile, &z_norm_tile, &z3_tile
 
 
 // -------------------------------------------------------------------------- //
 // ------------------------------ Decode Funcs ------------------------------ //
 // -------------------------------------------------------------------------- //
 
+// normalizer of x vector using vertical (Y) all-reduce communication
 fn rmsnorm_x() void {
     @load_to_dsr(dest_dsr_1, X_tmp_dsd);
     @load_to_dsr(src0_dsr_1, X_dsd);
     @load_to_dsr(src1_dsr_1, X_dsd);
     @fmulh(dest_dsr_1, src0_dsr_1, src1_dsr_1);
 
-    dim_p_pe_dsd_1 = @set_dsd_base_addr(dim_p_pe_dsd_1, ptr_X_tmp);
-    @load_to_dsr(src1_dsr_1, dim_p_pe_dsd_1, .{ .save_address = true });
+    // ROW_WISE_REDUCE: [FIX: The output is unstable and depends on the compiler's register allocation]
+    // dim_p_pe_dsd_1 = @set_dsd_base_addr(dim_p_pe_dsd_1, ptr_X_tmp);
+    // @load_to_dsr(src1_dsr_1, dim_p_pe_dsd_1, .{ .save_address = true });
+    // for (@range(i16, bsz)) |b| {    // FIX: The output is unstable and depends on the compiler's register allocation
+    //     sum = 0.0;
+    //     @faddh(ptr_sum, sum, src1_dsr_1);
+    //     local_sum[b] = sum;
+    // }
+    @load_to_dsr(src0_dsr_1, local_sum_element_dsd, .{ .save_address = false });
+    @load_to_dsr(src1_dsr_1, size1_chunk_dsd, .{ .save_address = true });
+    @set_dsr_base_addr(src1_dsr_1, ptr_X_tmp);
     for (@range(i16, bsz)) |b| {
-        sum = 0.0;
-        @faddh(ptr_sum, sum, src1_dsr_1);
-        local_sum[b] = sum;
+        @set_dsr_base_addr(src0_dsr_1, @ptrcast([*]f16, &local_sum[b]));
+        @fmulh(src0_dsr_1, src0_dsr_1, 0.0);
+        for (@range(i16, v_dim_p_pe)) |i| {
+            @faddh(src0_dsr_1, src0_dsr_1, src1_dsr_1);
+        }
     }
 
-    comm_mod.all_reduce_bsz(py, quotient_y, remainder_y, ptr_local_sum);
+    // simprint.fmt_with_coords("print: all_reduce_without_reset rmsnorm_x\n", .{});
 
-    dim_p_pe_dsd_1 = @set_dsd_base_addr(dim_p_pe_dsd_1, ptr_X_norm);
-    dim_p_pe_dsd_2 = @set_dsd_base_addr(dim_p_pe_dsd_2, ptr_X_tmp);
-    @load_to_dsr(dest_dsr_1, dim_p_pe_dsd_1, .{ .save_address = true});
-    @load_to_dsr(src0_dsr_1, dim_p_pe_dsd_2, .{ .save_address = true});
+    comm_mod.all_reduce_without_reset(bsz, ptr_local_sum, comm_mod.comm_axis.vertical, false);     // vertical all-reduce of (bsz)
+
+    // simprint.fmt_with_coords("print: all_reduce_without_reset rmsnorm_x end normalization\n", .{});
+
+    v_dim_p_pe_dsd_1 = @set_dsd_base_addr(v_dim_p_pe_dsd_1, ptr_X_norm);
+    v_dim_p_pe_dsd_2 = @set_dsd_base_addr(v_dim_p_pe_dsd_2, ptr_X);     // FIX: replace ptr_X_tmp to ptr_X
+    @load_to_dsr(dest_dsr_1, v_dim_p_pe_dsd_1, .{ .save_address = true});
+    @load_to_dsr(src0_dsr_1, v_dim_p_pe_dsd_2, .{ .save_address = true});
     @load_to_dsr(src1_dsr_1, W_dsd, .{ .save_address = false});
     for (@range(i16, bsz)) |b| {
         @fmulh(dest_dsr_1, src0_dsr_1, src1_dsr_1);
     }
 
-    dim_p_pe_dsd_1 = @set_dsd_base_addr(dim_p_pe_dsd_1, ptr_X_norm);
-    @load_to_dsr(dest_dsr_1, dim_p_pe_dsd_1, .{ .save_address = true});
-    @load_to_dsr(src0_dsr_1, dim_p_pe_dsd_1, .{ .save_address = true});
+    v_dim_p_pe_dsd_1 = @set_dsd_base_addr(v_dim_p_pe_dsd_1, ptr_X_norm);
+    @load_to_dsr(dest_dsr_1, v_dim_p_pe_dsd_1, .{ .save_address = true});
+    @load_to_dsr(src0_dsr_1, v_dim_p_pe_dsd_1, .{ .save_address = true});
     @map(fmulh_norm_func, local_sum_dsd);
 }
 
+// query vector generator
 fn xq_matvec_mult() void {
-    @fmovh(Q_dsd, 0.0);
+    @load_to_dsr(dest_dsr_1, Q_dsd);
+    @fmovh(dest_dsr_1, 0.0);
 
     left_vector_dsd = @set_dsd_base_addr(left_vector_dsd, ptr_X_norm);
 
@@ -418,16 +737,18 @@ fn xq_matvec_mult() void {
     // out_vector_dsd = @set_dsd_base_addr(out_vector_dsd, ptr_Q);
     out_vector_dsd = @set_dsd_base_addr(out_vector_dsd, ptr_QKV_tile);
 
-    Kt = dim_p_pe;
-    Nt = dim_p_pe;
+    Kt = v_dim_p_pe;
+    Nt = h_dim_p_pe;
 
     vecmat_computation();
 
     // comm_mod.all_reduce_bsz_dim(py, quotient_y, remainder_y, ptr_Q);
 }
 
+// key vector generator
 fn xk_matvec_mult() void {
-    @fmovh(K_dsd, 0.0);
+    @load_to_dsr(dest_dsr_1, K_dsd);
+    @fmovh(dest_dsr_1, 0.0);
 
     left_vector_dsd = @set_dsd_base_addr(left_vector_dsd, ptr_X_norm);
 
@@ -435,18 +756,20 @@ fn xk_matvec_mult() void {
 
     // out_vector_dsd = @set_dsd_base_addr(out_vector_dsd, ptr_K);
     out_vector_dsd = @set_dsd_base_addr(out_vector_dsd, ptr_QKV_tile);
-    out_vector_dsd = @increment_dsd_offset(out_vector_dsd, bsz*dim_p_pe, f16);
+    out_vector_dsd = @increment_dsd_offset(out_vector_dsd, bsz*h_dim_p_pe, f16);
 
-    Kt = dim_p_pe;
-    Nt = dim_p_pe;
+    Kt = v_dim_p_pe;
+    Nt = h_dim_p_pe;
 
     vecmat_computation();
 
     // comm_mod.all_reduce_bsz_dim(py, quotient_y, remainder_y, ptr_K);
 }
 
+// value vector generator
 fn xv_matvec_mult() void {
-    @fmovh(V_dsd, 0.0);
+    @load_to_dsr(dest_dsr_1, V_dsd);
+    @fmovh(dest_dsr_1, 0.0);
 
     left_vector_dsd = @set_dsd_base_addr(left_vector_dsd, ptr_X_norm);
 
@@ -454,102 +777,85 @@ fn xv_matvec_mult() void {
 
     // out_vector_dsd = @set_dsd_base_addr(out_vector_dsd, ptr_V);
     out_vector_dsd = @set_dsd_base_addr(out_vector_dsd, ptr_QKV_tile);
-    out_vector_dsd = @increment_dsd_offset(out_vector_dsd, 2*bsz*dim_p_pe, f16);
+    out_vector_dsd = @increment_dsd_offset(out_vector_dsd, 2*bsz*h_dim_p_pe, f16);
 
-    Kt = dim_p_pe;
-    Nt = dim_p_pe;
+    Kt = v_dim_p_pe;
+    Nt = h_dim_p_pe;
 
     vecmat_computation();
 
     // comm_mod.all_reduce_bsz_dim(py, quotient_y, remainder_y, ptr_V);
 }
 
+// query rottery positional encoding (local)
 fn xq_rope() void {
     X_even_dsd = @set_dsd_base_addr(X_even_dsd, ptr_QKV_tile);
-    X_odd_dsd = @set_dsd_base_addr(X_odd_dsd, ptr_QKV_tile);
+    X_odd_dsd = @set_dsd_base_addr(X_odd_dsd, @ptrcast([*]f16, &ptr_QKV_tile[1]));  // FIX: set_dsd_base_addr updates base_addr + offset
 
     @load_to_dsr(dest_dsr_1, X_tmp_1_dsd);
     @load_to_dsr(dest_dsr_2, X_tmp_2_dsd);
-    @load_to_dsr(dest_dsr_3, X_tmp_3_dsd);
-    @load_to_dsr(dest_dsr_4, X_tmp_4_dsd);
 
     @load_to_dsr(src1_dsr_1, freqs_cos_dsd);
     @load_to_dsr(src1_dsr_2, freqs_sin_dsd);
-    @load_to_dsr(src1_dsr_3, freqs_cos_dsd);
-    @load_to_dsr(src1_dsr_4, freqs_sin_dsd);
+
+    @load_to_dsr(src0_dsr_3, X_tmp_1_dsd);
+    @load_to_dsr(src1_dsr_3, X_tmp_2_dsd);
+
+    @load_to_dsr(src0_dsr_1, X_odd_dsd, .{ .save_address = true });
+    @load_to_dsr(src0_dsr_2, X_even_dsd, .{ .save_address = true });
+    @load_to_dsr(dest_dsr_3, X_odd_dsd, .{ .save_address = true });
+    @load_to_dsr(dest_dsr_4, X_even_dsd, .{ .save_address = true });
 
     for (@range(i16, bsz)) |b| {
 
-        @load_to_dsr(src0_dsr_1, X_odd_dsd);
-        @load_to_dsr(src0_dsr_2, X_even_dsd);
-        @load_to_dsr(src0_dsr_3, X_even_dsd);
-        @load_to_dsr(src0_dsr_4, X_odd_dsd);
-
         @fmulh(dest_dsr_1, src0_dsr_1, src1_dsr_1);
         @fmulh(dest_dsr_2, src0_dsr_2, src1_dsr_2);
-        @fmulh(dest_dsr_3, src0_dsr_3, src1_dsr_3);
-        @fmulh(dest_dsr_4, src0_dsr_4, src1_dsr_4);
+        @fsubh(dest_dsr_4, src0_dsr_3, src1_dsr_3);
 
-        @load_to_dsr(dest_dsr_5, X_even_dsd);
-        @load_to_dsr(src0_dsr_5, X_tmp_1_dsd);
-        @load_to_dsr(src1_dsr_5, X_tmp_2_dsd);
-        @fsubh(dest_dsr_5, src0_dsr_5, src1_dsr_5);
+        @fmulh(dest_dsr_1, src0_dsr_2, src1_dsr_1);
+        @fmulh(dest_dsr_2, src0_dsr_1, src1_dsr_2);
+        @faddh(dest_dsr_3, src0_dsr_3, src1_dsr_3);
 
-        @load_to_dsr(dest_dsr_5, X_odd_dsd);
-        @load_to_dsr(src0_dsr_5, X_tmp_3_dsd);
-        @load_to_dsr(src1_dsr_5, X_tmp_4_dsd);
-        @faddh(dest_dsr_5, src0_dsr_5, src1_dsr_5);
-
-        X_even_dsd = @increment_dsd_offset(X_even_dsd, dim_p_pe, f16);
-        X_odd_dsd = @increment_dsd_offset(X_odd_dsd, dim_p_pe, f16);
     }
 }
 
+// key rottery positional encoding (local)
 fn xk_rope() void {
     X_even_dsd = @set_dsd_base_addr(X_even_dsd, ptr_QKV_tile);
-    X_odd_dsd = @set_dsd_base_addr(X_odd_dsd, ptr_QKV_tile);
-    X_even_dsd = @increment_dsd_offset(X_even_dsd, bsz*dim_p_pe, f16);
-    X_odd_dsd = @increment_dsd_offset(X_odd_dsd, bsz*dim_p_pe, f16);
+    X_odd_dsd = @set_dsd_base_addr(X_odd_dsd, @ptrcast([*]f16, &ptr_QKV_tile[1]));
+    X_even_dsd = @increment_dsd_offset(X_even_dsd, bsz*h_dim_p_pe, f16);
+    X_odd_dsd = @increment_dsd_offset(X_odd_dsd, bsz*h_dim_p_pe, f16);
 
     @load_to_dsr(dest_dsr_1, X_tmp_1_dsd);
     @load_to_dsr(dest_dsr_2, X_tmp_2_dsd);
-    @load_to_dsr(dest_dsr_3, X_tmp_3_dsd);
-    @load_to_dsr(dest_dsr_4, X_tmp_4_dsd);
 
     @load_to_dsr(src1_dsr_1, freqs_cos_dsd);
     @load_to_dsr(src1_dsr_2, freqs_sin_dsd);
-    @load_to_dsr(src1_dsr_3, freqs_cos_dsd);
-    @load_to_dsr(src1_dsr_4, freqs_sin_dsd);
+
+    @load_to_dsr(src0_dsr_3, X_tmp_1_dsd);
+    @load_to_dsr(src1_dsr_3, X_tmp_2_dsd);
+
+    @load_to_dsr(src0_dsr_1, X_odd_dsd, .{ .save_address = true });
+    @load_to_dsr(src0_dsr_2, X_even_dsd, .{ .save_address = true });
+    @load_to_dsr(dest_dsr_3, X_odd_dsd, .{ .save_address = true });
+    @load_to_dsr(dest_dsr_4, X_even_dsd, .{ .save_address = true });
 
     for (@range(i16, bsz)) |b| {
 
-        @load_to_dsr(src0_dsr_1, X_odd_dsd);
-        @load_to_dsr(src0_dsr_2, X_even_dsd);
-        @load_to_dsr(src0_dsr_3, X_even_dsd);
-        @load_to_dsr(src0_dsr_4, X_odd_dsd);
-
         @fmulh(dest_dsr_1, src0_dsr_1, src1_dsr_1);
         @fmulh(dest_dsr_2, src0_dsr_2, src1_dsr_2);
-        @fmulh(dest_dsr_3, src0_dsr_3, src1_dsr_3);
-        @fmulh(dest_dsr_4, src0_dsr_4, src1_dsr_4);
+        @fsubh(dest_dsr_4, src0_dsr_3, src1_dsr_3);
 
-        @load_to_dsr(dest_dsr_5, X_even_dsd);
-        @load_to_dsr(src0_dsr_5, X_tmp_1_dsd);
-        @load_to_dsr(src1_dsr_5, X_tmp_2_dsd);
-        @fsubh(dest_dsr_5, src0_dsr_5, src1_dsr_5);
+        @fmulh(dest_dsr_1, src0_dsr_2, src1_dsr_1);
+        @fmulh(dest_dsr_2, src0_dsr_1, src1_dsr_2);
+        @faddh(dest_dsr_3, src0_dsr_3, src1_dsr_3);
 
-        @load_to_dsr(dest_dsr_5, X_odd_dsd);
-        @load_to_dsr(src0_dsr_5, X_tmp_3_dsd);
-        @load_to_dsr(src1_dsr_5, X_tmp_4_dsd);
-        @faddh(dest_dsr_5, src0_dsr_5, src1_dsr_5);
-
-        X_even_dsd = @increment_dsd_offset(X_even_dsd, dim_p_pe, f16);
-        X_odd_dsd = @increment_dsd_offset(X_odd_dsd, dim_p_pe, f16);
     }
 }
 
 fn score_matvec_mult() void {
-    @fmovh(score_dsd, 0.0);
+    @load_to_dsr(dest_dsr_1, score_dsd);
+    @fmovh(dest_dsr_1, 0.0);
 
     left_vector_dsd = @set_dsd_base_addr(left_vector_dsd, ptr_QKV_tile);
     
@@ -557,30 +863,58 @@ fn score_matvec_mult() void {
 
     out_vector_dsd = @set_dsd_base_addr(out_vector_dsd, ptr_score);
 
-    Kt = dim_p_pe;
+    Kt = h_dim_p_pe;
     Nt = seq_len_p_pe;
 
     vecmat_computation();
 
-    comm_mod.all_reduce_bsz_seq_len(px, quotient_x, remainder_x, ptr_score);
+    // simprint.fmt_with_coords("print: all_reduce_in_head start\n", .{});
+
+    // AllReduce(s) are conducted on n_heads independent units of pes_p_head PEs
+    comm_mod.all_reduce_with_reset(bsz * seq_len_p_pe, ptr_score, comm_mod.comm_axis.horizontal_in_head);
+
+    // simprint.fmt_with_coords("print: all_reduce_in_head end\n", .{});
+
+    // Apply score_mask: add -inf to padded seq positions so they vanish after softmax
+    @load_to_dsr(src1_dsr_1, score_mask_dsd);
+    @load_to_dsr(src0_dsr_1, score_batch_dsd, .{ .save_address = true });
+    @load_to_dsr(dest_dsr_1, score_batch_dsd, .{ .save_address = true });
+    for (@range(i16, bsz)) |b| {
+        @faddh(dest_dsr_1, src0_dsr_1, src1_dsr_1);
+    }
 
     // score factor
-    @load_to_dsr(dest_dsr_1, score_dsd);
-    @load_to_dsr(src0_dsr_1, score_dsd);
+    @load_to_dsr(dest_dsr_1, score_dsd, .{ .save_address = false });
+    @load_to_dsr(src0_dsr_1, score_dsd, .{ .save_address = false });
     @fmulh(dest_dsr_1, src0_dsr_1, alpha);
 }
 
 fn softmax_score() void {
 
-    seq_len_p_pe_dsd_1 = @set_dsd_base_addr(seq_len_p_pe_dsd_1, ptr_score);
-    @load_to_dsr(src1_dsr_1, seq_len_p_pe_dsd_1, .{ .save_address = true });
+    // ROW_WISE_REDUCE: [FIX: The output is unstable and depends on the compiler's register allocation]
+    // seq_len_p_pe_dsd_1 = @set_dsd_base_addr(seq_len_p_pe_dsd_1, ptr_score);
+    // @load_to_dsr(src1_dsr_1, seq_len_p_pe_dsd_1, .{ .save_address = true });
+    // for (@range(i16, bsz)) |b| {    // FIX: unstable if bsz > 1
+    //     max = 0.0;
+    //     @fmaxh(ptr_max, max, src1_dsr_1);   // FIX: dest and src0 must be assigned to the same reg, but it is not guaranteed now 
+    //     local_max[b] = max;
+    // }
+    @load_to_dsr(src0_dsr_1, local_max_element_dsd, .{ .save_address = false });
+    @load_to_dsr(src1_dsr_1, size1_chunk_dsd, .{ .save_address = true });
+    @set_dsr_base_addr(src1_dsr_1, ptr_score);
     for (@range(i16, bsz)) |b| {
-        max = 0.0;
-        @fmaxh(ptr_max, max, src1_dsr_1);
-        local_max[b] = max;
+        @set_dsr_base_addr(src0_dsr_1, @ptrcast([*]f16, &local_max[b]));
+        @faddh(src0_dsr_1, src0_dsr_1, math.NEGATIVE_INF_f16);
+        for (@range(i16, seq_len_p_pe)) |i| {
+            @fmaxh(src0_dsr_1, src0_dsr_1, src1_dsr_1);
+        }
     }
 
-    comm_mod.all_reduceMax_bsz(py, quotient_y, remainder_y, ptr_local_max);
+    // simprint.fmt_with_coords("print: all_reduce_without_reset max softmax_score\n", .{});
+
+    comm_mod.all_reduce_without_reset(bsz, ptr_local_max, comm_mod.comm_axis.vertical, true);     // vertical all-reduce of (bsz)
+
+    // simprint.fmt_with_coords("print: all_reduce_without_reset max softmax_score end\n", .{});
 
     seq_len_p_pe_dsd_1 = @set_dsd_base_addr(seq_len_p_pe_dsd_1, ptr_score_tmp);
     seq_len_p_pe_dsd_2 = @set_dsd_base_addr(seq_len_p_pe_dsd_2, ptr_score);
@@ -588,29 +922,56 @@ fn softmax_score() void {
     @load_to_dsr(src0_dsr_1, seq_len_p_pe_dsd_2, .{ .save_address = true });
     @map(fsubh_func, local_max_dsd);
 
-    @map(fast_exp, score_tmp_dsd, score_dsd);
+    // simprint.fmt_with_coords("print: exp_naive softmax_score \n", .{});
+
+    // @map(fast_exp, score_tmp_dsd, score_dsd);
+    // @map(math.exp_f16, score_tmp_dsd, score_dsd);
     // for (@range(i16, bsz*seq_len_p_pe)) |i| {
     //     score[i] = fast_exp(score_tmp[i]);
     // }
+    vectorized_exp_f16(bsz*seq_len_p_pe, ptr_score_tmp, ptr_score);
 
-    seq_len_p_pe_dsd_1 = @set_dsd_base_addr(seq_len_p_pe_dsd_1, ptr_score);
-    @load_to_dsr(src1_dsr_1, seq_len_p_pe_dsd_1, .{ .save_address = true });
+    // simprint.fmt_with_coords("print: row_wise_sum_reduce softmax_score \n", .{});
+
+    // ROW_WISE_REDUCE: [FIX: The output is unstable and depends on the compiler's register allocation]
+    // seq_len_p_pe_dsd_1 = @set_dsd_base_addr(seq_len_p_pe_dsd_1, ptr_score);
+    // @load_to_dsr(src1_dsr_1, seq_len_p_pe_dsd_1, .{ .save_address = true });
+    // for (@range(i16, bsz)) |b| {    // FIX: unstable if bsz > 1
+    //     sum = 0.0;
+    //     @faddh(ptr_sum, sum, src1_dsr_1);
+    //     local_sum[b] = sum;
+    // }
+    @load_to_dsr(src0_dsr_1, local_sum_element_dsd, .{ .save_address = false });
+    @load_to_dsr(src1_dsr_1, size1_chunk_dsd, .{ .save_address = true });
+    @set_dsr_base_addr(src1_dsr_1, ptr_score);
     for (@range(i16, bsz)) |b| {
-        sum = 0.0;
-        @faddh(ptr_sum, sum, src1_dsr_1);
-        local_sum[b] = sum;
+        @set_dsr_base_addr(src0_dsr_1, @ptrcast([*]f16, &local_sum[b]));
+        @fmulh(src0_dsr_1, src0_dsr_1, 0.0);
+        for (@range(i16, seq_len_p_pe)) |i| {
+            @faddh(src0_dsr_1, src0_dsr_1, src1_dsr_1);
+        }
     }
 
-    comm_mod.all_reduce_bsz(py, quotient_y, remainder_y, ptr_local_sum);
+    // simprint.fmt_with_coords("print: all_reduce_without_reset sum softmax_score\n", .{});
+
+    comm_mod.all_reduce_without_reset(bsz, ptr_local_sum, comm_mod.comm_axis.vertical, false);     // vertical all-reduce of (bsz)
+
+    // simprint.fmt_with_coords("print: all_reduce_without_reset sum softmax_score end fmulh_softmax_func\n", .{});
 
     seq_len_p_pe_dsd_1 = @set_dsd_base_addr(seq_len_p_pe_dsd_1, ptr_score);
     @load_to_dsr(dest_dsr_1, seq_len_p_pe_dsd_1, .{ .save_address = true });
     @load_to_dsr(src0_dsr_1, seq_len_p_pe_dsd_1, .{ .save_address = true });
     @map(fmulh_softmax_func, local_sum_dsd);
+
+    // softmax result of padded seq positions are -inf (normally non-negative), which must be masked as 0 using fmaxh
+    @load_to_dsr(dest_dsr_1, score_dsd);
+    @load_to_dsr(src0_dsr_1, score_dsd);
+    @fmaxh(dest_dsr_1, src0_dsr_1, 0.0);
 }
 
 fn output_matvec_mult() void {
-    @fmovh(output_dsd, 0.0);
+    @load_to_dsr(dest_dsr_1, output_dsd);
+    @fmovh(dest_dsr_1, 0.0);
 
     left_vector_dsd = @set_dsd_base_addr(left_vector_dsd, ptr_score);
     
@@ -619,15 +980,18 @@ fn output_matvec_mult() void {
     out_vector_dsd = @set_dsd_base_addr(out_vector_dsd, ptr_output);
 
     Kt = seq_len_p_pe;
-    Nt = dim_p_pe;
+    Nt = h_dim_p_pe;
 
     vecmat_computation();
 
-    comm_mod.all_reduce_bsz_dim(py, quotient_y, remainder_y, ptr_output);
+    // simprint.fmt_with_coords("print: all_reduce_with_reset output_matvec_mult\n", .{});
+
+    comm_mod.all_reduce_with_reset(bsz * h_dim_p_pe, ptr_output, comm_mod.comm_axis.vertical);      // vertical all-reduce of (bsz, h_dim_p_pe)
 }
 
 fn o_matvec_mult() void {
-    @fmovh(h1_dsd, 0.0);
+    @load_to_dsr(dest_dsr_1, h1_dsd);
+    @fmovh(dest_dsr_1, 0.0);
 
     left_vector_dsd = @set_dsd_base_addr(left_vector_dsd, ptr_output);
     
@@ -635,12 +999,14 @@ fn o_matvec_mult() void {
 
     out_vector_dsd = @set_dsd_base_addr(out_vector_dsd, ptr_h1);
 
-    Kt = dim_p_pe;
-    Nt = dim_p_pe;
+    Kt = h_dim_p_pe;
+    Nt = v_dim_p_pe;
 
     vecmat_computation();
 
-    comm_mod.all_reduce_bsz_dim(px, quotient_x, remainder_x, ptr_h1);
+    // simprint.fmt_with_coords("print: all_reduce_with_reset o_matvec_mult\n", .{});
+
+    comm_mod.all_reduce_with_reset(bsz * v_dim_p_pe, ptr_h1, comm_mod.comm_axis.horizontal);    // horizontal all-reduce of (bsz, v_dim_p_pe)
 }
 
 fn attn_residual_add() void {
@@ -656,33 +1022,49 @@ fn rmsnorm_z() void {
     @load_to_dsr(src1_dsr_1, Z_dsd);
     @fmulh(dest_dsr_1, src0_dsr_1, src1_dsr_1);
     
-    dim_p_pe_dsd_1 = @set_dsd_base_addr(dim_p_pe_dsd_1, ptr_X_tmp);
-    @load_to_dsr(src1_dsr_1, dim_p_pe_dsd_1, .{ .save_address = true });
+    // ROW_WISE_REDUCE: [FIX: The output is unstable and depends on the compiler's register allocation]
+    // dim_p_pe_dsd_1 = @set_dsd_base_addr(dim_p_pe_dsd_1, ptr_X_tmp);
+    // @load_to_dsr(src1_dsr_1, dim_p_pe_dsd_1, .{ .save_address = true });
+    // for (@range(i16, bsz)) |b| {    // FIX: unstable if bsz > 1
+    //     sum = 0.0;
+    //     @faddh(ptr_sum, sum, src1_dsr_1);
+    //     local_sum[b] = sum;
+    // }
+    @load_to_dsr(src0_dsr_1, local_sum_element_dsd, .{ .save_address = false });
+    @load_to_dsr(src1_dsr_1, size1_chunk_dsd, .{ .save_address = true });
+    @set_dsr_base_addr(src1_dsr_1, ptr_X_tmp);
     for (@range(i16, bsz)) |b| {
-        sum = 0.0;
-        @faddh(ptr_sum, sum, src1_dsr_1);
-        local_sum[b] = sum;
+        @set_dsr_base_addr(src0_dsr_1, @ptrcast([*]f16, &local_sum[b]));
+        @fmulh(src0_dsr_1, src0_dsr_1, 0.0);
+        for (@range(i16, v_dim_p_pe)) |i| {
+            @faddh(src0_dsr_1, src0_dsr_1, src1_dsr_1);
+        }
     }
 
-    comm_mod.all_reduce_bsz(py, quotient_y, remainder_y, ptr_local_sum);
+    // simprint.fmt_with_coords("print: all_reduce_without_reset rmsnorm_z\n", .{});
 
-    dim_p_pe_dsd_1 = @set_dsd_base_addr(dim_p_pe_dsd_1, ptr_z_norm);
-    dim_p_pe_dsd_2 = @set_dsd_base_addr(dim_p_pe_dsd_2, ptr_X_tmp);
-    @load_to_dsr(dest_dsr_1, dim_p_pe_dsd_1, .{ .save_address = true });
-    @load_to_dsr(src0_dsr_1, dim_p_pe_dsd_2, .{ .save_address = true });
+    comm_mod.all_reduce_without_reset(bsz, ptr_local_sum, comm_mod.comm_axis.vertical, false);     // vertical all-reduce of (bsz)
+
+    // simprint.fmt_with_coords("print: all_reduce_without_reset rmsnorm_z end normalization\n", .{});
+
+    v_dim_p_pe_dsd_1 = @set_dsd_base_addr(v_dim_p_pe_dsd_1, ptr_z_norm);
+    v_dim_p_pe_dsd_2 = @set_dsd_base_addr(v_dim_p_pe_dsd_2, ptr_Z);     // FIX: replace ptr_X_tmp to ptr_Z
+    @load_to_dsr(dest_dsr_1, v_dim_p_pe_dsd_1, .{ .save_address = true });
+    @load_to_dsr(src0_dsr_1, v_dim_p_pe_dsd_2, .{ .save_address = true });
     @load_to_dsr(src1_dsr_1, W_dsd, .{ .save_address = false });
     for (@range(i16, bsz)) |b| {
         @fmulh(dest_dsr_1, src0_dsr_1, src1_dsr_1);
     }
 
-    seq_len_p_pe_dsd_1 = @set_dsd_base_addr(seq_len_p_pe_dsd_1, ptr_z_norm);
-    @load_to_dsr(dest_dsr_1, seq_len_p_pe_dsd_1, .{ .save_address = true });
-    @load_to_dsr(src0_dsr_1, seq_len_p_pe_dsd_1, .{ .save_address = true });
+    v_dim_p_pe_dsd_1 = @set_dsd_base_addr(v_dim_p_pe_dsd_1, ptr_z_norm);
+    @load_to_dsr(dest_dsr_1, v_dim_p_pe_dsd_1, .{ .save_address = true });
+    @load_to_dsr(src0_dsr_1, v_dim_p_pe_dsd_1, .{ .save_address = true });
     @map(fmulh_norm_func, local_sum_dsd);
 }
 
 fn up_matvec_mult() void {
-    @fmovh(z1_dsd, 0.0);
+    @load_to_dsr(dest_dsr_1, z1_dsd);
+    @fmovh(dest_dsr_1, 0.0);
 
     left_vector_dsd = @set_dsd_base_addr(left_vector_dsd, ptr_z_norm);
     
@@ -691,7 +1073,7 @@ fn up_matvec_mult() void {
     // out_vector_dsd = @set_dsd_base_addr(out_vector_dsd, ptr_z1);
     out_vector_dsd = @set_dsd_base_addr(out_vector_dsd, ptr_ZZ_tile);
 
-    Kt = dim_p_pe;
+    Kt = v_dim_p_pe;
     Nt = ffn_dim_p_pe;
 
     vecmat_computation();
@@ -700,7 +1082,8 @@ fn up_matvec_mult() void {
 }
 
 fn gate_matvec_mult() void {
-    @fmovh(z2_dsd, 0.0);
+    @load_to_dsr(dest_dsr_1, z2_dsd);
+    @fmovh(dest_dsr_1, 0.0);
 
     left_vector_dsd = @set_dsd_base_addr(left_vector_dsd, ptr_z_norm);
     
@@ -710,7 +1093,7 @@ fn gate_matvec_mult() void {
     out_vector_dsd = @set_dsd_base_addr(out_vector_dsd, ptr_ZZ_tile);
     out_vector_dsd = @increment_dsd_offset(out_vector_dsd, bsz * ffn_dim_p_pe, f16);
 
-    Kt = dim_p_pe;
+    Kt = v_dim_p_pe;
     Nt = ffn_dim_p_pe;
 
     vecmat_computation();
@@ -718,17 +1101,33 @@ fn gate_matvec_mult() void {
     // comm_mod.all_reduce_bsz_ffn_dim(py, quotient_y, remainder_y, ptr_z2);
 }
 
-fn silu_kernel(val: f16) f16 {
-    return val / (1.0 + fast_exp(-val));
-}
+// fn silu_kernel(val: f16) f16 {
+//     return val / (1.0 + fast_exp(-val));
+// }
 
 var z2_val: f16 = 0.0;
 fn z2_silu() void {
-    for (@range(i16, bsz*dim_p_pe)) |i| {
-        z2_val = ZZ_tile[i];
-        ZZ_tile[i] = z2_val / (1.0 + fast_exp(-z2_val));
-    }
+    // for (@range(i16, bsz*ffn_dim_p_pe, 2*bsz*ffn_dim_p_pe, 1)) |i| {   // FIX: @range(i16, bsz*dim_p_pe) should be @range(i16, bsz*ffn_dim_p_pe, 2*bsz*ffn_dim_p_pe, 1)
+    //     z2_val = ZZ_tile[i];
+    //     // ZZ_tile[i] = z2_val / (1.0 + fast_exp(-z2_val));
+    //     ZZ_tile[i] = z2_val / (1.0 + math.exp_f16(-z2_val));
+    // }
     // @map(silu_kernel, z2_dsd, z2_dsd);
+
+    // simprint.fmt_with_coords("print: z2[0] = {f}\n", .{@as(@fp16(),ZZ_tile[bsz * ffn_dim_p_pe])});
+    @load_to_dsr(dest_dsr_4, z2_tmp_dsd);
+    @load_to_dsr(src0_dsr_4, z2_tmp_dsd);
+    @load_to_dsr(src1_dsr_4, z2_dsd);
+    @fnegh(dest_dsr_4, src1_dsr_4);
+    vectorized_exp_f16(bsz*ffn_dim_p_pe, ptr_z2_tmp, ptr_z3);
+    @set_dsr_base_addr(dest_dsr_4, ptr_z3);
+    @set_dsr_base_addr(src0_dsr_4, ptr_z3);
+    @faddh(dest_dsr_4, src0_dsr_4, @as(f16, 1.0));
+    vectorized_reciprocal_f16(bsz*ffn_dim_p_pe, ptr_z3, ptr_z2_tmp);
+    @set_dsr_base_addr(dest_dsr_4, @ptrcast([*]f16, &ZZ_tile[bsz*ffn_dim_p_pe]));
+    @set_dsr_base_addr(src0_dsr_4, ptr_z2_tmp);
+    @fmulh(dest_dsr_4, src0_dsr_4, src1_dsr_4);
+    // simprint.fmt_with_coords("print: z2[0] = {f}\n", .{@as(@fp16(),ZZ_tile[bsz * ffn_dim_p_pe])});
 }
 
 fn z3_mat() void {
@@ -739,7 +1138,8 @@ fn z3_mat() void {
 }
 
 fn down_matvec_mult() void {
-    @fmovh(h2_dsd, 0.0);
+    @load_to_dsr(dest_dsr_1, h2_dsd);
+    @fmovh(dest_dsr_1, 0.0);
 
     left_vector_dsd = @set_dsd_base_addr(left_vector_dsd, ptr_z3);
     
@@ -748,11 +1148,13 @@ fn down_matvec_mult() void {
     out_vector_dsd = @set_dsd_base_addr(out_vector_dsd, ptr_h2);
 
     Kt = ffn_dim_p_pe;
-    Nt = dim_p_pe;
+    Nt = v_dim_p_pe;
 
     vecmat_computation();
 
-    comm_mod.all_reduce_bsz_dim(px, quotient_x, remainder_x, ptr_h2);
+    // simprint.fmt_with_coords("print: all_reduce_with_reset down_matvec_mult\n", .{});
+
+    comm_mod.all_reduce_with_reset(bsz * v_dim_p_pe, ptr_h2, comm_mod.comm_axis.horizontal);    // horizontal all-reduce of (bsz, v_dim_p_pe)
 }
 
 fn ffn_residual_add() void {
@@ -763,61 +1165,126 @@ fn ffn_residual_add() void {
 }
 
 fn decode_struct() void {
+    // load fabric dsd(s) to dsr
+    // simprint.fmt_with_coords("print: runtime_setup\n", .{});
+
+    comm_mod.runtime_setup();
+
+    // normalize x: 1. local sum(x^2), 2. vertical all-reduce 3. local x / sqrt(s/D + eps)
+    // simprint.fmt_with_coords("print: square_sum rmsnorm_x\n", .{});
 
     rmsnorm_x();
 
+    // simprint.fmt_with_coords("print: qkv_matvec_mult\n", .{});
+
+    // normalized x to q, k, v vector: 1. local GEMV, 2. fused vertical all-reduce
     xq_matvec_mult();
     xk_matvec_mult();
     xv_matvec_mult();
-    comm_mod.all_reduce_bsz_dim_QKV_fusion(py, quotient_y, remainder_y, ptr_QKV_tile);
 
-    comm_mod.reconfig_allreduce_axis(0); // 0: px row-wise, 1: py col-wise
+    // simprint.fmt_with_coords("print: all_reduce_QKV_fusion\n", .{});
 
+    comm_mod.all_reduce_with_reset(bsz * 3 * h_dim_p_pe, ptr_QKV_tile, comm_mod.comm_axis.vertical);    // vertical all-reduce of (bsz, 3*h_dim_p_pe)
+
+    // simprint.fmt_with_coords("print: all_reduce_QKV_fusion end, reconfig\n", .{});
+
+    comm_mod.reconfig_allreduce_axis(0, true); // 0: px row-wise, 1: py col-wise, is_in_head is true
+
+    // simprint.fmt_with_coords("print: RoPE\n", .{});
+
+    // positional encoding
     xq_rope();
     xk_rope();
 
+    // simprint.fmt_with_coords("print: score_matvec_mult\n", .{});
+
+    // s_new = q_new @ K_cache: 1. local GEMV, 2. horizontal all-reduce
     score_matvec_mult();
 
-    comm_mod.reconfig_allreduce_axis(1);
+    // simprint.fmt_with_coords("print: reconfig\n", .{});
 
+    comm_mod.reconfig_allreduce_axis(1, false);
+
+    // simprint.fmt_with_coords("print: softmax_score\n", .{});
+
+    // score_new = softmax(s_new): 1. local MAX, 2. vertical all-reduce, 3. local sum(exp), 4. vertical all-reduce
     softmax_score();
 
+    // simprint.fmt_with_coords("print: output_matvec_mult\n", .{});
+
+    // output_new = score_new @ V_cache: 1. local GEMV, 2. vertical all-reduce
     output_matvec_mult();
 
-    comm_mod.reconfig_allreduce_axis(0);
+    // simprint.fmt_with_coords("print: reconfig\n", .{});
 
+    comm_mod.reconfig_allreduce_axis(0, false);
+
+    // simprint.fmt_with_coords("print: o_matvec_mult\n", .{});
+
+    // h1 = output_new @ O_weight: 1. local GEMV, 2. horizontal all-reduce
     o_matvec_mult();
 
+    // simprint.fmt_with_coords("print: attn_residual_add\n", .{});
+
+    // local residual connection (adding input x to h1) to generate z
     attn_residual_add();
 
-    comm_mod.reconfig_allreduce_axis(1);
+    // simprint.fmt_with_coords("print: reconfig\n", .{});
+
+    comm_mod.reconfig_allreduce_axis(1, false);
+
+    // normalization of output z from attention heads (post-norm fashion): 1. local sum(z^2), 
+    // simprint.fmt_with_coords("print: square_sum rmsnorm_z\n", .{});
 
     rmsnorm_z();
 
+    // SwiGLU (Gated Linear Unit): 
+    //  1. up matvec (local) to generate z1
+    //  2. gate matvec (local) to generate z2
+    //  3. fused vertical all-reduce
+    // simprint.fmt_with_coords("print: up_matvec_mult\n", .{});
     up_matvec_mult();
+    // simprint.fmt_with_coords("print: gate_matvec_mult\n", .{});
     gate_matvec_mult();
-    comm_mod.all_reduce_bsz_ffn_dim_ZZ_fusion(py, quotient_y, remainder_y, ptr_ZZ_tile);
+    // simprint.fmt_with_coords("print: all_reduce_ZZ_fusion\n", .{});
+    comm_mod.all_reduce_with_reset(bsz * 2 * ffn_dim_p_pe, ptr_ZZ_tile, comm_mod.comm_axis.vertical);   // vertical all-reduce of (bsz, 2*ffn_dim_p_pe)
+
+    //  4. activate gated vector z2
+    // simprint.fmt_with_coords("print: SiLU\n", .{});
 
     z2_silu();
 
+    //  5. element-wise multiplication between z1 and z2
+    // simprint.fmt_with_coords("print: Z3_mat\n", .{});
+
     z3_mat();
 
-    comm_mod.reconfig_allreduce_axis(0);
+    // simprint.fmt_with_coords("print: reconfig\n", .{});
+
+    comm_mod.reconfig_allreduce_axis(0, false);
+
+    //  6. down matvec h2 = z3 @ W_down : 1. local GEMV, 2. horizontal all-reduce
+    // simprint.fmt_with_coords("print: down_matvec_mult\n", .{});
 
     down_matvec_mult();
 
+    // residual connection h2 = z + h2
+    // simprint.fmt_with_coords("print: ffn_residual_add\n", .{});
+
     ffn_residual_add();
 
-    comm_mod.reconfig_allreduce_axis(1);
+    // simprint.fmt_with_coords("print: reconfig\n", .{});
 
-    decode_entry();
+    comm_mod.reconfig_allreduce_axis(1, false);
+
+    // decode_entry();
 }
 
 fn exit() void {
     timestamp.get_timestamp(&tsc_end_buf);
     timestamp.disable_tsc();
 
-    f_reference_timestamps();
+    // f_reference_timestamps();
     f_memcpy_timestamps();
     sys_mod.unblock_cmd_stream();
 }
@@ -835,21 +1302,28 @@ fn decode_host(total_warmup_times_: i16, total_repeat_times_: i16) void {
     total_repeat_times = total_repeat_times_;
     repeat_times = 0;
 
-    decode_entry();
+    // timestamp.enable_tsc();
+    // timestamp.get_timestamp(&tsc_ref_buf);
+    sync.start();   // @activate(decode_entry_task_id); is called inside
+
+    // decode_entry();
+    timestamp.enable_tsc();
 }
 
-fn decode_entry() void {
+// fn decode_entry() void {
+task decode_entry() void {
     // Run (total_warmup_times + total_repeat_times) times; only the last `total_repeat_times` iterations are timed
+    if (repeat_times == total_warmup_times) {
+        timestamp.reset_tsc_counter(); // start from 0
+        timestamp.get_timestamp(&tsc_start_buf);
+    }
+
+    repeat_times += 1;
+    decode_struct();
     if (repeat_times == total_warmup_times + total_repeat_times) {
         exit();
     } else {
-        if (repeat_times == total_warmup_times) {
-            timestamp.get_timestamp(&tsc_ref_buf);
-            timestamp.get_timestamp(&tsc_start_buf);
-        }
-
-        repeat_times += 1;
-        decode_struct();
+        @activate(decode_entry_task_id);
     }
 }
 
@@ -859,43 +1333,53 @@ fn decode_entry() void {
 // -------------------------------------------------------------------------- //
 
 fn f_memcpy_timestamps() void {
-    var lo_ : u16 = 0;
-    var hi_ : u16 = 0;
-    var word : u32 = 0;
+    // var lo_ : u16 = 0;
+    // var hi_ : u16 = 0;
+    // var word : u32 = 0;
 
-    lo_ = tsc_start_buf[0];
-    hi_ = tsc_start_buf[1];
-    timer_buf[0] = @bitcast(f32, (@as(u32,hi_) << @as(u16,16)) | @as(u32, lo_) );
+    // lo_ = tsc_start_buf[0];
+    // hi_ = tsc_start_buf[1];
+    // timer_buf[0] = @bitcast(f32, (@as(u32,hi_) << @as(u16,16)) | @as(u32, lo_) );
 
-    lo_ = tsc_start_buf[2];
-    hi_ = tsc_end_buf[0];
-    timer_buf[1] = @bitcast(f32, (@as(u32,hi_) << @as(u16,16)) | @as(u32, lo_) );
+    // lo_ = tsc_start_buf[2];
+    // hi_ = tsc_end_buf[0];
+    // timer_buf[1] = @bitcast(f32, (@as(u32,hi_) << @as(u16,16)) | @as(u32, lo_) );
 
-    lo_ = tsc_end_buf[1];
-    hi_ = tsc_end_buf[2];
-    timer_buf[2] = @bitcast(f32, (@as(u32,hi_) << @as(u16,16)) | @as(u32, lo_) );
+    // lo_ = tsc_end_buf[1];
+    // hi_ = tsc_end_buf[2];
+    // timer_buf[2] = @bitcast(f32, (@as(u32,hi_) << @as(u16,16)) | @as(u32, lo_) );
+
+    time_buf_u16[0] = tsc_start_buf[0];
+    time_buf_u16[1] = tsc_start_buf[1];
+    time_buf_u16[2] = tsc_start_buf[2];
+    time_buf_u16[3] = tsc_end_buf[0];
+    time_buf_u16[4] = tsc_end_buf[1];
+    time_buf_u16[5] = tsc_end_buf[2];
 }
 
-fn f_reference_timestamps() void {
-    var lo_ : u16 = 0;
-    var hi_ : u16 = 0;
+// fn f_reference_timestamps() void {
+//     var lo_ : u16 = 0;
+//     var hi_ : u16 = 0;
 
-    lo_ = tsc_ref_buf[0];
-    hi_ = tsc_ref_buf[1];
-    time_ref_f32[0] = @bitcast(f32, (@as(u32,hi_) << @as(u16,16)) | @as(u32, lo_) );
+//     lo_ = tsc_ref_buf[0];
+//     hi_ = tsc_ref_buf[1];
+//     time_ref_f32[0] = @bitcast(f32, (@as(u32,hi_) << @as(u16,16)) | @as(u32, lo_) );
 
-    lo_ = tsc_ref_buf[2];
-    hi_ = 0;
-    time_ref_f32[1] = @bitcast(f32, (@as(u32,hi_) << @as(u16,16)) | @as(u32, lo_) );
-}
+//     lo_ = tsc_ref_buf[2];
+//     hi_ = 0;
+//     time_ref_f32[1] = @bitcast(f32, (@as(u32,hi_) << @as(u16,16)) | @as(u32, lo_) );
+// }
 
 // -------------------------------------------------------------------------- //
 // ------------------------------ Compile-time ------------------------------ //
 // -------------------------------------------------------------------------- //
 
 comptime {
+    @bind_local_task(decode_entry, decode_entry_task_id);
+
     @export_symbol(ptr_X, "X");
     @export_symbol(ptr_W, "W");
+    @export_symbol(ptr_Z, "Z");
     @export_symbol(ptr_Q_weight, "Q_weight");
     @export_symbol(ptr_K_weight, "K_weight");
     @export_symbol(ptr_V_weight, "V_weight");
@@ -907,6 +1391,7 @@ comptime {
     @export_symbol(ptr_UP_weight, "UP_weight");
     @export_symbol(ptr_GATE_weight, "GATE_weight");
     @export_symbol(ptr_DOWN_weight, "DOWN_weight");
+    @export_symbol(ptr_score_mask, "score_mask");
 }
 
 comptime {
@@ -915,7 +1400,8 @@ comptime {
 }
 
 comptime {
-    @export_symbol(ptr_timer_buf, "timer_buf");
-    @export_symbol(ptr_time_ref, "time_ref");
+    // @export_symbol(ptr_timer_buf, "timer_buf");
+    // @export_symbol(ptr_time_ref, "time_ref");
+    @export_symbol(ptr_time_buf_u16, "time_buf");
     @export_symbol(ptr_debug, "debug");
 }

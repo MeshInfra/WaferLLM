@@ -1,0 +1,15 @@
+{
+    "Pw": 64,
+    "Ph": 32,
+    "pe_num_p_h_group": 8,
+    "pe_num_p_v_group": 6,
+    "pe_num_p_group_in_head": 3,
+    "bsz": 4,
+    "dim": 128,
+    "n_heads": 8,
+    "n_kv_heads": 1,
+    "head_dim": 16,
+    "seq_len": 256,
+    "ffn_dim": 384,
+    "layer_num": 32
+}

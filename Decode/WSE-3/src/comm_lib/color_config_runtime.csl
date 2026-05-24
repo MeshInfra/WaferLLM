@@ -1,0 +1,125 @@
+const tile_config = @import_module("<tile_config>");
+const color_config = tile_config.color_config;
+const target = tile_config.target;
+const reg_type = target.reg_type;
+const fabric_io = target.fabric_io;
+
+fn encode_rx_routes(dir: direction, r_state: reg_type) reg_type {
+  var config = r_state;
+  // if (dir == RAMP) {
+  //   config |= @get_int(fabric_io.RX_RAMP);
+  // } else if (dir == NORTH) {
+  //   config |= @get_int(fabric_io.RX_NORTH);
+  // } else if (dir == SOUTH) {
+  //   config |= @get_int(fabric_io.RX_SOUTH);
+  // } else if (dir == EAST) {
+  //   config |= @get_int(fabric_io.RX_EAST);
+  // } else {
+  //   config |= @get_int(fabric_io.RX_WEST);
+  // }
+  var ramp_mask = if (dir == RAMP) @get_int(fabric_io.RX_RAMP) else @get_int(0);
+  var north_mask = if (dir == NORTH) @get_int(fabric_io.RX_NORTH) else @get_int(0);
+  var south_mask = if (dir == SOUTH) @get_int(fabric_io.RX_SOUTH) else @get_int(0);
+  var east_mask = if (dir == EAST) @get_int(fabric_io.RX_EAST) else @get_int(0);
+  var west_mask = if (dir == WEST) @get_int(fabric_io.RX_WEST) else @get_int(0);
+  config |= ramp_mask | north_mask | south_mask | east_mask | west_mask;
+  return config;
+}
+
+
+fn encode_tx_routes(dir: direction, r_state: reg_type) reg_type {
+  var config = r_state;
+  // if (dir == RAMP) {
+  //   config |= @get_int(fabric_io.TX_RAMP);
+  // } else if (dir == NORTH) {
+  //   config |= @get_int(fabric_io.TX_NORTH);
+  // } else if (dir == SOUTH) {
+  //   config |= @get_int(fabric_io.TX_SOUTH);
+  // } else if (dir == EAST) {
+  //   config |= @get_int(fabric_io.TX_EAST);
+  // } else {
+  //   config |= @get_int(fabric_io.TX_WEST);
+  // }
+  var ramp_mask = if (dir == RAMP) @get_int(fabric_io.TX_RAMP) else @get_int(0);
+  var north_mask = if (dir == NORTH) @get_int(fabric_io.TX_NORTH) else @get_int(0);
+  var south_mask = if (dir == SOUTH) @get_int(fabric_io.TX_SOUTH) else @get_int(0);
+  var east_mask = if (dir == EAST) @get_int(fabric_io.TX_EAST) else @get_int(0);
+  var west_mask = if (dir == WEST) @get_int(fabric_io.TX_WEST) else @get_int(0);
+  config |= ramp_mask | north_mask | south_mask | east_mask | west_mask;
+  return config;
+}
+
+
+fn clear_routes(c: anytype) void {
+  const c_ty = @type_of(c);
+  const addr = if (c_ty == reg_type) c else color_config.get_color_config_addr(c);
+  var r_state = @get_config(addr, target.color_addr_range);
+  r_state = r_state & @get_int(fabric_io.CLEAR_MASK);
+  @set_config(addr, r_state, target.color_addr_range);
+}
+
+fn reset_rx_routes(c: anytype, new_rx_route: direction) void {
+  clear_routes(c);
+  const c_ty = @type_of(c);
+  const addr = if (c_ty == reg_type) c else color_config.get_color_config_addr(c);
+  var r_state = @get_config(addr, target.color_addr_range);
+  r_state |= encode_rx_routes(new_rx_route, r_state);
+  @set_config(addr, r_state, target.color_addr_range);
+}
+
+
+fn reset_tx_routes(c: anytype, new_tx_routes: [*]direction, tx_cnt: i16) void {
+  const c_ty = @type_of(c);
+  const addr = if (c_ty == reg_type) c else color_config.get_color_config_addr(c);
+  var r_state = @get_config(addr, target.color_addr_range);
+  for (@range(i16, @as(i16, tx_cnt))) |idx| {
+    r_state |= encode_tx_routes(new_tx_routes[idx], r_state);
+  }
+  @set_config(addr, r_state, target.color_addr_range);
+}
+
+
+
+
+
+// For a given color `c` or a word address `c` of a color configuration
+// register, clear all I/O routes and reset them according to `new_routes`.
+fn reset_routes(c: anytype, new_routes: anytype) void {
+  const c_ty = @type_of(c);
+  const addr = if (c_ty == reg_type) c else color_config.get_color_config_addr(c);
+  var r_state = @get_config(addr, target.color_addr_range);
+  r_state = r_state & @get_int(fabric_io.CLEAR_MASK);
+  if (@has_field(new_routes, "rx")) {
+    const rx_ty = @type_of(new_routes.rx);
+    if (rx_ty == direction) {
+      r_state |= encode_rx_routes(new_routes.rx, r_state);
+    } else {
+      if (@has_field(new_routes, "rx_cnt")) {
+        inline for (@range(i16, new_routes.rx_cnt)) |idx| {
+          r_state |= encode_rx_routes(new_routes.rx[idx], r_state);
+        }
+      } else {
+        inline for (new_routes.rx) |route| {
+          r_state |= encode_rx_routes(route, r_state);
+        }
+      }
+    }
+  }
+  if (@has_field(new_routes, "tx")) {
+    const tx_ty = @type_of(new_routes.tx);
+    if (tx_ty == direction) {
+      r_state |= encode_tx_routes(new_routes.tx, r_state);
+    } else {
+      if (@has_field(new_routes, "tx_cnt")) {
+        inline for (@range(i16, new_routes.tx_cnt)) |idx| {
+          r_state |= encode_tx_routes(new_routes.tx[idx], r_state);
+        }
+      } else {
+        inline for (new_routes.tx) |route| {
+            r_state |= encode_tx_routes(route, r_state);
+        }
+      }
+    }
+  }
+  @set_config(addr, r_state, target.color_addr_range);
+}
