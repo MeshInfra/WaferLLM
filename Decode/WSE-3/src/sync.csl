@@ -1,0 +1,99 @@
+const layout_module = @import_module("<layout>");
+const simprint = @import_module("<simprint>", .{ .enable = true });
+
+param color_1: color;
+param actvt: local_task_id;
+param iq_1;
+param oq_1;
+
+param width: u16;
+param height: u16;
+param is_first_row: bool;
+param is_first_col: bool;
+param is_last_row: bool;
+param is_last_col: bool;
+
+
+var signal: u32 = 0;
+
+var fabout_1 = @get_dsd(fabout_dsd, .{ .output_queue = oq_1, .extent = width+height+13, });
+var fabin_1 = @get_dsd(fabin_dsd, .{ .input_queue = iq_1, .extent = width+height+13, });
+var signal_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &signal, .extent = width+height+13, .stride = 0 });
+var comp_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &signal, .extent = 10, .stride = 0 });
+
+const s1dsr = @get_dsr(dsr_src1, 1);
+const ddsr = @get_dsr(dsr_dest, 1);
+const s0dsr = @get_dsr(dsr_src0, 1);
+
+//make this a rpc
+fn start() void {
+    signal = 0;
+    if (is_last_row and is_last_col) {
+       @load_to_dsr(s1dsr, signal_dsd);
+       @load_to_dsr(ddsr, fabout_1, .{.async = false });
+       signal = 1;
+    } else {
+       @load_to_dsr(ddsr, signal_dsd);
+       @load_to_dsr(s1dsr, fabin_1, .{.async = false });
+    }
+    @mov32(ddsr, s1dsr);
+    delay();
+}
+
+fn delay() void {
+    var pe_id_x = layout_module.get_x_coord();
+    var pe_id_y = layout_module.get_y_coord();
+
+    // do something
+    const latency = 2;
+    const queue_latency = 3;
+    const starter_penalty = 5;
+
+    // var delay = (width - 1 - pe_id_y) * latency + (height - 1 - pe_id_x) * latency + queue_latency;
+    var delay = pe_id_y * latency + pe_id_x * latency + queue_latency;
+    delay += if (is_last_row and is_last_col) starter_penalty else 0;
+    delay = @as(u16, @as(f32, delay) * 0.3333);     // about 3 cycles per item for the compute below (BC, src dest addr overlap)
+
+    @load_to_dsr(s1dsr, comp_dsd);
+    @load_to_dsr(s0dsr, comp_dsd);
+    @set_dsr_length(s0dsr, delay);
+    @set_dsr_length(s1dsr, delay);
+
+    @fmuls(s0dsr, s0dsr, s1dsr);    // requires BANK CONFLICT
+
+    // simprint.fmt_with_coords("sync ends\n", .{});
+
+    @activate(actvt);
+}
+
+comptime {
+
+    if (is_last_row) {
+        if (is_last_col) {
+	   @set_local_color_config(color_1, .{
+	    .routes = .{.rx = .{RAMP}, .tx = .{WEST, NORTH}}, 
+    	   });
+
+        } else if (is_first_col) {
+	   @set_local_color_config(color_1, .{
+	    .routes = .{.rx = .{EAST}, .tx = .{RAMP, NORTH}}, 
+    	   });
+        } else {
+	   @set_local_color_config(color_1, .{
+	    .routes = .{.rx = .{EAST}, .tx = .{RAMP, WEST, NORTH}}, 
+    	   });
+        }
+    } else if (is_first_row) {
+	   @set_local_color_config(color_1, .{
+	    .routes = .{.rx = .{SOUTH}, .tx = .{RAMP}}, 
+    	   });
+    } else {
+	   @set_local_color_config(color_1, .{
+	    .routes = .{.rx = .{SOUTH}, .tx = .{RAMP, NORTH}}, 
+    	   });
+    }
+
+    @initialize_queue(iq_1, .{ .color =  color_1});
+    @initialize_queue(oq_1, .{ .color =  color_1});
+  
+}

@@ -1,29 +1,17 @@
-param P: i16;
-param bsz: i16;
-param dim_p_pe: i16;
-// param pes_p_head: i16;
-// param pes_p_kv_head: i16;
-// param head_dim_p_pe: i16;
-param seq_len_p_pe: i16;
-param ffn_dim_p_pe: i16;
+// ----- Parameters from decode.csl -----
+// general attention block
+param Pw: i16;
+param Ph: i16;
+param pes_p_head: i16;
 
-param pe_num_p_group: i16;
-param root_1st_phase: i16;
-param root_2nd_phase: i16;
+param pe_num_p_first_h_group: i16;
+param pe_num_p_first_v_group: i16;
+param pe_num_p_first_group_in_head: i16;
+param pe_num_p_last_h_group: i16;
+param pe_num_p_last_v_group: i16;
+param pe_num_p_last_group_in_head: i16;
 
-param X_1st_RD_0: comptime_struct;
-param X_1st_RD_1: comptime_struct;
-param Y_1st_RD_0: comptime_struct;
-param Y_1st_RD_1: comptime_struct;
-
-param X_2nd_RD_0: comptime_struct;
-param X_2nd_RD_1: comptime_struct;
-param Y_2nd_RD_0: comptime_struct;
-param Y_2nd_RD_1: comptime_struct;
-
-param X_BD: comptime_struct;
-param Y_BD: comptime_struct;
-
+// color
 param reduce_1st_color_0: color;
 param reduce_1st_color_1: color;
 
@@ -55,1005 +43,2406 @@ const broadcast_send_queue_id = @get_output_queue(7);
 
 const ctrl = @import_module("<control>");
 const tile_config = @import_module("<tile_config>");
-const color_config = tile_config.color_config;
+const color_config = @import_module("comm_lib/color_config_runtime.csl");
+//const color_config = tile_config.color_config;
+const output_queue_status = tile_config.output_queue_status;
+const teardown = tile_config.teardown;
+
+fn is_in_teardown(color_name: color) bool {
+  const base_addr = @as(tile_config.reg_type, tile_config.addresses.COLOR_CONFIG) / tile_config.word_size;
+  const color_id = @get_int(color_name);
+  const color_addr = base_addr + color_id;
+  var state = @get_config(color_addr, tile_config.target.color_addr_range);
+  const mask = 1 << tile_config.target.teardown_in_progress_offset;
+  return @as(bool, state & mask);
+}
+
+fn teardown_exit(color_name: color) void {
+  const base_addr = @as(tile_config.reg_type, tile_config.addresses.COLOR_CONFIG) / tile_config.word_size;
+  const color_id = @get_int(color_name);
+  const color_addr = base_addr + color_id;
+  var state = @get_config(color_addr, tile_config.target.color_addr_range);
+  const mask = 1 << tile_config.target.teardown_in_progress_offset;
+  const is_in_td = @as(bool, state & mask);
+  if (is_in_td) {
+    teardown.exit(color_name);
+  }
+}
+
+var pe_num_p_h_group: i16;
+var pe_num_p_v_group: i16;
+var root_px_1st_phase: i16;
+var root_px_2nd_phase: i16;
+var root_py_1st_phase: i16;
+var root_py_2nd_phase: i16;
+var pe_num_p_group_in_head: i16;
+var root_px_in_head_1st_phase: i16;
+var root_px_in_head_2nd_phase: i16;
+var eff_gnum_x: i16;
+var eff_gnum_y: i16;
+var eff_gnum_xh: i16;
+
+// ************************* state ************************* //
+// each pe can be categorized into certain number of types
+var Y_1st_pe_type: i16 = -1;  // 0~5
+var Y_2nd_pe_type: i16 = -1;  // 0~8
+var Y_reduce_pe_type: i16 = -1;   // 0~23 
+var Y_bdcast_pe_type: i16 = -1;   // 0~1
+var X_1st_pe_type: i16 = -1;  // 0~5
+var X_2nd_pe_type: i16 = -1;  // 0~8
+var X_reduce_pe_type: i16 = -1;   // 0~23 
+var X_bdcast_pe_type: i16 = -1;   // 0~1
+var XH_1st_pe_type: i16 = -1;  // 0~5
+var XH_2nd_pe_type: i16 = -1;  // 0~8
+var XH_reduce_pe_type: i16 = -1;   // 0~23
+var XH_bdcast_pe_type: i16 = -1;   // 0~1
+
+var reduce_pe_type: i16 = -1;
+var bdcast_pe_type: i16 = -1;
+
+// ************************* Enum for axis *********************** //
+const comm_axis = enum(u16) { horizontal, vertical, horizontal_in_head };
+
+// ************************* direction struct ******************** //
+// general attention block
+const RD_T = struct {
+    rx: direction,
+    tx: [1]direction
+};
+var X_1st_RD_0: RD_T = .{ .rx = RAMP, .tx = [1]direction{ RAMP } };
+var X_1st_RD_1: RD_T = .{ .rx = RAMP, .tx = [1]direction{ RAMP } };
+var Y_1st_RD_0: RD_T = .{ .rx = RAMP, .tx = [1]direction{ RAMP } };
+var Y_1st_RD_1: RD_T = .{ .rx = RAMP, .tx = [1]direction{ RAMP } };
+
+var X_2nd_RD_0: RD_T = .{ .rx = RAMP, .tx = [1]direction{ RAMP } };
+var X_2nd_RD_1: RD_T = .{ .rx = RAMP, .tx = [1]direction{ RAMP } };
+var Y_2nd_RD_0: RD_T = .{ .rx = RAMP, .tx = [1]direction{ RAMP } };
+var Y_2nd_RD_1: RD_T = .{ .rx = RAMP, .tx = [1]direction{ RAMP } };
+
+const BD_T = struct {
+    rx: direction,
+    tx: [2]direction,
+    tx_cnt: i16
+};
+
+var X_BD: BD_T = .{ .rx = RAMP, .tx = [2]direction{ RAMP, RAMP }, .tx_cnt = 2 };
+var Y_BD: BD_T = .{ .rx = RAMP, .tx = [2]direction{ RAMP, RAMP }, .tx_cnt = 2 };
+
+// multi-head attention
+var X_1st_RD_IN_H_0: RD_T = .{ .rx = RAMP, .tx = [1]direction{ RAMP } };
+var X_1st_RD_IN_H_1: RD_T = .{ .rx = RAMP, .tx = [1]direction{ RAMP } };
+var X_2nd_RD_IN_H_0: RD_T = .{ .rx = RAMP, .tx = [1]direction{ RAMP } };
+var X_2nd_RD_IN_H_1: RD_T = .{ .rx = RAMP, .tx = [1]direction{ RAMP } };
+var X_BD_IN_H: BD_T = .{ .rx = RAMP, .tx = [2]direction{ RAMP, RAMP }, .tx_cnt = 2 };
 
 const dummy = @zeros([1]f16);
 
-// *************************** RMSNorm bsz ***************************//
+const dummy_dsd = @get_dsd(mem1d_dsd, .{
+    .extent = 1,
+    .base_address = &dummy,
+});
 
-const reduce_1st_0_send_bsz = @get_dsd(fabout_dsd, .{
-    .extent = bsz,
-    .fabric_color = reduce_1st_color_0,
+const ctrl_mem_switch_teardown = @constants([1]u32, comptime ctrl.encode_single_payload(
+  ctrl.opcode.TEARDOWN,    // cmd: teardown the color
+  true,                    // ce_ignore: ignored at CE
+  {},                      // entrypoint: no control task activated
+  0x00                     // data: no dataflow
+));
+
+// ************************* control wavelet *************************//
+
+const ctrl_mem = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{1} -> ctrl_mem_switch_teardown[i] });
+
+const ctrl_1st_0 = @get_dsd(fabout_dsd, .{
     .output_queue = reduce_1st_0_send_queue_id,
-    // .simd_mode = .{ .simd_32 = true },
-    // .simd_mode = .{ .simd_64 = true },
-    .simd_mode = .{ .simd_max = true },
+    .extent = 1,
+    .control = true,
 });
 
-const reduce_1st_0_recv_bsz = @get_dsd(fabin_dsd, .{
-    .extent = bsz,
-    .fabric_color = reduce_1st_color_0,
-    .input_queue = reduce_1st_0_recv_queue_id,
-    // .simd_mode = .{ .simd_32 = true },
-    // .simd_mode = .{ .simd_64 = true },
-    .simd_mode = .{ .simd_max = true },
-});
-
-const reduce_1st_1_send_bsz = @get_dsd(fabout_dsd, .{
-    .extent = bsz,
-    .fabric_color = reduce_1st_color_1,
+const ctrl_1st_1 = @get_dsd(fabout_dsd, .{
     .output_queue = reduce_1st_1_send_queue_id,
-    // .simd_mode = .{ .simd_32 = true },
-    // .simd_mode = .{ .simd_64 = true },
-    .simd_mode = .{ .simd_max = true },
+    .extent = 1,
+    .control = true,
 });
 
-const reduce_1st_1_recv_bsz = @get_dsd(fabin_dsd, .{
-    .extent = bsz,
-    .fabric_color = reduce_1st_color_1,
-    .input_queue = reduce_1st_1_recv_queue_id,
-    // .simd_mode = .{ .simd_32 = true },
-    // .simd_mode = .{ .simd_64 = true },
-    .simd_mode = .{ .simd_max = true },
-});
-
-const reduce_2nd_0_send_bsz = @get_dsd(fabout_dsd, .{
-    .extent = bsz,
-    .fabric_color = reduce_2nd_color_0,
+const ctrl_2nd_0 = @get_dsd(fabout_dsd, .{
     .output_queue = reduce_2nd_0_send_queue_id,
-    // .simd_mode = .{ .simd_32 = true },
-    // .simd_mode = .{ .simd_64 = true },
-    .simd_mode = .{ .simd_max = true },
+    .extent = 1,
+    .control = true,
 });
 
-const reduce_2nd_0_recv_bsz = @get_dsd(fabin_dsd, .{
-    .extent = bsz,
-    .fabric_color = reduce_2nd_color_0,
-    .input_queue = reduce_2nd_0_recv_queue_id,
-    // .simd_mode = .{ .simd_32 = true },
-    // .simd_mode = .{ .simd_64 = true },
-    .simd_mode = .{ .simd_max = true },
-});
-
-const reduce_2nd_1_send_bsz = @get_dsd(fabout_dsd, .{
-    .extent = bsz,
-    .fabric_color = reduce_2nd_color_1,
+const ctrl_2nd_1 = @get_dsd(fabout_dsd, .{
     .output_queue = reduce_2nd_1_send_queue_id,
-    // .simd_mode = .{ .simd_32 = true },
-    // .simd_mode = .{ .simd_64 = true },
-    .simd_mode = .{ .simd_max = true },
+    .extent = 1,
+    .control = true,
 });
 
-const reduce_2nd_1_recv_bsz = @get_dsd(fabin_dsd, .{
-    .extent = bsz,
-    .fabric_color = reduce_2nd_color_1,
-    .input_queue = reduce_2nd_1_recv_queue_id,
-    // .simd_mode = .{ .simd_32 = true },
-    // .simd_mode = .{ .simd_64 = true },
-    .simd_mode = .{ .simd_max = true },
-});
-
-
-const bdcast_send_bsz = @get_dsd(fabout_dsd, .{
-    .extent = bsz,
-    .fabric_color = broadcast_color,
+const ctrl_bdcast = @get_dsd(fabout_dsd, .{
     .output_queue = broadcast_send_queue_id,
-    // .simd_mode = .{ .simd_32 = true },
-    // .simd_mode = .{ .simd_64 = true },
-    .simd_mode = .{ .simd_max = true },
+    .extent = 1,
+    .control = true,
 });
 
-const bdcast_recv_bsz = @get_dsd(fabin_dsd, .{
-    .extent = bsz,
-    .fabric_color = broadcast_color,
-    .input_queue = broadcast_recv_queue_id,
-    // .simd_mode = .{ .simd_32 = true },
-    // .simd_mode = .{ .simd_64 = true },
-    .simd_mode = .{ .simd_max = true },
-});
+// *************************** DSD ***********************************//
+// recv dsd is loaded to dsr_src0
+// send dsd is loaded to dsr_dest
 
-// *************************** bsz * dim_p_pe ***************************//
-const reduce_1st_0_send_bsz_dim = @get_dsd(fabout_dsd, .{
-    .extent = bsz * dim_p_pe,
-    .fabric_color = reduce_1st_color_0,
+const reduce_1st_0_send = @get_dsd(fabout_dsd, .{
+    .extent = 1,
     .output_queue = reduce_1st_0_send_queue_id,
-    // .simd_mode = .{ .simd_32 = true },
-    // .simd_mode = .{ .simd_64 = true },
     .simd_mode = .{ .simd_max = true },
 });
 
-const reduce_1st_0_recv_bsz_dim = @get_dsd(fabin_dsd, .{
-    .extent = bsz * dim_p_pe,
-    .fabric_color = reduce_1st_color_0,
+const reduce_1st_0_recv = @get_dsd(fabin_dsd, .{
+    .extent = 1,
     .input_queue = reduce_1st_0_recv_queue_id,
-    // .simd_mode = .{ .simd_32 = true },
-    // .simd_mode = .{ .simd_64 = true },
     .simd_mode = .{ .simd_max = true },
 });
 
-const reduce_1st_1_send_bsz_dim = @get_dsd(fabout_dsd, .{
-    .extent = bsz * dim_p_pe,
-    .fabric_color = reduce_1st_color_1,
+const reduce_1st_1_send = @get_dsd(fabout_dsd, .{
+    .extent = 1,
     .output_queue = reduce_1st_1_send_queue_id,
-    // .simd_mode = .{ .simd_32 = true },
-    // .simd_mode = .{ .simd_64 = true },
     .simd_mode = .{ .simd_max = true },
 });
 
-const reduce_1st_1_recv_bsz_dim = @get_dsd(fabin_dsd, .{
-    .extent = bsz * dim_p_pe,
-    .fabric_color = reduce_1st_color_1,
+const reduce_1st_1_recv = @get_dsd(fabin_dsd, .{
+    .extent = 1,
     .input_queue = reduce_1st_1_recv_queue_id,
-    // .simd_mode = .{ .simd_32 = true },
-    // .simd_mode = .{ .simd_64 = true },
     .simd_mode = .{ .simd_max = true },
 });
 
-const reduce_2nd_0_send_bsz_dim = @get_dsd(fabout_dsd, .{
-    .extent = bsz * dim_p_pe,
-    .fabric_color = reduce_2nd_color_0,
+const reduce_2nd_0_send = @get_dsd(fabout_dsd, .{
+    .extent = 1,
     .output_queue = reduce_2nd_0_send_queue_id,
-    // .simd_mode = .{ .simd_32 = true },
-    // .simd_mode = .{ .simd_64 = true },
     .simd_mode = .{ .simd_max = true },
 });
 
-const reduce_2nd_0_recv_bsz_dim = @get_dsd(fabin_dsd, .{
-    .extent = bsz * dim_p_pe,
-    .fabric_color = reduce_2nd_color_0,
+const reduce_2nd_0_recv = @get_dsd(fabin_dsd, .{
+    .extent = 1,
     .input_queue = reduce_2nd_0_recv_queue_id,
-    // .simd_mode = .{ .simd_32 = true },
-    // .simd_mode = .{ .simd_64 = true },
     .simd_mode = .{ .simd_max = true },
 });
 
-const reduce_2nd_1_send_bsz_dim = @get_dsd(fabout_dsd, .{
-    .extent = bsz * dim_p_pe,
-    .fabric_color = reduce_2nd_color_1,
+const reduce_2nd_1_send = @get_dsd(fabout_dsd, .{
+    .extent = 1,
     .output_queue = reduce_2nd_1_send_queue_id,
-    // .simd_mode = .{ .simd_32 = true },
-    // .simd_mode = .{ .simd_64 = true },
     .simd_mode = .{ .simd_max = true },
 });
 
-const reduce_2nd_1_recv_bsz_dim = @get_dsd(fabin_dsd, .{
-    .extent = bsz * dim_p_pe,
-    .fabric_color = reduce_2nd_color_1,
+const reduce_2nd_1_recv = @get_dsd(fabin_dsd, .{
+    .extent = 1,
     .input_queue = reduce_2nd_1_recv_queue_id,
-    // .simd_mode = .{ .simd_32 = true },
-    // .simd_mode = .{ .simd_64 = true },
     .simd_mode = .{ .simd_max = true },
 });
 
 
-const bdcast_send_bsz_dim = @get_dsd(fabout_dsd, .{
-    .extent = bsz * dim_p_pe,
-    .fabric_color = broadcast_color,
+const bdcast_send = @get_dsd(fabout_dsd, .{
+    .extent = 1,
     .output_queue = broadcast_send_queue_id,
-    // .simd_mode = .{ .simd_32 = true },
-    // .simd_mode = .{ .simd_64 = true },
     .simd_mode = .{ .simd_max = true },
 });
 
-const bdcast_recv_bsz_dim = @get_dsd(fabin_dsd, .{
-    .extent = bsz * dim_p_pe,
-    .fabric_color = broadcast_color,
+const bdcast_recv = @get_dsd(fabin_dsd, .{
+    .extent = 1,
     .input_queue = broadcast_recv_queue_id,
-    // .simd_mode = .{ .simd_32 = true },
-    // .simd_mode = .{ .simd_64 = true },
     .simd_mode = .{ .simd_max = true },
 });
 
-// *************************** bsz * 3 * dim_p_pe ***************************//
-const reduce_1st_0_send_bsz_dim_QKV_fusion = @get_dsd(fabout_dsd, .{
-    .extent = bsz * 3 * dim_p_pe,
-    .fabric_color = reduce_1st_color_0,
-    .output_queue = reduce_1st_0_send_queue_id,
-    // .simd_mode = .{ .simd_32 = true },
-    // .simd_mode = .{ .simd_64 = true },
-    .simd_mode = .{ .simd_max = true },
-});
+var vector_buf_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &dummy, .extent = 1, });
 
-const reduce_1st_0_recv_bsz_dim_QKV_fusion = @get_dsd(fabin_dsd, .{
-    .extent = bsz * 3 * dim_p_pe,
-    .fabric_color = reduce_1st_color_0,
-    .input_queue = reduce_1st_0_recv_queue_id,
-    // .simd_mode = .{ .simd_32 = true },
-    // .simd_mode = .{ .simd_64 = true },
-    .simd_mode = .{ .simd_max = true },
-});
+var X_BD_ht: BD_T = .{ .rx = RAMP, .tx = [2]direction{ RAMP, RAMP }, .tx_cnt = 1 };
+var X_BD_: BD_T = .{ .rx = RAMP, .tx = [2]direction{ RAMP, RAMP }, .tx_cnt = 2 };
+var Y_BD_: BD_T = .{ .rx = RAMP, .tx = [2]direction{ RAMP, RAMP }, .tx_cnt = 2 };
+var Y_BD_ht: BD_T = .{ .rx = RAMP, .tx = [2]direction{ RAMP, RAMP }, .tx_cnt = 1 };
 
-const reduce_1st_1_send_bsz_dim_QKV_fusion = @get_dsd(fabout_dsd, .{
-    .extent = bsz * 3 * dim_p_pe,
-    .fabric_color = reduce_1st_color_1,
-    .output_queue = reduce_1st_1_send_queue_id,
-    // .simd_mode = .{ .simd_32 = true },
-    // .simd_mode = .{ .simd_64 = true },
-    .simd_mode = .{ .simd_max = true },
-});
+// multi-head attention
+var X_BD_ht_IN_H: BD_T = .{ .rx = RAMP, .tx = [2]direction{ RAMP, RAMP }, .tx_cnt = 1 };
+var X_BD_IN_H_: BD_T = .{ .rx = RAMP, .tx = [2]direction{ RAMP, RAMP }, .tx_cnt = 2 };
 
-const reduce_1st_1_recv_bsz_dim_QKV_fusion = @get_dsd(fabin_dsd, .{
-    .extent = bsz * 3 * dim_p_pe,
-    .fabric_color = reduce_1st_color_1,
-    .input_queue = reduce_1st_1_recv_queue_id,
-    // .simd_mode = .{ .simd_32 = true },
-    // .simd_mode = .{ .simd_64 = true },
-    .simd_mode = .{ .simd_max = true },
-});
+// dsr
+const reduce_1st_0_send_dsr = @get_dsr(dsr_dest, 6);
+const reduce_1st_0_recv_dsr = @get_dsr(dsr_src0, 6);
+// const src1_dsr_6 = @get_dsr(dsr_src1, 6);
 
-const reduce_2nd_0_send_bsz_dim_QKV_fusion = @get_dsd(fabout_dsd, .{
-    .extent = bsz * 3 * dim_p_pe,
-    .fabric_color = reduce_2nd_color_0,
-    .output_queue = reduce_2nd_0_send_queue_id,
-    // .simd_mode = .{ .simd_32 = true },
-    // .simd_mode = .{ .simd_64 = true },
-    .simd_mode = .{ .simd_max = true },
-});
+const reduce_1st_1_send_dsr = @get_dsr(dsr_dest, 7);
+const reduce_1st_1_recv_dsr = @get_dsr(dsr_src0, 7);
+// const src1_dsr_7 = @get_dsr(dsr_src1, 7);
 
-const reduce_2nd_0_recv_bsz_dim_QKV_fusion = @get_dsd(fabin_dsd, .{
-    .extent = bsz * 3 * dim_p_pe,
-    .fabric_color = reduce_2nd_color_0,
-    .input_queue = reduce_2nd_0_recv_queue_id,
-    // .simd_mode = .{ .simd_32 = true },
-    // .simd_mode = .{ .simd_64 = true },
-    .simd_mode = .{ .simd_max = true },
-});
+const reduce_2nd_0_send_dsr = @get_dsr(dsr_dest, 8);
+const reduce_2nd_0_recv_dsr = @get_dsr(dsr_src0, 8);
+// const src1_dsr_8 = @get_dsr(dsr_src1, 8);
 
-const reduce_2nd_1_send_bsz_dim_QKV_fusion = @get_dsd(fabout_dsd, .{
-    .extent = bsz * 3 * dim_p_pe,
-    .fabric_color = reduce_2nd_color_1,
-    .output_queue = reduce_2nd_1_send_queue_id,
-    // .simd_mode = .{ .simd_32 = true },
-    // .simd_mode = .{ .simd_64 = true },
-    .simd_mode = .{ .simd_max = true },
-});
+const reduce_2nd_1_send_dsr = @get_dsr(dsr_dest, 9);
+const reduce_2nd_1_recv_dsr = @get_dsr(dsr_src0, 9);
+// const src1_dsr_9 = @get_dsr(dsr_src1, 9);
 
-const reduce_2nd_1_recv_bsz_dim_QKV_fusion = @get_dsd(fabin_dsd, .{
-    .extent = bsz * 3 * dim_p_pe,
-    .fabric_color = reduce_2nd_color_1,
-    .input_queue = reduce_2nd_1_recv_queue_id,
-    // .simd_mode = .{ .simd_32 = true },
-    // .simd_mode = .{ .simd_64 = true },
-    .simd_mode = .{ .simd_max = true },
-});
+const bdcast_send_dsr = @get_dsr(dsr_dest, 10);
+const bdcast_recv_dsr = @get_dsr(dsr_src0, 10);
+// const src1_dsr_10 = @get_dsr(dsr_src1, 10);
 
+const ctrl_1st_0_dsr = @get_dsr(dsr_dest, 11);
+// const src0_dsr_11 = @get_dsr(dsr_src0, 11);
+// const src1_dsr_11 = @get_dsr(dsr_src1, 11);
+const ctrl_buf_dsr = @get_dsr(dsr_src1, 11);
 
-const bdcast_send_bsz_dim_QKV_fusion = @get_dsd(fabout_dsd, .{
-    .extent = bsz * 3 * dim_p_pe,
-    .fabric_color = broadcast_color,
-    .output_queue = broadcast_send_queue_id,
-    // .simd_mode = .{ .simd_32 = true },
-    // .simd_mode = .{ .simd_64 = true },
-    .simd_mode = .{ .simd_max = true },
-});
+const ctrl_1st_1_dsr = @get_dsr(dsr_dest, 12);
+// const src0_dsr_12 = @get_dsr(dsr_src0, 12);
+// const src1_dsr_12 = @get_dsr(dsr_src1, 12);
 
-const bdcast_recv_bsz_dim_QKV_fusion = @get_dsd(fabin_dsd, .{
-    .extent = bsz * 3 * dim_p_pe,
-    .fabric_color = broadcast_color,
-    .input_queue = broadcast_recv_queue_id,
-    // .simd_mode = .{ .simd_32 = true },
-    // .simd_mode = .{ .simd_64 = true },
-    .simd_mode = .{ .simd_max = true },
-});
+const ctrl_2nd_0_dsr = @get_dsr(dsr_dest, 13);
+// const src0_dsr_13 = @get_dsr(dsr_src0, 13);
+// const src1_dsr_13 = @get_dsr(dsr_src1, 13);
 
-// ************************* bsz * seq_len_p_pe *************************//
-const reduce_1st_0_send_bsz_seq_len = @get_dsd(fabout_dsd, .{
-    .extent = bsz * seq_len_p_pe,
-    .fabric_color = reduce_1st_color_0,
-    .output_queue = reduce_1st_0_send_queue_id,
-    // .simd_mode = .{ .simd_32 = true },
-    // .simd_mode = .{ .simd_64 = true },
-    .simd_mode = .{ .simd_max = true },
-});
+const ctrl_2nd_1_dsr = @get_dsr(dsr_dest, 14);
+// const src0_dsr_14 = @get_dsr(dsr_src0, 14);
+// const src1_dsr_14 = @get_dsr(dsr_src1, 14);
 
-const reduce_1st_0_recv_bsz_seq_len = @get_dsd(fabin_dsd, .{
-    .extent = bsz * seq_len_p_pe,
-    .fabric_color = reduce_1st_color_0,
-    .input_queue = reduce_1st_0_recv_queue_id,
-    // .simd_mode = .{ .simd_32 = true },
-    // .simd_mode = .{ .simd_64 = true },
-    .simd_mode = .{ .simd_max = true },
-});
+const ctrl_bdcast_dsr = @get_dsr(dsr_dest, 15);
+// const src0_dsr_15 = @get_dsr(dsr_src0, 15);
+// const src1_dsr_15 = @get_dsr(dsr_src1, 15);
 
-const reduce_1st_1_send_bsz_seq_len = @get_dsd(fabout_dsd, .{
-    .extent = bsz * seq_len_p_pe,
-    .fabric_color = reduce_1st_color_1,
-    .output_queue = reduce_1st_1_send_queue_id,
-    // .simd_mode = .{ .simd_32 = true },
-    // .simd_mode = .{ .simd_64 = true },
-    .simd_mode = .{ .simd_max = true },
-});
+const vector_buf_ddsr = @get_dsr(dsr_dest, 2);
+const vector_buf_s1dsr = @get_dsr(dsr_src1, 2);
 
-const reduce_1st_1_recv_bsz_seq_len = @get_dsd(fabin_dsd, .{
-    .extent = bsz * seq_len_p_pe,
-    .fabric_color = reduce_1st_color_1,
-    .input_queue = reduce_1st_1_recv_queue_id,
-    // .simd_mode = .{ .simd_32 = true },
-    // .simd_mode = .{ .simd_64 = true },
-    .simd_mode = .{ .simd_max = true },
-});
+fn get_params(
+    px: i16, 
+    quotient_x: i16, 
+    remainder_x: i16, 
+    py: i16, 
+    quotient_y: i16, 
+    remainder_y: i16,
+    px_in_head: i16,
+    quotient_x_in_head: i16,
+    remainder_x_in_head: i16,
+) void {
+    const quotient_x_even: bool = (quotient_x % 2) == 0;
+    const quotient_y_even: bool = (quotient_y % 2) == 0;
+    const remainder_x_even: bool = (remainder_x % 2) == 0;
+    const remainder_y_even: bool = (remainder_y % 2) == 0;
 
-const reduce_2nd_0_send_bsz_seq_len = @get_dsd(fabout_dsd, .{
-    .extent = bsz * seq_len_p_pe,
-    .fabric_color = reduce_2nd_color_0,
-    .output_queue = reduce_2nd_0_send_queue_id,
-    // .simd_mode = .{ .simd_32 = true },
-    // .simd_mode = .{ .simd_64 = true },
-    .simd_mode = .{ .simd_max = true },
-});
+    // @comptime_print("(px, py)=", px, py);
+    // @comptime_print("(quotient_x, remainder_x, quotient_y, remainder_y)=", quotient_x, remainder_x, quotient_y, remainder_y);
+    // @comptime_print("(quotient_x_in_head, remainder_x_in_head)=", quotient_x_in_head, remainder_x_in_head);
+    // @comptime_print(eff_root_1st_x, eff_root_2nd_x, eff_root_1st_y, eff_root_2nd_y, eff_root_1st_xh, eff_root_2nd_xh);
 
-const reduce_2nd_0_recv_bsz_seq_len = @get_dsd(fabin_dsd, .{
-    .extent = bsz * seq_len_p_pe,
-    .fabric_color = reduce_2nd_color_0,
-    .input_queue = reduce_2nd_0_recv_queue_id,
-    // .simd_mode = .{ .simd_32 = true },
-    // .simd_mode = .{ .simd_64 = true },
-    .simd_mode = .{ .simd_max = true },
-});
+    // Phase 1 reduceFn:
+        // remainder_x or remainder_y == root_1st_phase:
+            // Even-numbered remainder_x or remainder_y: color 0 receives from HEAD, color 1 receives from TAIL
+            // Odd-numbered remainder_x or remainder_y: color 1 receives from HEAD, color 0 receives from TAIL
+        // (remainder_x or remainder_y < root_1st_phase):
+            // Even-numbered remainder_x or remainder_y: color 0 receives from HEAD, color 1 sends to TAIL
+            // Odd-numbered remainder_x or remainder_y: color 1 receives from HEAD, color 0 sends to TAIL
+        // (remainder_x or remainder_y > root_1st_phase):
+            // Even-numbered remainder_x or remainder_y: color 1 receives from TAIL, color 0 sends to HEAD
+            // Odd-numbered remainder_x or remainder_y: color 0 receives from TAIL, color 1 sends to HEAD
 
-const reduce_2nd_1_send_bsz_seq_len = @get_dsd(fabout_dsd, .{
-    .extent = bsz * seq_len_p_pe,
-    .fabric_color = reduce_2nd_color_1,
-    .output_queue = reduce_2nd_1_send_queue_id,
-    // .simd_mode = .{ .simd_32 = true },
-    // .simd_mode = .{ .simd_64 = true },
-    .simd_mode = .{ .simd_max = true },
-});
+    // Phase 2 reduceFn:
+        // px or py == root_2nd_phase:
+            // Even-numbered quotient_x or quotient_y: color 0 receives from HEAD, color 1 receives from TAIL
+            // Odd-numbered quotient_x or quotient_y: color 1 receives from HEAD, color 0 receives from TAIL
+        // (px or py < root_2nd_phase) and (remainder_x or remainder_y == root_1st_phase):
+            // Even-numbered quotient_x or quotient_y: color 0 receives from HEAD, color 1 sends to TAIL
+            // Odd-numbered quotient_x or quotient_y: color 1 receives from HEAD, color 0 sends to TAIL
+        // (px or py > root_2nd_phase) and (remainder_x or remainder_y == root_1st_phase):
+            // Even-numbered quotient_x or quotient_y: color 1 receives from TAIL, color 0 sends to HEAD
+            // Odd-numbered quotient_x or quotient_y: color 0 receives from TAIL, color 1 sends to HEAD
 
-const reduce_2nd_1_recv_bsz_seq_len = @get_dsd(fabin_dsd, .{
-    .extent = bsz * seq_len_p_pe,
-    .fabric_color = reduce_2nd_color_1,
-    .input_queue = reduce_2nd_1_recv_queue_id,
-    // .simd_mode = .{ .simd_32 = true },
-    // .simd_mode = .{ .simd_64 = true },
-    .simd_mode = .{ .simd_max = true },
-});
+        // HEAD: WEST, NORTH
+        // TAIL: EAST, SOUTH
 
+    if (remainder_x == root_px_1st_phase) {
+        if (remainder_x_even) {
+            if (remainder_x == pe_num_p_h_group - 1) {
+                X_1st_RD_0.rx = WEST;
+                X_1st_RD_1.rx = RAMP;
+            } else {
+                X_1st_RD_0.rx = WEST;
+                X_1st_RD_1.rx = EAST;
+            }
+        } else {
+            if (remainder_x == pe_num_p_h_group - 1) {
+                X_1st_RD_1.rx = WEST;
+                X_1st_RD_0.rx = RAMP;
+            } else {
+                X_1st_RD_1.rx = WEST;
+                X_1st_RD_0.rx = EAST;
+            }
+        }
+    } else if (remainder_x < root_px_1st_phase) {
+        if (remainder_x_even) {
+            if (remainder_x == 0) {
+                X_1st_RD_0.rx = RAMP;
+                X_1st_RD_0.tx[0] = RAMP;
+                X_1st_RD_1.rx = RAMP;
+                X_1st_RD_1.tx[0] = EAST;
+            } else {
+                X_1st_RD_0.rx = WEST;
+                X_1st_RD_0.tx[0] = RAMP;
+                X_1st_RD_1.rx = RAMP;
+                X_1st_RD_1.tx[0] = EAST;
+            }
+        } else {
+            // remainder_x % 2 == 1
+            X_1st_RD_1.rx = WEST;
+            X_1st_RD_1.tx[0] = RAMP;
+            X_1st_RD_0.rx = RAMP;
+            X_1st_RD_0.tx[0] = EAST;
+        }
+    } else {
+        // remainder_x > root_1st_phase
+        if (remainder_x_even) {
+            if (remainder_x == pe_num_p_h_group - 1) {
+                X_1st_RD_1.rx = RAMP;
+                X_1st_RD_1.tx[0] = RAMP;
+                X_1st_RD_0.rx = RAMP;
+                X_1st_RD_0.tx[0] = WEST;
+            } else {
+                X_1st_RD_1.rx = EAST;
+                X_1st_RD_1.tx[0] = RAMP;
+                X_1st_RD_0.rx = RAMP;
+                X_1st_RD_0.tx[0] = WEST;
+            }
+        } else {
+            // remainder_x % 2 == 1
+            if (remainder_x == pe_num_p_h_group - 1) {
+                X_1st_RD_0.rx = RAMP;
+                X_1st_RD_0.tx[0] = RAMP;
+                X_1st_RD_1.rx = RAMP;
+                X_1st_RD_1.tx[0] = WEST;
+            } else {
+                X_1st_RD_0.rx = EAST;
+                X_1st_RD_0.tx[0] = RAMP;
+                X_1st_RD_1.rx = RAMP;
+                X_1st_RD_1.tx[0] = WEST;
+            }
+        }
+    }
 
-const bdcast_send_bsz_seq_len = @get_dsd(fabout_dsd, .{
-    .extent = bsz * seq_len_p_pe,
-    .fabric_color = broadcast_color,
-    .output_queue = broadcast_send_queue_id,
-    // .simd_mode = .{ .simd_32 = true },
-    // .simd_mode = .{ .simd_64 = true },
-    .simd_mode = .{ .simd_max = true },
-});
+    if (remainder_y == root_py_1st_phase) {
+        if (remainder_y_even) {
+            if (remainder_y == pe_num_p_v_group - 1) {
+                Y_1st_RD_0.rx = NORTH;
+                Y_1st_RD_1.rx = RAMP;
+            } else {
+                Y_1st_RD_0.rx = NORTH;
+                Y_1st_RD_1.rx = SOUTH;
+            }
+        } else {
+            if (remainder_y == pe_num_p_v_group - 1) {
+                Y_1st_RD_1.rx = NORTH;
+                Y_1st_RD_0.rx = RAMP;
+            } else {
+                Y_1st_RD_1.rx = NORTH;
+                Y_1st_RD_0.rx = SOUTH;
+            }
+        }
+    } else if (remainder_y < root_py_1st_phase) {
+        if (remainder_y_even) {
+            if (remainder_y == 0) {
+                Y_1st_RD_0.rx = RAMP;
+                Y_1st_RD_0.tx[0] = RAMP;
+                Y_1st_RD_1.rx = RAMP;
+                Y_1st_RD_1.tx[0] = SOUTH;
+            } else {
+                Y_1st_RD_0.rx = NORTH;
+                Y_1st_RD_0.tx[0] = RAMP;
+                Y_1st_RD_1.rx = RAMP;
+                Y_1st_RD_1.tx[0] = SOUTH;
+            }
+        } else {
+            Y_1st_RD_1.rx = NORTH;
+            Y_1st_RD_1.tx[0] = RAMP;
+            Y_1st_RD_0.rx = RAMP;
+            Y_1st_RD_0.tx[0] = SOUTH;
+        }
+    } else {
+        if (remainder_y_even) {
+            if (remainder_y == pe_num_p_v_group - 1) {
+                Y_1st_RD_1.rx = RAMP;
+                Y_1st_RD_1.tx[0] = RAMP;
+                Y_1st_RD_0.rx = RAMP;
+                Y_1st_RD_0.tx[0] = NORTH;
+            } else {
+                Y_1st_RD_1.rx = SOUTH;
+                Y_1st_RD_1.tx[0] = RAMP;
+                Y_1st_RD_0.rx = RAMP;
+                Y_1st_RD_0.tx[0] = NORTH;
+            }
+        } else {
+            if (remainder_y == pe_num_p_v_group - 1) {
+                Y_1st_RD_0.rx = RAMP;
+                Y_1st_RD_0.tx[0] = RAMP;
+                Y_1st_RD_1.rx = RAMP;
+                Y_1st_RD_1.tx[0] = NORTH;
+            } else {
+                Y_1st_RD_0.rx = SOUTH;
+                Y_1st_RD_0.tx[0] = RAMP;
+                Y_1st_RD_1.rx = RAMP;
+                Y_1st_RD_1.tx[0] = NORTH;
+            }
+        }
+    }
 
-const bdcast_recv_bsz_seq_len = @get_dsd(fabin_dsd, .{
-    .extent = bsz * seq_len_p_pe,
-    .fabric_color = broadcast_color,
-    .input_queue = broadcast_recv_queue_id,
-    // .simd_mode = .{ .simd_32 = true },
-    // .simd_mode = .{ .simd_64 = true },
-    .simd_mode = .{ .simd_max = true },
-});
+    if (remainder_x_in_head == root_px_in_head_1st_phase) {
+        if (remainder_x_in_head % 2 == 0) {
+            if (remainder_x_in_head == pe_num_p_group_in_head - 1) {
+                X_1st_RD_IN_H_0.rx = WEST;
+                X_1st_RD_IN_H_1.rx = RAMP;
+            } else {
+                X_1st_RD_IN_H_0.rx = WEST;
+                X_1st_RD_IN_H_1.rx = EAST;
+            }
+        } else {
+            if (remainder_x_in_head == pe_num_p_group_in_head - 1) {
+                X_1st_RD_IN_H_1.rx = WEST;
+                X_1st_RD_IN_H_0.rx = RAMP;
+            } else {
+                X_1st_RD_IN_H_1.rx = WEST;
+                X_1st_RD_IN_H_0.rx = EAST;
+            }
+        }
+    } else if (remainder_x_in_head < root_px_in_head_1st_phase) {
+        if (remainder_x_in_head % 2 == 0) {
+            if (remainder_x_in_head == 0) {
+                X_1st_RD_IN_H_0.rx = RAMP;
+                X_1st_RD_IN_H_0.tx[0] = RAMP;
+                X_1st_RD_IN_H_1.rx = RAMP;
+                X_1st_RD_IN_H_1.tx[0] = EAST;
+            } else {
+                X_1st_RD_IN_H_0.rx = WEST;
+                X_1st_RD_IN_H_0.tx[0] = RAMP;
+                X_1st_RD_IN_H_1.rx = RAMP;
+                X_1st_RD_IN_H_1.tx[0] = EAST;
+            }
+        } else {
+            if (remainder_x_in_head == 0) {
+                X_1st_RD_IN_H_1.rx = RAMP;
+                X_1st_RD_IN_H_1.tx[0] = RAMP;
+                X_1st_RD_IN_H_0.rx = RAMP;
+                X_1st_RD_IN_H_0.tx[0] = EAST;
+            } else {
+                X_1st_RD_IN_H_1.rx = WEST;
+                X_1st_RD_IN_H_1.tx[0] = RAMP;
+                X_1st_RD_IN_H_0.rx = RAMP;
+                X_1st_RD_IN_H_0.tx[0] = EAST;
+            }
+        }
+    } else {
+        if (remainder_x_in_head % 2 == 0) {
+            if (remainder_x_in_head == pe_num_p_group_in_head - 1) {
+                X_1st_RD_IN_H_1.rx = RAMP;
+                X_1st_RD_IN_H_1.tx[0] = RAMP;
+                X_1st_RD_IN_H_0.rx = RAMP;
+                X_1st_RD_IN_H_0.tx[0] = WEST;
+            } else {
+                X_1st_RD_IN_H_1.rx = EAST;
+                X_1st_RD_IN_H_1.tx[0] = RAMP;
+                X_1st_RD_IN_H_0.rx = RAMP;
+                X_1st_RD_IN_H_0.tx[0] = WEST;
+            }
+        } else {
+            if (remainder_x_in_head == pe_num_p_group_in_head - 1) {
+                X_1st_RD_IN_H_0.rx = RAMP;
+                X_1st_RD_IN_H_0.tx[0] = RAMP;
+                X_1st_RD_IN_H_1.rx = RAMP;
+                X_1st_RD_IN_H_1.tx[0] = WEST;
+            } else {
+                X_1st_RD_IN_H_0.rx = EAST;
+                X_1st_RD_IN_H_0.tx[0] = RAMP;
+                X_1st_RD_IN_H_1.rx = RAMP;
+                X_1st_RD_IN_H_1.tx[0] = WEST;
+            }
+        }
+    }
 
-// ************************* bsz * 2 * ffn_dim_p_pe *************************//
+    if (px == root_px_2nd_phase) {
+        if (root_px_2nd_phase < Pw - pe_num_p_last_h_group) {
+            if (quotient_x_even) {
+                X_2nd_RD_0.rx = WEST;
+                X_2nd_RD_1.rx = EAST;
+            } else {
+                X_2nd_RD_1.rx = WEST;
+                X_2nd_RD_0.rx = EAST;
+            }
+        } else {
+            if (quotient_x_even) {  // should not be selected
+                X_2nd_RD_0.rx = RAMP;
+                X_2nd_RD_1.rx = EAST;
+            } else {
+                X_2nd_RD_1.rx = WEST;
+                X_2nd_RD_0.rx = RAMP;
+            }
+        }
+    } else if (px < root_px_2nd_phase) {    // from WEST to EAST
+        if (remainder_x == root_px_1st_phase) {
+            if (px < pe_num_p_h_group) {
+                X_2nd_RD_0.rx = RAMP;
+                X_2nd_RD_0.tx[0] = RAMP;
+                X_2nd_RD_1.rx = RAMP;
+                X_2nd_RD_1.tx[0] = EAST;
+            } else {
+                if (quotient_x % 2 == 0) {
+                    X_2nd_RD_0.rx = WEST;
+                    X_2nd_RD_0.tx[0] = RAMP;
+                    X_2nd_RD_1.rx = RAMP;
+                    X_2nd_RD_1.tx[0] = EAST;
+                } else {
+                    X_2nd_RD_1.rx = WEST;
+                    X_2nd_RD_1.tx[0] = RAMP;
+                    X_2nd_RD_0.rx = RAMP;
+                    X_2nd_RD_0.tx[0] = EAST;
+                }
+            }
+        } else if (remainder_x > root_px_1st_phase) {
+            if (quotient_x % 2 == 0) {
+                X_2nd_RD_0.rx = RAMP;
+                X_2nd_RD_0.tx[0] = RAMP;
+                X_2nd_RD_1.rx = WEST;
+                X_2nd_RD_1.tx[0] = EAST;
+            } else {
+                X_2nd_RD_0.rx = WEST;
+                X_2nd_RD_0.tx[0] = EAST;
+                X_2nd_RD_1.rx = RAMP;
+                X_2nd_RD_1.tx[0] = RAMP;
+            }
+        } else {
+            if (quotient_x == 0) {
+                // nothing to be relayed
+                X_2nd_RD_0.rx = RAMP;
+                X_2nd_RD_0.tx[0] = RAMP;
+                X_2nd_RD_1.rx = RAMP;
+                X_2nd_RD_1.tx[0] = RAMP;
+            } else if (quotient_x % 2 == 0) {
+                X_2nd_RD_0.rx = WEST;
+                X_2nd_RD_0.tx[0] = EAST;
+                X_2nd_RD_1.rx = RAMP;
+                X_2nd_RD_1.tx[0] = RAMP;
+            } else {
+                X_2nd_RD_0.rx = RAMP;
+                X_2nd_RD_0.tx[0] = RAMP;
+                X_2nd_RD_1.rx = WEST;
+                X_2nd_RD_1.tx[0] = EAST;
+            }
+        }
+    } else {    // from EAST to WEST
+        if (remainder_x == root_px_1st_phase) {
+            if (px > Pw - pe_num_p_last_h_group - 1) {
+                if (quotient_x % 2 == 0) {
+                    X_2nd_RD_1.rx = RAMP;
+                    X_2nd_RD_1.tx[0] = RAMP;
+                    X_2nd_RD_0.rx = RAMP;
+                    X_2nd_RD_0.tx[0] = WEST;
+                } else {
+                    X_2nd_RD_0.rx = RAMP;
+                    X_2nd_RD_0.tx[0] = RAMP;
+                    X_2nd_RD_1.rx = RAMP;
+                    X_2nd_RD_1.tx[0] = WEST;
+                }
+            } else {
+                if (quotient_x % 2 == 0) {
+                    X_2nd_RD_1.rx = EAST;
+                    X_2nd_RD_1.tx[0] = RAMP;
+                    X_2nd_RD_0.rx = RAMP;
+                    X_2nd_RD_0.tx[0] = WEST;
+                } else {
+                    X_2nd_RD_0.rx = EAST;
+                    X_2nd_RD_0.tx[0] = RAMP;
+                    X_2nd_RD_1.rx = RAMP;
+                    X_2nd_RD_1.tx[0] = WEST;
+                }
+            }
+        } else if (remainder_x < root_px_1st_phase) {
+            if (quotient_x % 2 == 0) {
+                X_2nd_RD_0.rx = EAST;
+                X_2nd_RD_0.tx[0] = WEST;
+                X_2nd_RD_1.rx = RAMP;
+                X_2nd_RD_1.tx[0] = RAMP;
+            } else {
+                X_2nd_RD_0.rx = RAMP;
+                X_2nd_RD_0.tx[0] = RAMP;
+                X_2nd_RD_1.rx = EAST;
+                X_2nd_RD_1.tx[0] = WEST;
+            }
+        } else {
+            if (quotient_x == eff_gnum_x - 1) {
+                // nothing to be relayed
+                X_2nd_RD_0.rx = RAMP;
+                X_2nd_RD_0.tx[0] = RAMP;
+                X_2nd_RD_1.rx = RAMP;
+                X_2nd_RD_1.tx[0] = RAMP;
+            } else if (quotient_x % 2 == 0) {
+                X_2nd_RD_0.rx = RAMP;
+                X_2nd_RD_0.tx[0] = RAMP;
+                X_2nd_RD_1.rx = EAST;
+                X_2nd_RD_1.tx[0] = WEST;
+            } else {
+                X_2nd_RD_0.rx = EAST;
+                X_2nd_RD_0.tx[0] = WEST;
+                X_2nd_RD_1.rx = RAMP;
+                X_2nd_RD_1.tx[0] = RAMP;
+            }
+        }
+    }
 
-const reduce_1st_0_send_bsz_ffn_dim_ZZ_fusion = @get_dsd(fabout_dsd, .{
-    .extent = bsz * 2 * ffn_dim_p_pe,
-    .fabric_color = reduce_1st_color_0,
-    .output_queue = reduce_1st_0_send_queue_id,
-    // .simd_mode = .{ .simd_32_or_64 = true },
-    // .simd_mode = .{ .simd_64 = true },
-    .simd_mode = .{ .simd_max = true },
-});
+    if (py == root_py_2nd_phase) {
+        if (root_py_2nd_phase < Ph - pe_num_p_last_v_group) {
+            if (quotient_y_even) {
+                Y_2nd_RD_0.rx = NORTH;
+                Y_2nd_RD_1.rx = SOUTH;
+            } else {
+                Y_2nd_RD_1.rx = NORTH;
+                Y_2nd_RD_0.rx = SOUTH;
+            }
+        } else {
+            if (quotient_y_even) {  // should not be selected
+                Y_2nd_RD_0.rx = RAMP;
+                Y_2nd_RD_1.rx = SOUTH;
+            } else {
+                Y_2nd_RD_1.rx = NORTH;
+                Y_2nd_RD_0.rx = RAMP;
+            }
+        }
+    } else if (py < root_py_2nd_phase) {    // from NORTH to SOUTH
+        if (remainder_y == root_py_1st_phase) {
+            if (py < pe_num_p_v_group) {
+                Y_2nd_RD_0.rx = RAMP;
+                Y_2nd_RD_0.tx[0] = RAMP;
+                Y_2nd_RD_1.rx = RAMP;
+                Y_2nd_RD_1.tx[0] = SOUTH;
+            } else {
+                if (quotient_y % 2 == 0) {
+                    Y_2nd_RD_0.rx = NORTH;
+                    Y_2nd_RD_0.tx[0] = RAMP;
+                    Y_2nd_RD_1.rx = RAMP;
+                    Y_2nd_RD_1.tx[0] = SOUTH;
+                } else {
+                    Y_2nd_RD_1.rx = NORTH;
+                    Y_2nd_RD_1.tx[0] = RAMP;
+                    Y_2nd_RD_0.rx = RAMP;
+                    Y_2nd_RD_0.tx[0] = SOUTH;
+                }
+            }
+        } else if (remainder_y > root_py_1st_phase) {
+            if (quotient_y % 2 == 0) {
+                Y_2nd_RD_0.rx = RAMP;
+                Y_2nd_RD_0.tx[0] = RAMP;
+                Y_2nd_RD_1.rx = NORTH;
+                Y_2nd_RD_1.tx[0] = SOUTH;
+            } else {
+                Y_2nd_RD_0.rx = NORTH;
+                Y_2nd_RD_0.tx[0] = SOUTH;
+                Y_2nd_RD_1.rx = RAMP;
+                Y_2nd_RD_1.tx[0] = RAMP;
+            }
+        } else {
+            if (quotient_y == 0) {
+                // nothing to be relayed
+                Y_2nd_RD_0.rx = RAMP;
+                Y_2nd_RD_0.tx[0] = RAMP;
+                Y_2nd_RD_1.rx = RAMP;
+                Y_2nd_RD_1.tx[0] = RAMP;
+            } else if (quotient_y % 2 == 0) {
+                Y_2nd_RD_0.rx = NORTH;
+                Y_2nd_RD_0.tx[0] = SOUTH;
+                Y_2nd_RD_1.rx = RAMP;
+                Y_2nd_RD_1.tx[0] = RAMP;
+            } else {
+                Y_2nd_RD_0.rx = RAMP;
+                Y_2nd_RD_0.tx[0] = RAMP;
+                Y_2nd_RD_1.rx = NORTH;
+                Y_2nd_RD_1.tx[0] = SOUTH;
+            }
+        }
+    } else {    // from SOUTH to NORTH
+        if (remainder_y == root_py_1st_phase) {
+            if (py > Ph - pe_num_p_last_v_group - 1) {
+                if (quotient_y % 2 == 0) {
+                    Y_2nd_RD_1.rx = RAMP;
+                    Y_2nd_RD_1.tx[0] = RAMP;
+                    Y_2nd_RD_0.rx = RAMP;
+                    Y_2nd_RD_0.tx[0] = NORTH;
+                } else {
+                    Y_2nd_RD_0.rx = RAMP;
+                    Y_2nd_RD_0.tx[0] = RAMP;
+                    Y_2nd_RD_1.rx = RAMP;
+                    Y_2nd_RD_1.tx[0] = NORTH;
+                }
+            } else {
+                if (quotient_y % 2 == 0) {
+                    Y_2nd_RD_1.rx = SOUTH;
+                    Y_2nd_RD_1.tx[0] = RAMP;
+                    Y_2nd_RD_0.rx = RAMP;
+                    Y_2nd_RD_0.tx[0] = NORTH;
+                } else {
+                    Y_2nd_RD_0.rx = SOUTH;
+                    Y_2nd_RD_0.tx[0] = RAMP;
+                    Y_2nd_RD_1.rx = RAMP;
+                    Y_2nd_RD_1.tx[0] = NORTH;
+                }
+            }
+        } else if (remainder_y < root_py_1st_phase) {
+            if (quotient_y % 2 == 0) {
+                Y_2nd_RD_0.rx = SOUTH;
+                Y_2nd_RD_0.tx[0] = NORTH;
+                Y_2nd_RD_1.rx = RAMP;
+                Y_2nd_RD_1.tx[0] = RAMP;
+            } else {
+                Y_2nd_RD_0.rx = RAMP;
+                Y_2nd_RD_0.tx[0] = RAMP;
+                Y_2nd_RD_1.rx = SOUTH;
+                Y_2nd_RD_1.tx[0] = NORTH;
+            }
+        } else {
+            if (quotient_y == eff_gnum_y - 1) {
+                // nothing to be relayed
+                Y_2nd_RD_0.rx = RAMP;
+                Y_2nd_RD_0.tx[0] = RAMP;
+                Y_2nd_RD_1.rx = RAMP;
+                Y_2nd_RD_1.tx[0] = RAMP;
+            } else if (quotient_y % 2 == 0) {
+                Y_2nd_RD_0.rx = RAMP;
+                Y_2nd_RD_0.tx[0] = RAMP;
+                Y_2nd_RD_1.rx = SOUTH;
+                Y_2nd_RD_1.tx[0] = NORTH;
+            } else {
+                Y_2nd_RD_0.rx = SOUTH;
+                Y_2nd_RD_0.tx[0] = NORTH;
+                Y_2nd_RD_1.rx = RAMP;
+                Y_2nd_RD_1.tx[0] = RAMP;
+            }
+        }
+    }
 
-const reduce_1st_0_recv_bsz_ffn_dim_ZZ_fusion = @get_dsd(fabin_dsd, .{
-    .extent = bsz * 2 * ffn_dim_p_pe,
-    .fabric_color = reduce_1st_color_0,
-    .input_queue = reduce_1st_0_recv_queue_id,
-    // .simd_mode = .{ .simd_32_or_64 = true },
-    // .simd_mode = .{ .simd_64 = true },
-    .simd_mode = .{ .simd_max = true },
-});
+    if (px_in_head == root_px_in_head_2nd_phase) {
+        if (root_px_in_head_2nd_phase < pes_p_head - pe_num_p_last_group_in_head) {
+            if (quotient_x_in_head % 2 == 0) {
+                X_2nd_RD_IN_H_0.rx = WEST;
+                X_2nd_RD_IN_H_1.rx = EAST;
+            } else {
+                X_2nd_RD_IN_H_1.rx = WEST;
+                X_2nd_RD_IN_H_0.rx = EAST;
+            }
+        } else {
+            if (quotient_x_in_head % 2 == 0) {  // should not be selected
+                X_2nd_RD_IN_H_0.rx = RAMP;
+                X_2nd_RD_IN_H_1.rx = EAST;
+            } else {
+                X_2nd_RD_IN_H_1.rx = WEST;
+                X_2nd_RD_IN_H_0.rx = RAMP;
+            }
+        }
+    } else if (px_in_head < root_px_in_head_2nd_phase) {    // from WEST to EAST
+        if (remainder_x_in_head == root_px_in_head_1st_phase) {
+            if (px_in_head < pe_num_p_group_in_head) {
+                X_2nd_RD_IN_H_0.rx = RAMP;
+                X_2nd_RD_IN_H_0.tx[0] = RAMP;
+                X_2nd_RD_IN_H_1.rx = RAMP;
+                X_2nd_RD_IN_H_1.tx[0] = EAST;
+            } else {
+                if (quotient_x_in_head % 2 == 0) {
+                    X_2nd_RD_IN_H_0.rx = WEST;
+                    X_2nd_RD_IN_H_0.tx[0] = RAMP;
+                    X_2nd_RD_IN_H_1.rx = RAMP;
+                    X_2nd_RD_IN_H_1.tx[0] = EAST;
+                } else {
+                    X_2nd_RD_IN_H_1.rx = WEST;
+                    X_2nd_RD_IN_H_1.tx[0] = RAMP;
+                    X_2nd_RD_IN_H_0.rx = RAMP;
+                    X_2nd_RD_IN_H_0.tx[0] = EAST;
+                }
+            }
+        } else if (remainder_x_in_head > root_px_in_head_1st_phase) {
+            if (quotient_x_in_head % 2 == 0) {
+                X_2nd_RD_IN_H_0.rx = RAMP;
+                X_2nd_RD_IN_H_0.tx[0] = RAMP;
+                X_2nd_RD_IN_H_1.rx = WEST;
+                X_2nd_RD_IN_H_1.tx[0] = EAST;
+            } else {
+                X_2nd_RD_IN_H_0.rx = WEST;
+                X_2nd_RD_IN_H_0.tx[0] = EAST;
+                X_2nd_RD_IN_H_1.rx = RAMP;
+                X_2nd_RD_IN_H_1.tx[0] = RAMP;
+            }
+        } else {
+            if (quotient_x_in_head == 0) {
+                // nothing to be relayed
+                X_2nd_RD_IN_H_0.rx = RAMP;
+                X_2nd_RD_IN_H_0.tx[0] = RAMP;
+                X_2nd_RD_IN_H_1.rx = RAMP;
+                X_2nd_RD_IN_H_1.tx[0] = RAMP;
+            } else if (quotient_x_in_head % 2 == 0) {
+                X_2nd_RD_IN_H_0.rx = WEST;
+                X_2nd_RD_IN_H_0.tx[0] = EAST;
+                X_2nd_RD_IN_H_1.rx = RAMP;
+                X_2nd_RD_IN_H_1.tx[0] = RAMP;
+            } else {
+                X_2nd_RD_IN_H_0.rx = RAMP;
+                X_2nd_RD_IN_H_0.tx[0] = RAMP;
+                X_2nd_RD_IN_H_1.rx = WEST;
+                X_2nd_RD_IN_H_1.tx[0] = EAST;
+            }
+        }
+    } else {    // from EAST to WEST
+        if (remainder_x_in_head == root_px_in_head_1st_phase) {
+            if (px_in_head > pes_p_head - pe_num_p_last_group_in_head - 1) {
+                if (quotient_x_in_head % 2 == 0) {
+                    X_2nd_RD_IN_H_1.rx = RAMP;
+                    X_2nd_RD_IN_H_1.tx[0] = RAMP;
+                    X_2nd_RD_IN_H_0.rx = RAMP;
+                    X_2nd_RD_IN_H_0.tx[0] = WEST;
+                } else {
+                    X_2nd_RD_IN_H_0.rx = RAMP;
+                    X_2nd_RD_IN_H_0.tx[0] = RAMP;
+                    X_2nd_RD_IN_H_1.rx = RAMP;
+                    X_2nd_RD_IN_H_1.tx[0] = WEST;
+                }
+            } else {
+                if (quotient_x_in_head % 2 == 0) {
+                    X_2nd_RD_IN_H_1.rx = EAST;
+                    X_2nd_RD_IN_H_1.tx[0] = RAMP;
+                    X_2nd_RD_IN_H_0.rx = RAMP;
+                    X_2nd_RD_IN_H_0.tx[0] = WEST;
+                } else {
+                    X_2nd_RD_IN_H_0.rx = EAST;
+                    X_2nd_RD_IN_H_0.tx[0] = RAMP;
+                    X_2nd_RD_IN_H_1.rx = RAMP;
+                    X_2nd_RD_IN_H_1.tx[0] = WEST;
+                }
+            }
+        } else if (remainder_x_in_head < root_px_in_head_1st_phase) {
+            if (quotient_x_in_head % 2 == 0) {
+                X_2nd_RD_IN_H_0.rx = EAST;
+                X_2nd_RD_IN_H_0.tx[0] = WEST;
+                X_2nd_RD_IN_H_1.rx = RAMP;
+                X_2nd_RD_IN_H_1.tx[0] = RAMP;
+            } else {
+                X_2nd_RD_IN_H_0.rx = RAMP;
+                X_2nd_RD_IN_H_0.tx[0] = RAMP;
+                X_2nd_RD_IN_H_1.rx = EAST;
+                X_2nd_RD_IN_H_1.tx[0] = WEST;
+            }
+        } else {
+            if (quotient_x_in_head == eff_gnum_xh - 1) {
+                // nothing to be relayed
+                X_2nd_RD_IN_H_0.rx = RAMP;
+                X_2nd_RD_IN_H_0.tx[0] = RAMP;
+                X_2nd_RD_IN_H_1.rx = RAMP;
+                X_2nd_RD_IN_H_1.tx[0] = RAMP;
+            } else if (quotient_x_in_head % 2 == 0) {
+                X_2nd_RD_IN_H_0.rx = RAMP;
+                X_2nd_RD_IN_H_0.tx[0] = RAMP;
+                X_2nd_RD_IN_H_1.rx = EAST;
+                X_2nd_RD_IN_H_1.tx[0] = WEST;
+            } else {
+                X_2nd_RD_IN_H_0.rx = EAST;
+                X_2nd_RD_IN_H_0.tx[0] = WEST;
+                X_2nd_RD_IN_H_1.rx = RAMP;
+                X_2nd_RD_IN_H_1.tx[0] = RAMP;
+            }
+        }
+    }
 
-const reduce_1st_1_send_bsz_ffn_dim_ZZ_fusion = @get_dsd(fabout_dsd, .{
-    .extent = bsz * 2 * ffn_dim_p_pe,
-    .fabric_color = reduce_1st_color_1,
-    .output_queue = reduce_1st_1_send_queue_id,
-    // .simd_mode = .{ .simd_32_or_64 = true },
-    // .simd_mode = .{ .simd_64 = true },
-    .simd_mode = .{ .simd_max = true },
-});
+    // general attention block
+    if (px == root_px_2nd_phase) {
+        X_BD_.rx = RAMP;
+        X_BD_.tx[0] = WEST;
+        X_BD_.tx[1] = EAST;
+        X_BD_.tx_cnt = 2;
+     } else if (px < root_px_2nd_phase) {
+        if (px == 0) {
+            X_BD_ht.rx = EAST;
+            X_BD_ht.tx[0] = RAMP;
+            X_BD_ht.tx[1] = RAMP;
+            X_BD_ht.tx_cnt = 1;
+        } else {
+            X_BD_.rx = EAST;
+            X_BD_.tx[0] = WEST;
+            X_BD_.tx[1] = RAMP;
+            X_BD_.tx_cnt = 2;
+        }
+    } else {
+        // px > root_2nd_phase
+        if (px == Pw - 1) {
+            X_BD_ht.rx = WEST;
+            X_BD_ht.tx[0] = RAMP;
+            X_BD_ht.tx[1] = RAMP;
+            X_BD_ht.tx_cnt = 1;
+        } else {
+            X_BD_.rx = WEST;
+            X_BD_.tx[0] = RAMP;
+            X_BD_.tx[1] = EAST;
+            X_BD_.tx_cnt = 2;
+        }
+    }
 
-const reduce_1st_1_recv_bsz_ffn_dim_ZZ_fusion = @get_dsd(fabin_dsd, .{
-    .extent = bsz * 2 * ffn_dim_p_pe,
-    .fabric_color = reduce_1st_color_1,
-    .input_queue = reduce_1st_1_recv_queue_id,
-    // .simd_mode = .{ .simd_32_or_64 = true },
-    // .simd_mode = .{ .simd_64 = true },
-    .simd_mode = .{ .simd_max = true },
-});
+    if (py == root_py_2nd_phase) {
+        Y_BD_.rx = RAMP;
+        Y_BD_.tx[0] = NORTH;
+        Y_BD_.tx[1] = SOUTH;
+        Y_BD_.tx_cnt = 2;
+    } else if (py < root_py_2nd_phase) {
+        if (py == 0) {
+            Y_BD_ht.rx = SOUTH;
+            Y_BD_ht.tx[0] = RAMP;
+            Y_BD_ht.tx[1] = RAMP;
+            Y_BD_ht.tx_cnt = 1;
+        } else {
+            Y_BD_.rx = SOUTH;
+            Y_BD_.tx[0] = NORTH;
+            Y_BD_.tx[1] = RAMP;
+            Y_BD_.tx_cnt = 2;
+        }
+    } else {
+        // py > root_2nd_phase
+        if (py == Ph - 1) {
+            Y_BD_ht.rx = NORTH;
+            Y_BD_ht.tx[0] = RAMP;
+            Y_BD_ht.tx[1] = RAMP;
+            Y_BD_ht.tx_cnt = 1;
+        } else {
+            Y_BD_.rx = NORTH;
+            Y_BD_.tx[0] = RAMP;
+            Y_BD_.tx[1] = SOUTH;
+            Y_BD_.tx_cnt = 2;
+        }
+    }
 
-const reduce_2nd_0_send_bsz_ffn_dim_ZZ_fusion = @get_dsd(fabout_dsd, .{
-    .extent = bsz * 2 * ffn_dim_p_pe,
-    .fabric_color = reduce_2nd_color_0,
-    .output_queue = reduce_2nd_0_send_queue_id,
-    // .simd_mode = .{ .simd_32_or_64 = true },
-    // .simd_mode = .{ .simd_64 = true },
-    .simd_mode = .{ .simd_max = true },
-});
+    // multi-head attention
+    if (px_in_head == root_px_in_head_2nd_phase) {
+        X_BD_IN_H_.rx = RAMP;
+        X_BD_IN_H_.tx[0] = WEST;
+        X_BD_IN_H_.tx[1] = EAST;
+        X_BD_IN_H_.tx_cnt = 2;
+        X_BD_ht_IN_H.rx = RAMP;
+        X_BD_ht_IN_H.tx[0] = WEST;
+        X_BD_ht_IN_H.tx[1] = RAMP;
+        X_BD_ht_IN_H.tx_cnt = 1;
+    } else if (px_in_head < root_px_in_head_2nd_phase) {
+        if (px_in_head == 0) {
+            X_BD_ht_IN_H.rx = EAST;
+            X_BD_ht_IN_H.tx[0] = RAMP;
+            X_BD_ht_IN_H.tx[1] = RAMP;
+            X_BD_ht_IN_H.tx_cnt = 1;
+        } else {
+            X_BD_IN_H_.rx = EAST;
+            X_BD_IN_H_.tx[0] = WEST;
+            X_BD_IN_H_.tx[1] = RAMP;
+            X_BD_IN_H_.tx_cnt = 2;
+        }
+    } else {
+        // px_in_head > eff_root_2nd_xh
+        if (px_in_head == pes_p_head - 1) {
+            X_BD_ht_IN_H.rx = WEST;
+            X_BD_ht_IN_H.tx[0] = RAMP;
+            X_BD_ht_IN_H.tx[1] = RAMP;
+            X_BD_ht_IN_H.tx_cnt = 1;
+        } else {
+            X_BD_IN_H_.rx = WEST;
+            X_BD_IN_H_.tx[0] = RAMP;
+            X_BD_IN_H_.tx[1] = EAST;
+            X_BD_IN_H_.tx_cnt = 2;
+        }
+    }
 
-const reduce_2nd_0_recv_bsz_ffn_dim_ZZ_fusion = @get_dsd(fabin_dsd, .{
-    .extent = bsz * 2 * ffn_dim_p_pe,
-    .fabric_color = reduce_2nd_color_0,
-    .input_queue = reduce_2nd_0_recv_queue_id,
-    // .simd_mode = .{ .simd_32_or_64 = true },
-    // .simd_mode = .{ .simd_64 = true },
-    .simd_mode = .{ .simd_max = true },
-});
-
-const reduce_2nd_1_send_bsz_ffn_dim_ZZ_fusion = @get_dsd(fabout_dsd, .{
-    .extent = bsz * 2 * ffn_dim_p_pe,
-    .fabric_color = reduce_2nd_color_1,
-    .output_queue = reduce_2nd_1_send_queue_id,
-    // .simd_mode = .{ .simd_32_or_64 = true },
-    // .simd_mode = .{ .simd_64 = true },
-    .simd_mode = .{ .simd_max = true },
-});
-
-const reduce_2nd_1_recv_bsz_ffn_dim_ZZ_fusion = @get_dsd(fabin_dsd, .{
-    .extent = bsz * 2 * ffn_dim_p_pe,
-    .fabric_color = reduce_2nd_color_1,
-    .input_queue = reduce_2nd_1_recv_queue_id,
-    // .simd_mode = .{ .simd_32_or_64 = true },
-    // .simd_mode = .{ .simd_64 = true },
-    .simd_mode = .{ .simd_max = true },
-});
-
-
-const bdcast_send_bsz_ffn_dim_ZZ_fusion = @get_dsd(fabout_dsd, .{
-    .extent = bsz * 2 * ffn_dim_p_pe,
-    .fabric_color = broadcast_color,
-    .output_queue = broadcast_send_queue_id,
-    // .simd_mode = .{ .simd_32_or_64 = true },
-    // .simd_mode = .{ .simd_64 = true },
-    .simd_mode = .{ .simd_max = true },
-});
-
-const bdcast_recv_bsz_ffn_dim_ZZ_fusion = @get_dsd(fabin_dsd, .{
-    .extent = bsz * 2 * ffn_dim_p_pe,
-    .fabric_color = broadcast_color,
-    .input_queue = broadcast_recv_queue_id,
-    // .simd_mode = .{ .simd_32_or_64 = true },
-    // .simd_mode = .{ .simd_64 = true },
-    .simd_mode = .{ .simd_max = true },
-});
-
-var vector_buf_dsd_bsz = @get_dsd(mem1d_dsd, .{ .base_address = &dummy, .extent = bsz });
-var vector_buf_dsd_bsz_dim = @get_dsd(mem1d_dsd, .{ .base_address = &dummy, .extent = bsz * dim_p_pe });
-var vector_buf_dsd_bsz_dim_QKV_fusion = @get_dsd(mem1d_dsd, .{ .base_address = &dummy, .extent = bsz * 3 * dim_p_pe });
-var vector_buf_dsd_bsz_seq_len = @get_dsd(mem1d_dsd, .{ .base_address = &dummy, .extent = bsz * seq_len_p_pe });
-var vector_buf_dsd_bsz_ffn_dim_ZZ_fusion = @get_dsd(mem1d_dsd, .{ .base_address = &dummy, .extent = bsz * 2 * ffn_dim_p_pe });
-const vector_buf_dsr = @get_dsr(dsr_src1, 2);
-
-fn init() void {
-    color_config.reset_routes(reduce_1st_color_0, Y_1st_RD_0);
-    color_config.reset_routes(reduce_1st_color_1, Y_1st_RD_1);
-
-    color_config.reset_routes(reduce_2nd_color_0, Y_2nd_RD_0);
-    color_config.reset_routes(reduce_2nd_color_1, Y_2nd_RD_1);
-
-    color_config.reset_routes(broadcast_color, Y_BD);
+    X_BD = if (px == 0 or px == Pw - 1) X_BD_ht else X_BD_;
+    Y_BD = if (py == 0 or py == Ph - 1) Y_BD_ht else Y_BD_;
+    X_BD_IN_H = if (px_in_head == 0 or px_in_head == pes_p_head - 1) X_BD_ht_IN_H else X_BD_IN_H_;
 }
 
-fn all_reduce_bsz(pe_id: i16, quotient_pe_id: i16, remainder_pe_id: i16, vector_buf_ptr: [*]f16) void {
-    vector_buf_dsd_bsz = @set_dsd_base_addr(vector_buf_dsd_bsz, vector_buf_ptr);
-    @load_to_dsr(vector_buf_dsr, vector_buf_dsd_bsz);
+fn init(
+    px: i16, 
+    quotient_x: i16, 
+    remainder_x: i16, 
+    py: i16, 
+    quotient_y: i16, 
+    remainder_y: i16,
+    px_in_head: i16,
+    quotient_x_in_head: i16,
+    remainder_x_in_head: i16,
+    _pe_num_p_h_group: i16, 
+    _pe_num_p_v_group: i16,
+    _root_px_1st_phase: i16,
+    _root_px_2nd_phase: i16,
+    _root_py_1st_phase: i16,
+    _root_py_2nd_phase: i16,
+    _pe_num_p_group_in_head: i16,
+    _root_px_in_head_1st_phase: i16,
+    _root_px_in_head_2nd_phase: i16,
+) void {
+    // calculation
+    pe_num_p_h_group = _pe_num_p_h_group;
+    pe_num_p_v_group = _pe_num_p_v_group;
+    root_px_1st_phase = _root_px_1st_phase;
+    root_px_2nd_phase = _root_px_2nd_phase;
+    root_py_1st_phase = _root_py_1st_phase;
+    root_py_2nd_phase = _root_py_2nd_phase;
+    pe_num_p_group_in_head = _pe_num_p_group_in_head;
+    root_px_in_head_1st_phase = _root_px_in_head_1st_phase;
+    root_px_in_head_2nd_phase = _root_px_in_head_2nd_phase;
 
-    // 1st phase reduce
-    if (remainder_pe_id == root_1st_phase) {
-        if (root_1st_phase < pe_num_p_group - 1) {
-            @faddh(vector_buf_dsd_bsz, reduce_1st_0_recv_bsz, vector_buf_dsr);
+    // ================================================================ //
+    // Compute effective per-PE root values (supports fractional groups) //
+    // ================================================================ //
+
+    // --- X direction (general attention) ---
+    const h_group_num: i16 = Pw / pe_num_p_first_h_group;
+    const h_rem: i16 = Pw - h_group_num * pe_num_p_first_h_group;
+    eff_gnum_x = h_group_num + (if (h_rem > 0) @as(i16, 1) else @as(i16, 0));
+
+    // --- Y direction (general attention) ---
+    const v_group_num: i16 = Ph / pe_num_p_first_v_group;
+    const v_rem: i16 = Ph - v_group_num * pe_num_p_first_v_group;
+    eff_gnum_y = v_group_num + (if (v_rem > 0) @as(i16, 1) else @as(i16, 0));
+
+    // --- X direction (in-head, multi-head attention) ---
+    const group_num_in_head: i16 = pes_p_head / pe_num_p_first_group_in_head;
+    const head_rem: i16 = pes_p_head - group_num_in_head * pe_num_p_first_group_in_head;
+    eff_gnum_xh = group_num_in_head + (if (head_rem > 0) @as(i16, 1) else @as(i16, 0));
+
+    get_params(px, quotient_x, remainder_x, py, quotient_y, remainder_y, px_in_head, quotient_x_in_head, remainder_x_in_head);
+
+    // ================================================================ //
+    // Categorize PE into a type    //
+    // ================================================================ //
+    // type in a horizontal all-reduce (1st phase)
+    if (remainder_x == root_px_1st_phase) {
+        if (root_px_1st_phase < pe_num_p_h_group - 1) {
+            X_1st_pe_type = 0;
         }
-        @faddh(vector_buf_dsd_bsz, reduce_1st_1_recv_bsz, vector_buf_dsr);
-    } else if (remainder_pe_id > root_1st_phase) {
-        if (remainder_pe_id % 2 == 0) {
-            if (remainder_pe_id == pe_num_p_group - 1) {
-                @fmovh(reduce_1st_0_send_bsz, vector_buf_dsr);
+        else {
+            X_1st_pe_type = 1;
+        }
+    } else if (remainder_x > root_px_1st_phase) {
+        if (remainder_x % 2 == 0) {
+            if (remainder_x == pe_num_p_h_group - 1) { 
+                X_1st_pe_type = 2;
             } else {
-                @faddh(reduce_1st_0_send_bsz, reduce_1st_1_recv_bsz, vector_buf_dsr);
+                X_1st_pe_type = 3;
             }
         } else {
-            // remainder_pe_id % 2 == 1
-            if (remainder_pe_id == pe_num_p_group - 1) {
-                @fmovh(reduce_1st_1_send_bsz, vector_buf_dsr);
+            // remainder_x % 2 == 1
+            if (remainder_x == pe_num_p_h_group - 1) {
+                X_1st_pe_type = 4;
             } else {
-                @faddh(reduce_1st_1_send_bsz, reduce_1st_0_recv_bsz, vector_buf_dsr);
+                X_1st_pe_type = 5;
             }
         }
     } else {
-        // remainder_pe_id < root_1st_phase
-        if (remainder_pe_id % 2 == 0) {
-            if (remainder_pe_id == 0) {
-                @fmovh(reduce_1st_1_send_bsz, vector_buf_dsr);
+        // remainder_x < root_1st_phase
+        if (remainder_x % 2 == 0) {
+            if (remainder_x == 0) {
+                X_1st_pe_type = 4;
             } else {
-                @faddh(reduce_1st_1_send_bsz, reduce_1st_0_recv_bsz, vector_buf_dsr);
+                X_1st_pe_type = 5;
             }
         } else {
-            // remainder_pe_id never be 0
-            @faddh(reduce_1st_0_send_bsz, reduce_1st_1_recv_bsz, vector_buf_dsr);
+            // remainder_x never be 0
+            X_1st_pe_type = 3;
         }
     }
 
-    // 2nd phase reduce
-    if (pe_id == root_2nd_phase) {
-        if (root_2nd_phase < P - pe_num_p_group) {
-            @faddh(vector_buf_dsd_bsz, reduce_2nd_0_recv_bsz, vector_buf_dsr);
+    // type in a horizontal all-reduce (2nd phase)
+    if (px == root_px_2nd_phase) {
+        if (root_px_2nd_phase < Pw - pe_num_p_last_h_group) {
+            X_2nd_pe_type = 0;
         }
-        @faddh(vector_buf_dsd_bsz, reduce_2nd_1_recv_bsz, vector_buf_dsr);
-    } else if (pe_id > root_2nd_phase) {
-        if (remainder_pe_id == root_1st_phase) {
-            if (pe_id > P - pe_num_p_group - 1) {
-                if (quotient_pe_id % 2 == 0) {
-                    @fmovh(reduce_2nd_0_send_bsz, vector_buf_dsr);
+        else {
+            X_2nd_pe_type = 1;
+        }
+    } else if (px > root_px_2nd_phase) {
+        if (remainder_x == root_px_1st_phase) {
+            if (px > Pw - pe_num_p_last_h_group - 1) {
+                if (quotient_x % 2 == 0) {
+                    X_2nd_pe_type = 2;
                 } else {
-                    @fmovh(reduce_2nd_1_send_bsz, vector_buf_dsr);
+                    X_2nd_pe_type = 3;
                 }
             } else {
-                if (quotient_pe_id % 2 == 0) {
-                    @faddh(reduce_2nd_0_send_bsz, reduce_2nd_1_recv_bsz, vector_buf_dsr);
+                if (quotient_x % 2 == 0) {
+                    X_2nd_pe_type = 4;
                 } else {
-                    @faddh(reduce_2nd_1_send_bsz, reduce_2nd_0_recv_bsz, vector_buf_dsr);
+                    X_2nd_pe_type = 5;
                 }
             }
         }
-    } else {
-        if (remainder_pe_id == root_1st_phase) {
-            if (pe_id < pe_num_p_group) {
-                @fmovh(reduce_2nd_1_send_bsz, vector_buf_dsr);
+        else if (remainder_x < root_px_1st_phase) {
+            if (quotient_x % 2 == 0) {
+                // reduce_2nd_color_0 is already managed
+                X_2nd_pe_type = 6;
             } else {
-                if (quotient_pe_id % 2 == 0) {
-                    @faddh(reduce_2nd_1_send_bsz, reduce_2nd_0_recv_bsz, vector_buf_dsr);
+                // reduce_2nd_color_1 is already managed
+                X_2nd_pe_type = 7;
+            }
+        } else {
+            // remainder_x > root_1st_phase
+            if (quotient_x == eff_gnum_x - 1) {
+                // relay nothing = teardown both
+                X_2nd_pe_type = 8;
+            } else if (quotient_x % 2 == 0) {
+                // reduce_2nd_color_1 is already managed
+                X_2nd_pe_type = 7;
+            } else {
+                // reduce_2nd_color_0 is already managed
+                X_2nd_pe_type = 6;
+            }
+        }
+    } else {
+        if (remainder_x == root_px_1st_phase) {
+            if (px < pe_num_p_h_group) {
+                X_2nd_pe_type = 3;
+            } else {
+                if (quotient_x % 2 == 0) {
+                    X_2nd_pe_type = 5;
                 } else {
-                    @faddh(reduce_2nd_0_send_bsz, reduce_2nd_1_recv_bsz, vector_buf_dsr);
+                    X_2nd_pe_type = 4;
                 }
+            }
+        }
+        else if (remainder_x > root_px_1st_phase) {
+            if (quotient_x % 2 == 0) {
+                // reduce_2nd_color_1 is already managed
+                X_2nd_pe_type = 7;
+            } else {
+                // reduce_2nd_color_0 is already managed
+                X_2nd_pe_type = 6;
+            }
+        } else {
+            if (quotient_x == 0) {
+                // relay nothing = teardown both
+                X_2nd_pe_type = 8;
+            } else if (quotient_x % 2 == 0) {
+                // reduce_2nd_color_0 is already managed
+                X_2nd_pe_type = 6;
+            } else {
+                // reduce_2nd_color_1 is already managed
+                X_2nd_pe_type = 7;
             }
         }
     }
 
-    // Broadcast
-    if (pe_id == root_2nd_phase) {
-        @mov16(bdcast_send_bsz, vector_buf_dsr);
+    // type in a horizontal all-reduce
+    if (X_1st_pe_type <= 1) {
+        if (X_2nd_pe_type <= 1) {
+            X_reduce_pe_type = X_1st_pe_type * 2 + X_2nd_pe_type;            // 0..3
+        } else {
+            X_reduce_pe_type = 4 + X_1st_pe_type * 4 + (X_2nd_pe_type - 2); // 4..11
+        }
     } else {
-        @mov16(vector_buf_dsd_bsz, bdcast_recv_bsz);
+        X_reduce_pe_type = 12 + (X_1st_pe_type - 2) * 3 + (X_2nd_pe_type - 6); // 12..23
     }
+
+    // type in a horizontal all-reduce (broadcast)
+    if (px == root_px_2nd_phase) {
+        X_bdcast_pe_type = 0;
+    } else {
+        X_bdcast_pe_type = 1;
+    }
+
+    // type in a vertical all-reduce (1st phase)
+    if (remainder_y == root_py_1st_phase) {
+        if (root_py_1st_phase < pe_num_p_v_group - 1) {
+            Y_1st_pe_type = 0;
+        }
+        else {
+            Y_1st_pe_type = 1;
+        }
+    } else if (remainder_y > root_py_1st_phase) {
+        if (remainder_y % 2 == 0) {
+            if (remainder_y == pe_num_p_v_group - 1) { 
+                Y_1st_pe_type = 2;
+            } else {
+                Y_1st_pe_type = 3;
+            }
+        } else {
+            // remainder_y % 2 == 1
+            if (remainder_y == pe_num_p_v_group - 1) {
+                Y_1st_pe_type = 4;
+            } else {
+                Y_1st_pe_type = 5;
+            }
+        }
+    } else {
+        // remainder_y < root_1st_phase
+        if (remainder_y % 2 == 0) {
+            if (remainder_y == 0) {
+                Y_1st_pe_type = 4;
+            } else {
+                Y_1st_pe_type = 5;
+            }
+        } else {
+            // remainder_y never be 0
+            Y_1st_pe_type = 3;
+        }
+    }
+
+    // type in a vertical all-reduce (2nd phase)
+    if (py == root_py_2nd_phase) {
+        if (root_py_2nd_phase < Ph - pe_num_p_last_v_group) {
+            Y_2nd_pe_type = 0;
+        }
+        else {
+            Y_2nd_pe_type = 1;
+        }
+    } else if (py > root_py_2nd_phase) {
+        if (remainder_y == root_py_1st_phase) {
+            if (py > Ph - pe_num_p_last_v_group - 1) {
+                if (quotient_y % 2 == 0) {
+                    Y_2nd_pe_type = 2;
+                } else {
+                    Y_2nd_pe_type = 3;
+                }
+            } else {
+                if (quotient_y % 2 == 0) {
+                    Y_2nd_pe_type = 4;
+                } else {
+                    Y_2nd_pe_type = 5;
+                }
+            }
+        }
+        else if (remainder_y < root_py_1st_phase) {
+            if (quotient_y % 2 == 0) {
+                // reduce_2nd_color_0 is already managed
+                Y_2nd_pe_type = 6;
+            } else {
+                // reduce_2nd_color_1 is already managed
+                Y_2nd_pe_type = 7;
+            }
+        } else {
+            // remainder_y > root_1st_phase
+            if (quotient_y == eff_gnum_y - 1) {
+                // relay nothing = teardown both
+                Y_2nd_pe_type = 8;
+            } else if (quotient_y % 2 == 0) {
+                // reduce_2nd_color_1 is already managed
+                Y_2nd_pe_type = 7;
+            } else {
+                // reduce_2nd_color_0 is already managed
+                Y_2nd_pe_type = 6;
+            }
+        }
+    } else {
+        if (remainder_y == root_py_1st_phase) {
+            if (py < pe_num_p_v_group) {
+                Y_2nd_pe_type = 3;
+            } else {
+                if (quotient_y % 2 == 0) {
+                    Y_2nd_pe_type = 5;
+                } else {
+                    Y_2nd_pe_type = 4;
+                }
+            }
+        }
+        else if (remainder_y > root_py_1st_phase) {
+            if (quotient_y % 2 == 0) {
+                // reduce_2nd_color_1 is already managed
+                Y_2nd_pe_type = 7;
+            } else {
+                // reduce_2nd_color_0 is already managed
+                Y_2nd_pe_type = 6;
+            }
+        } else {
+            if (quotient_y == 0) {
+                // relay nothing = teardown both
+                Y_2nd_pe_type = 8;
+            } else if (quotient_y % 2 == 0) {
+                // reduce_2nd_color_0 is already managed
+                Y_2nd_pe_type = 6;
+            } else {
+                // reduce_2nd_color_1 is already managed
+                Y_2nd_pe_type = 7;
+            }
+        }
+    }
+
+    // type in a vertical all-reduce
+    if (Y_1st_pe_type <= 1) {
+        if (Y_2nd_pe_type <= 1) {
+            Y_reduce_pe_type = Y_1st_pe_type * 2 + Y_2nd_pe_type;            // 0..3
+        } else {
+            Y_reduce_pe_type = 4 + Y_1st_pe_type * 4 + (Y_2nd_pe_type - 2); // 4..11
+        }
+    } else {
+        Y_reduce_pe_type = 12 + (Y_1st_pe_type - 2) * 3 + (Y_2nd_pe_type - 6); // 12..23
+    }
+
+    // type in a vertical all-reduce (broadcast)
+    if (py == root_py_2nd_phase) {
+        Y_bdcast_pe_type = 0;
+    } else {
+        Y_bdcast_pe_type = 1;
+    }
+
+    // type in a horizontal all-reduce in head (1st phase)
+    if (remainder_x_in_head == root_px_in_head_1st_phase) {
+        if (root_px_in_head_1st_phase < pe_num_p_group_in_head - 1) { 
+            XH_1st_pe_type = 0; 
+        } else {
+            XH_1st_pe_type = 1;
+        }
+    } else if (remainder_x_in_head > root_px_in_head_1st_phase) {
+        if (remainder_x_in_head % 2 == 0) {
+            if (remainder_x_in_head == pe_num_p_group_in_head - 1) { 
+                XH_1st_pe_type = 2; 
+            } else { 
+                XH_1st_pe_type = 3; 
+            }
+        } else {
+            if (remainder_x_in_head == pe_num_p_group_in_head - 1) { 
+                XH_1st_pe_type = 4; 
+            } else {
+                XH_1st_pe_type = 5;
+            }
+        }
+    } else {
+        if (remainder_x_in_head % 2 == 0) {
+            if (remainder_x_in_head == 0) { 
+                XH_1st_pe_type = 4; 
+            } else { 
+                XH_1st_pe_type = 5;
+            }
+        } else {
+            XH_1st_pe_type = 3;
+        }
+    }
+
+    // type in a horizontal all-reduce in head (2nd phase)
+    if (px_in_head == root_px_in_head_2nd_phase) {
+        if (root_px_in_head_2nd_phase < pes_p_head - pe_num_p_last_group_in_head) {
+            XH_2nd_pe_type = 0;
+        } else {
+            XH_2nd_pe_type = 1;
+        }
+    } else if (px_in_head > root_px_in_head_2nd_phase) {
+        if (remainder_x_in_head == root_px_in_head_1st_phase) {
+            if (px_in_head > pes_p_head - pe_num_p_last_group_in_head - 1) {
+                if (quotient_x_in_head % 2 == 0) {
+                    XH_2nd_pe_type = 2;
+                } else {
+                    XH_2nd_pe_type = 3;
+                }
+            } else {
+                if (quotient_x_in_head % 2 == 0) {
+                    XH_2nd_pe_type = 4;
+                } else {
+                    XH_2nd_pe_type = 5;
+                }
+            }
+        } else if (remainder_x_in_head < root_px_in_head_1st_phase) {
+            if (quotient_x_in_head % 2 == 0) {
+                XH_2nd_pe_type = 6;
+            } else {
+                XH_2nd_pe_type = 7;
+            }
+        } else {
+            // remainder_x_in_head > root_px_in_head_1st_phase
+            if (quotient_x_in_head == eff_gnum_xh - 1) {
+                XH_2nd_pe_type = 8;
+            } else if (quotient_x_in_head % 2 == 0) {
+                XH_2nd_pe_type = 7;
+            } else {
+                XH_2nd_pe_type = 6;
+            }
+        }
+    } else {
+        if (remainder_x_in_head == root_px_in_head_1st_phase) {
+            if (px_in_head < pe_num_p_group_in_head) {
+                XH_2nd_pe_type = 3;
+            } else {
+                if (quotient_x_in_head % 2 == 0) {
+                    XH_2nd_pe_type = 5;
+                } else {
+                    XH_2nd_pe_type = 4;
+                }
+            }
+        } else if (remainder_x_in_head > root_px_in_head_1st_phase) {
+            if (quotient_x_in_head % 2 == 0) {
+                XH_2nd_pe_type = 7;
+            } else {
+                XH_2nd_pe_type = 6;
+            }
+        } else {
+            if (quotient_x_in_head == 0) {
+                XH_2nd_pe_type = 8;
+            } else if (quotient_x_in_head % 2 == 0) {
+                XH_2nd_pe_type = 6;
+            } else {
+                XH_2nd_pe_type = 7;
+            }
+        }
+    }
+
+    // type in a horizontal all-reduce in head
+    if (XH_1st_pe_type <= 1) {
+        if (XH_2nd_pe_type <= 1) {
+            XH_reduce_pe_type = XH_1st_pe_type * 2 + XH_2nd_pe_type;            // 0..3
+        } else {
+            XH_reduce_pe_type = 4 + XH_1st_pe_type * 4 + (XH_2nd_pe_type - 2); // 4..11
+        }
+    } else {
+        XH_reduce_pe_type = 12 + (XH_1st_pe_type - 2) * 3 + (XH_2nd_pe_type - 6); // 12..23
+    }
+
+    // type in a horizontal all-reduce (broadcast)
+    if (px_in_head == root_px_in_head_2nd_phase) {
+        XH_bdcast_pe_type = 0;
+    } else {
+        XH_bdcast_pe_type = 1;
+    }
+
+    // -------------- in teardown mode at the beginning ---------------- //
+
+    color_config.reset_rx_routes(reduce_1st_color_0, Y_1st_RD_0.rx);
+    color_config.reset_tx_routes(reduce_1st_color_0, &Y_1st_RD_0.tx, 1);
+    color_config.reset_rx_routes(reduce_1st_color_1, Y_1st_RD_1.rx);
+    color_config.reset_tx_routes(reduce_1st_color_1, &Y_1st_RD_1.tx, 1);
+
+    color_config.reset_rx_routes(reduce_2nd_color_0, Y_2nd_RD_0.rx);
+    color_config.reset_tx_routes(reduce_2nd_color_0, &Y_2nd_RD_0.tx, 1);
+    color_config.reset_rx_routes(reduce_2nd_color_1, Y_2nd_RD_1.rx);
+    color_config.reset_tx_routes(reduce_2nd_color_1, &Y_2nd_RD_1.tx, 1);
+
+    color_config.reset_rx_routes(broadcast_color, Y_BD.rx);
+    color_config.reset_tx_routes(broadcast_color, &Y_BD.tx, Y_BD.tx_cnt);
+    teardown.exit(reduce_1st_color_0);
+    teardown.exit(reduce_1st_color_1);
+    teardown.exit(reduce_2nd_color_0);
+    teardown.exit(reduce_2nd_color_1);
+    teardown.exit(broadcast_color);
 }
 
-fn all_reduceMax_bsz(pe_id: i16, quotient_pe_id: i16, remainder_pe_id: i16, vector_buf_ptr: [*]f16) void {
-    vector_buf_dsd_bsz = @set_dsd_base_addr(vector_buf_dsd_bsz, vector_buf_ptr);
-    @load_to_dsr(vector_buf_dsr, vector_buf_dsd_bsz);
+fn runtime_setup() void {
+    // load dsd to dsr (for fabric_dsd)
+    // only size will be changed at each call
+    @load_to_dsr(reduce_1st_0_send_dsr, reduce_1st_0_send);
+    @load_to_dsr(reduce_1st_1_send_dsr, reduce_1st_1_send);
+    @load_to_dsr(reduce_2nd_0_send_dsr, reduce_2nd_0_send);
+    @load_to_dsr(reduce_2nd_1_send_dsr, reduce_2nd_1_send);
+    @load_to_dsr(bdcast_send_dsr, bdcast_send);
 
-    // 1st phase reduce
-    if (remainder_pe_id == root_1st_phase) {
-        if (root_1st_phase < pe_num_p_group - 1) {
-            @fmaxh(vector_buf_dsd_bsz, reduce_1st_0_recv_bsz, vector_buf_dsr);
-        }
-        @fmaxh(vector_buf_dsd_bsz, reduce_1st_1_recv_bsz, vector_buf_dsr);
-    } else if (remainder_pe_id > root_1st_phase) {
-        if (remainder_pe_id % 2 == 0) {
-            if (remainder_pe_id == pe_num_p_group - 1) {
-                @fmovh(reduce_1st_0_send_bsz, vector_buf_dsr);
-            } else {
-                @fmaxh(reduce_1st_0_send_bsz, reduce_1st_1_recv_bsz, vector_buf_dsr);
-            }
-        } else {
-            // remainder_pe_id % 2 == 1
-            if (remainder_pe_id == pe_num_p_group - 1) {
-                @fmovh(reduce_1st_1_send_bsz, vector_buf_dsr);
-            } else {
-                @fmaxh(reduce_1st_1_send_bsz, reduce_1st_0_recv_bsz, vector_buf_dsr);
-            }
-        }
-    } else {
-        // remainder_pe_id < root_1st_phase
-        if (remainder_pe_id % 2 == 0) {
-            if (remainder_pe_id == 0) {
-                @fmovh(reduce_1st_1_send_bsz, vector_buf_dsr);
-            } else {
-                @fmaxh(reduce_1st_1_send_bsz, reduce_1st_0_recv_bsz, vector_buf_dsr);
-            }
-        } else {
-            // remainder_pe_id never be 0
-            @fmaxh(reduce_1st_0_send_bsz, reduce_1st_1_recv_bsz, vector_buf_dsr);
-        }
-    }
+    @load_to_dsr(reduce_1st_0_recv_dsr, reduce_1st_0_recv);
+    @load_to_dsr(reduce_1st_1_recv_dsr, reduce_1st_1_recv);
+    @load_to_dsr(reduce_2nd_0_recv_dsr, reduce_2nd_0_recv);
+    @load_to_dsr(reduce_2nd_1_recv_dsr, reduce_2nd_1_recv);
+    @load_to_dsr(bdcast_recv_dsr, bdcast_recv);
 
-    // 2nd phase reduce
-    if (pe_id == root_2nd_phase) {
-        if (root_2nd_phase < P - pe_num_p_group) {
-            @fmaxh(vector_buf_dsd_bsz, reduce_2nd_0_recv_bsz, vector_buf_dsr);
-        }
-        @fmaxh(vector_buf_dsd_bsz, reduce_2nd_1_recv_bsz, vector_buf_dsr);
-    } else if (pe_id > root_2nd_phase) {
-        if (remainder_pe_id == root_1st_phase) {
-            if (pe_id > P - pe_num_p_group - 1) {
-                if (quotient_pe_id % 2 == 0) {
-                    @fmovh(reduce_2nd_0_send_bsz, vector_buf_dsr);
-                } else {
-                    @fmovh(reduce_2nd_1_send_bsz, vector_buf_dsr);
-                }
-            } else {
-                if (quotient_pe_id % 2 == 0) {
-                    @fmaxh(reduce_2nd_0_send_bsz, reduce_2nd_1_recv_bsz, vector_buf_dsr);
-                } else {
-                    @fmaxh(reduce_2nd_1_send_bsz, reduce_2nd_0_recv_bsz, vector_buf_dsr);
-                }
-            }
-        }
-    } else {
-        if (remainder_pe_id == root_1st_phase) {
-            if (pe_id < pe_num_p_group) {
-                @fmovh(reduce_2nd_1_send_bsz, vector_buf_dsr);
-            } else {
-                if (quotient_pe_id % 2 == 0) {
-                    @fmaxh(reduce_2nd_1_send_bsz, reduce_2nd_0_recv_bsz, vector_buf_dsr);
-                } else {
-                    @fmaxh(reduce_2nd_0_send_bsz, reduce_2nd_1_recv_bsz, vector_buf_dsr);
-                }
-            }
-        }
-    }
+    @load_to_dsr(ctrl_1st_0_dsr, ctrl_1st_0);
+    @load_to_dsr(ctrl_1st_1_dsr, ctrl_1st_1);
+    @load_to_dsr(ctrl_2nd_0_dsr, ctrl_2nd_0);
+    @load_to_dsr(ctrl_2nd_1_dsr, ctrl_2nd_1);
+    @load_to_dsr(ctrl_bdcast_dsr, ctrl_bdcast);
 
-    // Broadcast
-    if (pe_id == root_2nd_phase) {
-        @mov16(bdcast_send_bsz, vector_buf_dsr);
-    } else {
-        @mov16(vector_buf_dsd_bsz, bdcast_recv_bsz);
-    }
+    // memory dsd will be loaded to dsr at each call
+    @load_to_dsr(ctrl_buf_dsr, ctrl_mem);
 }
 
-fn all_reduce_bsz_dim(pe_id: i16, quotient_pe_id: i16, remainder_pe_id: i16, vector_buf_ptr: [*]f16) void {
-    vector_buf_dsd_bsz_dim = @set_dsd_base_addr(vector_buf_dsd_bsz_dim, vector_buf_ptr);
-    @load_to_dsr(vector_buf_dsr, vector_buf_dsd_bsz_dim);
+// ==================== helper fns for all_reduce_with_reset ====================
+// Each case is isolated in its own function to prevent LLVM SimplifyCFG from
+// merging basic blocks across cases and generating phi nodes for immarg operands.
 
-    // 1st phase reduce
-    if (remainder_pe_id == root_1st_phase) {
-        if (root_1st_phase < pe_num_p_group - 1) {
-            @faddh(vector_buf_dsd_bsz_dim, reduce_1st_0_recv_bsz_dim, vector_buf_dsr);
-        }
-        @faddh(vector_buf_dsd_bsz_dim, reduce_1st_1_recv_bsz_dim, vector_buf_dsr);
-    } else if (remainder_pe_id > root_1st_phase) {
-        if (remainder_pe_id % 2 == 0) {
-            if (remainder_pe_id == pe_num_p_group - 1) {
-                @fmovh(reduce_1st_0_send_bsz_dim, vector_buf_dsr);
-            } else {
-                @faddh(reduce_1st_0_send_bsz_dim, reduce_1st_1_recv_bsz_dim, vector_buf_dsr);
-            }
-        } else {
-            // remainder_pe_id % 2 == 1
-            if (remainder_pe_id == pe_num_p_group - 1) {
-                @fmovh(reduce_1st_1_send_bsz_dim, vector_buf_dsr);
-            } else {
-                @faddh(reduce_1st_1_send_bsz_dim, reduce_1st_0_recv_bsz_dim, vector_buf_dsr);
-            }
-        }
-    } else {
-        // remainder_pe_id < root_1st_phase
-        if (remainder_pe_id % 2 == 0) {
-            if (remainder_pe_id == 0) {
-                @fmovh(reduce_1st_1_send_bsz_dim, vector_buf_dsr);
-            } else {
-                @faddh(reduce_1st_1_send_bsz_dim, reduce_1st_0_recv_bsz_dim, vector_buf_dsr);
-            }
-        } else {
-            // remainder_pe_id never be 0
-            @faddh(reduce_1st_0_send_bsz_dim, reduce_1st_1_recv_bsz_dim, vector_buf_dsr);
-        }
-    }
-
-    // 2nd phase reduce
-    if (pe_id == root_2nd_phase) {
-        if (root_2nd_phase < P - pe_num_p_group) {
-            @faddh(vector_buf_dsd_bsz_dim, reduce_2nd_0_recv_bsz_dim, vector_buf_dsr);
-        }
-        @faddh(vector_buf_dsd_bsz_dim, reduce_2nd_1_recv_bsz_dim, vector_buf_dsr);
-    } else if (pe_id > root_2nd_phase) {
-        if (remainder_pe_id == root_1st_phase) {
-            if (pe_id > P - pe_num_p_group - 1) {
-                if (quotient_pe_id % 2 == 0) {
-                    @fmovh(reduce_2nd_0_send_bsz_dim, vector_buf_dsr);
-                } else {
-                    @fmovh(reduce_2nd_1_send_bsz_dim, vector_buf_dsr);
-                }
-            } else {
-                if (quotient_pe_id % 2 == 0) {
-                    @faddh(reduce_2nd_0_send_bsz_dim, reduce_2nd_1_recv_bsz_dim, vector_buf_dsr);
-                } else {
-                    @faddh(reduce_2nd_1_send_bsz_dim, reduce_2nd_0_recv_bsz_dim, vector_buf_dsr);
-                }
-            }
-        }
-    } else {
-        if (remainder_pe_id == root_1st_phase) {
-            if (pe_id < pe_num_p_group) {
-                @fmovh(reduce_2nd_1_send_bsz_dim, vector_buf_dsr);
-            } else {
-                if (quotient_pe_id % 2 == 0) {
-                    @faddh(reduce_2nd_1_send_bsz_dim, reduce_2nd_0_recv_bsz_dim, vector_buf_dsr);
-                } else {
-                    @faddh(reduce_2nd_0_send_bsz_dim, reduce_2nd_1_recv_bsz_dim, vector_buf_dsr);
-                }
-            }
-        }
-    }
-
-    // Broadcast
-    if (pe_id == root_2nd_phase) {
-        @mov16(bdcast_send_bsz_dim, vector_buf_dsr);
-    } else {
-        @mov16(vector_buf_dsd_bsz_dim, bdcast_recv_bsz_dim);
-    }
+fn reduce_reset_case_0() void {  // X_1st=0, X_2nd=0
+    @faddh(vector_buf_ddsr, reduce_1st_0_recv_dsr, vector_buf_s1dsr);
+    @faddh(vector_buf_ddsr, reduce_1st_1_recv_dsr, vector_buf_s1dsr);
+    @faddh(vector_buf_ddsr, reduce_2nd_0_recv_dsr, vector_buf_s1dsr);
+    @faddh(vector_buf_ddsr, reduce_2nd_1_recv_dsr, vector_buf_s1dsr);
+}
+fn reduce_reset_case_1() void {  // X_1st=0, X_2nd=1
+    @faddh(vector_buf_ddsr, reduce_1st_0_recv_dsr, vector_buf_s1dsr);
+    @faddh(vector_buf_ddsr, reduce_1st_1_recv_dsr, vector_buf_s1dsr);
+    @mov32(ctrl_2nd_0_dsr, ctrl_buf_dsr);
+    @faddh(vector_buf_ddsr, reduce_2nd_1_recv_dsr, vector_buf_s1dsr);
+}
+fn reduce_reset_case_2() void {  // X_1st=1, X_2nd=0
+    @mov32(ctrl_1st_0_dsr, ctrl_buf_dsr);
+    @faddh(vector_buf_ddsr, reduce_1st_1_recv_dsr, vector_buf_s1dsr);
+    @faddh(vector_buf_ddsr, reduce_2nd_0_recv_dsr, vector_buf_s1dsr);
+    @faddh(vector_buf_ddsr, reduce_2nd_1_recv_dsr, vector_buf_s1dsr);
+}
+fn reduce_reset_case_3() void {  // X_1st=1, X_2nd=1
+    @mov32(ctrl_1st_0_dsr, ctrl_buf_dsr);
+    @faddh(vector_buf_ddsr, reduce_1st_1_recv_dsr, vector_buf_s1dsr);
+    @mov32(ctrl_2nd_0_dsr, ctrl_buf_dsr);
+    @faddh(vector_buf_ddsr, reduce_2nd_1_recv_dsr, vector_buf_s1dsr);
+}
+fn reduce_reset_case_4() void {  // X_1st=0, X_2nd=2
+    @faddh(vector_buf_ddsr, reduce_1st_0_recv_dsr, vector_buf_s1dsr);
+    // @faddh(vector_buf_ddsr, reduce_1st_1_recv_dsr, vector_buf_s1dsr);
+    // @fmovh(reduce_2nd_0_send_dsr, vector_buf_s1dsr);    // TODO: merge this into the previous faddh
+    @faddh(reduce_2nd_0_send_dsr, reduce_1st_1_recv_dsr, vector_buf_s1dsr);
+    @mov32(ctrl_2nd_0_dsr, ctrl_buf_dsr);
+    @mov32(ctrl_2nd_1_dsr, ctrl_buf_dsr);
+}
+fn reduce_reset_case_5() void {  // X_1st=0, X_2nd=3
+    @faddh(vector_buf_ddsr, reduce_1st_0_recv_dsr, vector_buf_s1dsr);
+    // @faddh(vector_buf_ddsr, reduce_1st_1_recv_dsr, vector_buf_s1dsr);
+    // @fmovh(reduce_2nd_1_send_dsr, vector_buf_s1dsr);    // TODO: merge this into the previous faddh
+    @faddh(reduce_2nd_1_send_dsr, reduce_1st_1_recv_dsr, vector_buf_s1dsr);
+    @mov32(ctrl_2nd_1_dsr, ctrl_buf_dsr);
+    @mov32(ctrl_2nd_0_dsr, ctrl_buf_dsr);
+}
+fn reduce_reset_case_6() void {  // X_1st=0, X_2nd=4
+    @faddh(vector_buf_ddsr, reduce_1st_0_recv_dsr, vector_buf_s1dsr);
+    @faddh(vector_buf_ddsr, reduce_1st_1_recv_dsr, vector_buf_s1dsr);
+    @faddh(reduce_2nd_0_send_dsr, reduce_2nd_1_recv_dsr, vector_buf_s1dsr);
+    @mov32(ctrl_2nd_0_dsr, ctrl_buf_dsr);
+}
+fn reduce_reset_case_7() void {  // X_1st=0, X_2nd=5
+    @faddh(vector_buf_ddsr, reduce_1st_0_recv_dsr, vector_buf_s1dsr);
+    @faddh(vector_buf_ddsr, reduce_1st_1_recv_dsr, vector_buf_s1dsr);
+    @faddh(reduce_2nd_1_send_dsr, reduce_2nd_0_recv_dsr, vector_buf_s1dsr);
+    @mov32(ctrl_2nd_1_dsr, ctrl_buf_dsr);
+}
+fn reduce_reset_case_8() void {  // X_1st=1, X_2nd=2
+    @mov32(ctrl_1st_0_dsr, ctrl_buf_dsr);
+    // @faddh(vector_buf_ddsr, reduce_1st_1_recv_dsr, vector_buf_s1dsr);
+    // @fmovh(reduce_2nd_0_send_dsr, vector_buf_s1dsr);    // TODO: merge this into the previous faddh
+    @faddh(reduce_2nd_0_send_dsr, reduce_1st_1_recv_dsr, vector_buf_s1dsr);
+    @mov32(ctrl_2nd_0_dsr, ctrl_buf_dsr);
+    @mov32(ctrl_2nd_1_dsr, ctrl_buf_dsr);
+}
+fn reduce_reset_case_9() void {  // X_1st=1, X_2nd=3
+    @mov32(ctrl_1st_0_dsr, ctrl_buf_dsr);
+    // @faddh(vector_buf_ddsr, reduce_1st_1_recv_dsr, vector_buf_s1dsr);
+    // @fmovh(reduce_2nd_1_send_dsr, vector_buf_s1dsr);    // TODO: merge this into the previous faddh
+    @faddh(reduce_2nd_1_send_dsr, reduce_1st_1_recv_dsr, vector_buf_s1dsr);
+    @mov32(ctrl_2nd_1_dsr, ctrl_buf_dsr);
+    @mov32(ctrl_2nd_0_dsr, ctrl_buf_dsr);
+}
+fn reduce_reset_case_10() void {  // X_1st=1, X_2nd=4
+    @mov32(ctrl_1st_0_dsr, ctrl_buf_dsr);
+    @faddh(vector_buf_ddsr, reduce_1st_1_recv_dsr, vector_buf_s1dsr);
+    @faddh(reduce_2nd_0_send_dsr, reduce_2nd_1_recv_dsr, vector_buf_s1dsr);
+    @mov32(ctrl_2nd_0_dsr, ctrl_buf_dsr);
+}
+fn reduce_reset_case_11() void {  // X_1st=1, X_2nd=5
+    @mov32(ctrl_1st_0_dsr, ctrl_buf_dsr);
+    @faddh(vector_buf_ddsr, reduce_1st_1_recv_dsr, vector_buf_s1dsr);
+    @faddh(reduce_2nd_1_send_dsr, reduce_2nd_0_recv_dsr, vector_buf_s1dsr);
+    @mov32(ctrl_2nd_1_dsr, ctrl_buf_dsr);
+}
+fn reduce_reset_case_12() void {  // X_1st=2, X_2nd=6
+    @fmovh(reduce_1st_0_send_dsr, vector_buf_s1dsr);
+    @mov32(ctrl_1st_1_dsr, ctrl_buf_dsr);
+    @mov32(ctrl_1st_0_dsr, ctrl_buf_dsr);
+    @mov32(ctrl_2nd_1_dsr, ctrl_buf_dsr);
+}
+fn reduce_reset_case_13() void {  // X_1st=2, X_2nd=7
+    @fmovh(reduce_1st_0_send_dsr, vector_buf_s1dsr);
+    @mov32(ctrl_1st_1_dsr, ctrl_buf_dsr);
+    @mov32(ctrl_1st_0_dsr, ctrl_buf_dsr);
+    @mov32(ctrl_2nd_0_dsr, ctrl_buf_dsr);
+}
+fn reduce_reset_case_14() void {  // X_1st=2, X_2nd=8
+    @fmovh(reduce_1st_0_send_dsr, vector_buf_s1dsr);
+    @mov32(ctrl_1st_1_dsr, ctrl_buf_dsr);
+    @mov32(ctrl_1st_0_dsr, ctrl_buf_dsr);
+    @mov32(ctrl_2nd_0_dsr, ctrl_buf_dsr);
+    @mov32(ctrl_2nd_1_dsr, ctrl_buf_dsr);
+}
+fn reduce_reset_case_15() void {  // X_1st=3, X_2nd=6
+    @faddh(reduce_1st_0_send_dsr, reduce_1st_1_recv_dsr, vector_buf_s1dsr);
+    @mov32(ctrl_1st_0_dsr, ctrl_buf_dsr);
+    @mov32(ctrl_2nd_1_dsr, ctrl_buf_dsr);
+}
+fn reduce_reset_case_16() void {  // X_1st=3, X_2nd=7
+    @faddh(reduce_1st_0_send_dsr, reduce_1st_1_recv_dsr, vector_buf_s1dsr);
+    @mov32(ctrl_1st_0_dsr, ctrl_buf_dsr);
+    @mov32(ctrl_2nd_0_dsr, ctrl_buf_dsr);
+}
+fn reduce_reset_case_17() void {  // X_1st=3, X_2nd=8
+    @faddh(reduce_1st_0_send_dsr, reduce_1st_1_recv_dsr, vector_buf_s1dsr);
+    @mov32(ctrl_1st_0_dsr, ctrl_buf_dsr);
+    @mov32(ctrl_2nd_0_dsr, ctrl_buf_dsr);
+    @mov32(ctrl_2nd_1_dsr, ctrl_buf_dsr);
+}
+fn reduce_reset_case_18() void {  // X_1st=4, X_2nd=6
+    @fmovh(reduce_1st_1_send_dsr, vector_buf_s1dsr);
+    @mov32(ctrl_1st_0_dsr, ctrl_buf_dsr);
+    @mov32(ctrl_1st_1_dsr, ctrl_buf_dsr);
+    @mov32(ctrl_2nd_1_dsr, ctrl_buf_dsr);
+}
+fn reduce_reset_case_19() void {  // X_1st=4, X_2nd=7
+    @fmovh(reduce_1st_1_send_dsr, vector_buf_s1dsr);
+    @mov32(ctrl_1st_0_dsr, ctrl_buf_dsr);
+    @mov32(ctrl_1st_1_dsr, ctrl_buf_dsr);
+    @mov32(ctrl_2nd_0_dsr, ctrl_buf_dsr);
+}
+fn reduce_reset_case_20() void {  // X_1st=4, X_2nd=8
+    @fmovh(reduce_1st_1_send_dsr, vector_buf_s1dsr);
+    @mov32(ctrl_1st_0_dsr, ctrl_buf_dsr);
+    @mov32(ctrl_1st_1_dsr, ctrl_buf_dsr);
+    @mov32(ctrl_2nd_0_dsr, ctrl_buf_dsr);
+    @mov32(ctrl_2nd_1_dsr, ctrl_buf_dsr);
+}
+fn reduce_reset_case_21() void {  // X_1st=5, X_2nd=6
+    @faddh(reduce_1st_1_send_dsr, reduce_1st_0_recv_dsr, vector_buf_s1dsr);
+    @mov32(ctrl_1st_1_dsr, ctrl_buf_dsr);
+    @mov32(ctrl_2nd_1_dsr, ctrl_buf_dsr);
+}
+fn reduce_reset_case_22() void {  // X_1st=5, X_2nd=7
+    @faddh(reduce_1st_1_send_dsr, reduce_1st_0_recv_dsr, vector_buf_s1dsr);
+    @mov32(ctrl_1st_1_dsr, ctrl_buf_dsr);
+    @mov32(ctrl_2nd_0_dsr, ctrl_buf_dsr);
+}
+fn reduce_reset_case_23() void {  // X_1st=5, X_2nd=8
+    @faddh(reduce_1st_1_send_dsr, reduce_1st_0_recv_dsr, vector_buf_s1dsr);
+    @mov32(ctrl_1st_1_dsr, ctrl_buf_dsr);
+    @mov32(ctrl_2nd_0_dsr, ctrl_buf_dsr);
+    @mov32(ctrl_2nd_1_dsr, ctrl_buf_dsr);
 }
 
-fn all_reduce_bsz_dim_QKV_fusion(pe_id: i16, quotient_pe_id: i16, remainder_pe_id: i16, vector_buf_ptr: [*]f16) void {
-    vector_buf_dsd_bsz_dim_QKV_fusion = @set_dsd_base_addr(vector_buf_dsd_bsz_dim_QKV_fusion, vector_buf_ptr);
-    @load_to_dsr(vector_buf_dsr, vector_buf_dsd_bsz_dim_QKV_fusion);
+const reduce_reset_funcs = [24](*const fn()void) {
+    reduce_reset_case_0,
+    reduce_reset_case_1,
+    reduce_reset_case_2,
+    reduce_reset_case_3,
+    reduce_reset_case_4,
+    reduce_reset_case_5,
+    reduce_reset_case_6,
+    reduce_reset_case_7,
+    reduce_reset_case_8,
+    reduce_reset_case_9,
+    reduce_reset_case_10,
+    reduce_reset_case_11,
+    reduce_reset_case_12,
+    reduce_reset_case_13,
+    reduce_reset_case_14,
+    reduce_reset_case_15,
+    reduce_reset_case_16,
+    reduce_reset_case_17,
+    reduce_reset_case_18,
+    reduce_reset_case_19,
+    reduce_reset_case_20,
+    reduce_reset_case_21,
+    reduce_reset_case_22,
+    reduce_reset_case_23,
+};
 
-    // 1st phase reduce
-    if (remainder_pe_id == root_1st_phase) {
-        if (root_1st_phase < pe_num_p_group - 1) {
-            @faddh(vector_buf_dsd_bsz_dim_QKV_fusion, reduce_1st_0_recv_bsz_dim_QKV_fusion, vector_buf_dsr);
-        }
-        @faddh(vector_buf_dsd_bsz_dim_QKV_fusion, reduce_1st_1_recv_bsz_dim_QKV_fusion, vector_buf_dsr);
-    } else if (remainder_pe_id > root_1st_phase) {
-        if (remainder_pe_id % 2 == 0) {
-            if (remainder_pe_id == pe_num_p_group - 1) {
-                @fmovh(reduce_1st_0_send_bsz_dim, vector_buf_dsr);
-            } else {
-                @faddh(reduce_1st_0_send_bsz_dim_QKV_fusion, reduce_1st_1_recv_bsz_dim_QKV_fusion, vector_buf_dsr);
-            }
-        } else {
-            // remainder_pe_id % 2 == 1
-            if (remainder_pe_id == pe_num_p_group - 1) {
-                @fmovh(reduce_1st_1_send_bsz_dim, vector_buf_dsr);
-            } else {
-                @faddh(reduce_1st_1_send_bsz_dim_QKV_fusion, reduce_1st_0_recv_bsz_dim_QKV_fusion, vector_buf_dsr);
-            }
-        }
-    } else {
-        // remainder_pe_id < root_1st_phase
-        if (remainder_pe_id % 2 == 0) {
-            if (remainder_pe_id == 0) {
-                @fmovh(reduce_1st_1_send_bsz_dim, vector_buf_dsr);
-            } else {
-                @faddh(reduce_1st_1_send_bsz_dim_QKV_fusion, reduce_1st_0_recv_bsz_dim_QKV_fusion, vector_buf_dsr);
-            }
-        } else {
-            // remainder_pe_id never be 0
-            @faddh(reduce_1st_0_send_bsz_dim_QKV_fusion, reduce_1st_1_recv_bsz_dim_QKV_fusion, vector_buf_dsr);
-        }
+// ====================== all reduce with reset ================= //
+fn all_reduce_with_reset(size: u16, vector_buf_ptr: [*]f16, c_axis: comm_axis) void {
+    @set_dsr_length(reduce_1st_0_send_dsr, size);
+    @set_dsr_length(reduce_1st_1_send_dsr, size);
+    @set_dsr_length(reduce_2nd_0_send_dsr, size);
+    @set_dsr_length(reduce_2nd_1_send_dsr, size);
+    @set_dsr_length(bdcast_send_dsr, size);
+
+    @set_dsr_length(reduce_1st_0_recv_dsr, size);
+    @set_dsr_length(reduce_1st_1_recv_dsr, size);
+    @set_dsr_length(reduce_2nd_0_recv_dsr, size);
+    @set_dsr_length(reduce_2nd_1_recv_dsr, size);
+    @set_dsr_length(bdcast_recv_dsr, size);
+
+    vector_buf_dsd = @set_dsd_length(vector_buf_dsd, size);
+    vector_buf_dsd = @set_dsd_base_addr(vector_buf_dsd, vector_buf_ptr);
+    @load_to_dsr(vector_buf_ddsr, vector_buf_dsd);
+    @load_to_dsr(vector_buf_s1dsr, vector_buf_dsd);
+
+    switch (c_axis) {
+        comm_axis.horizontal => {
+            reduce_pe_type = X_reduce_pe_type;
+            bdcast_pe_type = X_bdcast_pe_type;
+        },
+        comm_axis.vertical => {
+            reduce_pe_type = Y_reduce_pe_type;
+            bdcast_pe_type = Y_bdcast_pe_type;
+        },
+        comm_axis.horizontal_in_head => {
+            reduce_pe_type = XH_reduce_pe_type;
+            bdcast_pe_type = XH_bdcast_pe_type;
+        },
     }
 
-    // 2nd phase reduce
-    if (pe_id == root_2nd_phase) {
-        if (root_2nd_phase < P - pe_num_p_group) {
-            @faddh(vector_buf_dsd_bsz_dim_QKV_fusion, reduce_2nd_0_recv_bsz_dim_QKV_fusion, vector_buf_dsr);
-        }
-        @faddh(vector_buf_dsd_bsz_dim_QKV_fusion, reduce_2nd_1_recv_bsz_dim_QKV_fusion, vector_buf_dsr);
-    } else if (pe_id > root_2nd_phase) {
-        if (remainder_pe_id == root_1st_phase) {
-            if (pe_id > P - pe_num_p_group - 1) {
-                if (quotient_pe_id % 2 == 0) {
-                    @fmovh(reduce_2nd_0_send_bsz_dim_QKV_fusion, vector_buf_dsr);
-                } else {
-                    @fmovh(reduce_2nd_1_send_bsz_dim_QKV_fusion, vector_buf_dsr);
-                }
-            } else {
-                if (quotient_pe_id % 2 == 0) {
-                    @faddh(reduce_2nd_0_send_bsz_dim_QKV_fusion, reduce_2nd_1_recv_bsz_dim_QKV_fusion, vector_buf_dsr);
-                } else {
-                    @faddh(reduce_2nd_1_send_bsz_dim_QKV_fusion, reduce_2nd_0_recv_bsz_dim_QKV_fusion, vector_buf_dsr);
-                }
-            }
-        }
+    // switch (X_1st_pe_type) {
+    //     0 => {  // root_px_1st and not end of the group, 
+    //         @faddh(vector_buf_ddsr, reduce_1st_0_recv_dsr, vector_buf_s1dsr);
+    //         @faddh(vector_buf_ddsr, reduce_1st_1_recv_dsr, vector_buf_s1dsr);
+    //     },
+    //     1 => {  // root_px_1st and end of the group, 
+    //         @mov32(ctrl_1st_0_dsr, ctrl_buf_dsr);
+    //         @faddh(vector_buf_ddsr, reduce_1st_1_recv_dsr, vector_buf_s1dsr);
+    //     },
+    //     2 => {  // end of the group and %2 = 0, or top of the group and %2 = 1
+    //         @fmovh(reduce_1st_0_send_dsr, vector_buf_s1dsr);
+    //         @mov32(ctrl_1st_1_dsr, ctrl_buf_dsr);
+    //         @mov32(ctrl_1st_0_dsr, ctrl_buf_dsr);
+    //     },
+    //     3 => {  // bottom half of the group and %2 = 0, or top half of the group and %2 = 1 (except 2)
+    //         @faddh(reduce_1st_0_send_dsr, reduce_1st_1_recv_dsr, vector_buf_s1dsr);
+    //         @mov32(ctrl_1st_0_dsr, ctrl_buf_dsr);
+    //     },
+    //     4 => {  // end of the group and %2 = 1, or top of the group and %2 = 0
+    //         @fmovh(reduce_1st_1_send_dsr, vector_buf_s1dsr);
+    //         @mov32(ctrl_1st_0_dsr, ctrl_buf_dsr);
+    //         @mov32(ctrl_1st_1_dsr, ctrl_buf_dsr);
+    //     },
+    //     5 => {  // top half of the group and %2 = 0, or bottom half of the group and %2 = 1 (except 4)
+    //         @faddh(reduce_1st_1_send_dsr, reduce_1st_0_recv_dsr, vector_buf_s1dsr);
+    //         @mov32(ctrl_1st_1_dsr, ctrl_buf_dsr);
+    //     },
+    //     else => {
+    //         // simprint.fmt_with_coords("print: ERROR X_1st_pe_type is illegal!\n", .{});
+    //     }
+    // }
+
+    // switch (X_2nd_pe_type) {
+    //     0 => {
+    //         @faddh(vector_buf_ddsr, reduce_2nd_0_recv_dsr, vector_buf_s1dsr);
+    //         @faddh(vector_buf_ddsr, reduce_2nd_1_recv_dsr, vector_buf_s1dsr);
+    //     },
+    //     1 => {
+    //         @mov32(ctrl_2nd_0_dsr, ctrl_buf_dsr);
+    //         @faddh(vector_buf_ddsr, reduce_2nd_1_recv_dsr, vector_buf_s1dsr);
+    //     },
+    //     2 => {
+    //         @fmovh(reduce_2nd_0_send_dsr, vector_buf_s1dsr);
+    //         @mov32(ctrl_2nd_0_dsr, ctrl_buf_dsr);
+    //         @mov32(ctrl_2nd_1_dsr, ctrl_buf_dsr);
+    //     },
+    //     3 => {
+    //         @fmovh(reduce_2nd_1_send_dsr, vector_buf_s1dsr);
+    //         @mov32(ctrl_2nd_1_dsr, ctrl_buf_dsr);
+    //         @mov32(ctrl_2nd_0_dsr, ctrl_buf_dsr);
+    //     },
+    //     4 => {
+    //         @faddh(reduce_2nd_0_send_dsr, reduce_2nd_1_recv_dsr, vector_buf_s1dsr);
+    //         @mov32(ctrl_2nd_0_dsr, ctrl_buf_dsr);
+    //     },
+    //     5 => {
+    //         @faddh(reduce_2nd_1_send_dsr, reduce_2nd_0_recv_dsr, vector_buf_s1dsr);
+    //         @mov32(ctrl_2nd_1_dsr, ctrl_buf_dsr);
+    //     },
+    //     6 => {
+    //         @mov32(ctrl_2nd_1_dsr, ctrl_buf_dsr);
+    //     },
+    //     7 => {
+    //         @mov32(ctrl_2nd_0_dsr, ctrl_buf_dsr);
+    //     },
+    //     8 => {
+    //         @mov32(ctrl_2nd_0_dsr, ctrl_buf_dsr);
+    //         @mov32(ctrl_2nd_1_dsr, ctrl_buf_dsr);
+    //     },
+    //     else {
+    //         // simprint.fmt_with_coords("print: ERROR X_2nd_pe_type is illegal!\n", .{});
+    //     }
+    // }
+    // switch (reduce_pe_type) {
+    //     // ==================== Group A: absolute root ====================
+    //     0 => {  // X_1st=0, X_2nd=0: 1st recv both, 2nd recv from both
+    //         // @faddh(vector_buf_ddsr, reduce_1st_0_recv_dsr, vector_buf_s1dsr);
+    //         // @faddh(vector_buf_ddsr, reduce_1st_1_recv_dsr, vector_buf_s1dsr);
+    //         // @faddh(vector_buf_ddsr, reduce_2nd_0_recv_dsr, vector_buf_s1dsr);
+    //         // @faddh(vector_buf_ddsr, reduce_2nd_1_recv_dsr, vector_buf_s1dsr);
+    //         reduce_reset_case_0();
+    //     },
+    //     1 => {  // X_1st=0, X_2nd=1: 1st recv both, 2nd recv from head sides (i.e., it is tail group)
+    //         // @faddh(vector_buf_ddsr, reduce_1st_0_recv_dsr, vector_buf_s1dsr);
+    //         // @faddh(vector_buf_ddsr, reduce_1st_1_recv_dsr, vector_buf_s1dsr);
+    //         // @mov32(ctrl_2nd_0_dsr, ctrl_buf_dsr);
+    //         // @faddh(vector_buf_ddsr, reduce_2nd_1_recv_dsr, vector_buf_s1dsr);
+    //         reduce_reset_case_1();
+    //     },
+    //     2 => {  // X_1st=1, X_2nd=0: 1st only from top (end of the group), 2nd recv both sides
+    //         // @mov32(ctrl_1st_0_dsr, ctrl_buf_dsr);
+    //         // @faddh(vector_buf_ddsr, reduce_1st_1_recv_dsr, vector_buf_s1dsr);
+    //         // @faddh(vector_buf_ddsr, reduce_2nd_0_recv_dsr, vector_buf_s1dsr);
+    //         // @faddh(vector_buf_ddsr, reduce_2nd_1_recv_dsr, vector_buf_s1dsr);
+    //         reduce_reset_case_2();
+    //     },
+    //     3 => {  // X_1st=1, X_2nd=1: 1st only from top, 2nd only from head sides (i.e., it is tail group)
+    //         // @mov32(ctrl_1st_0_dsr, ctrl_buf_dsr);
+    //         // @faddh(vector_buf_ddsr, reduce_1st_1_recv_dsr, vector_buf_s1dsr);
+    //         // @mov32(ctrl_2nd_0_dsr, ctrl_buf_dsr);
+    //         // @faddh(vector_buf_ddsr, reduce_2nd_1_recv_dsr, vector_buf_s1dsr);
+    //         reduce_reset_case_3();
+    //     },
+    //     // ==================== Group B: 1st root, 2nd relay ====================
+    //     4 => {  // X_1st=0, X_2nd=2: 1st recv both, 2nd fmovh→send_0 (root of tail group; even)
+    //         // @faddh(vector_buf_ddsr, reduce_1st_0_recv_dsr, vector_buf_s1dsr);
+    //         // @faddh(vector_buf_ddsr, reduce_1st_1_recv_dsr, vector_buf_s1dsr);
+    //         // @fmovh(reduce_2nd_0_send_dsr, vector_buf_s1dsr);    // TODO: merge this into the previous faddh
+    //         // @mov32(ctrl_2nd_0_dsr, ctrl_buf_dsr);
+    //         // @mov32(ctrl_2nd_1_dsr, ctrl_buf_dsr);
+    //         reduce_reset_case_4();
+    //     },
+    //     5 => {  // X_1st=0, X_2nd=3: 1st recv both, 2nd fmovh→send_1 (root of head group, or root of tail group; odd)
+    //         // @faddh(vector_buf_ddsr, reduce_1st_0_recv_dsr, vector_buf_s1dsr);
+    //         // @faddh(vector_buf_ddsr, reduce_1st_1_recv_dsr, vector_buf_s1dsr);
+    //         // @fmovh(reduce_2nd_1_send_dsr, vector_buf_s1dsr);    // TODO: merge this into the previous faddh
+    //         // @mov32(ctrl_2nd_1_dsr, ctrl_buf_dsr);
+    //         // @mov32(ctrl_2nd_0_dsr, ctrl_buf_dsr);
+    //         reduce_reset_case_5();
+    //     },
+    //     6 => {  // X_1st=0, X_2nd=4: 1st recv both, 2nd faddh→send_0
+    //         // @faddh(vector_buf_ddsr, reduce_1st_0_recv_dsr, vector_buf_s1dsr);
+    //         // @faddh(vector_buf_ddsr, reduce_1st_1_recv_dsr, vector_buf_s1dsr);
+    //         // @faddh(reduce_2nd_0_send_dsr, reduce_2nd_1_recv_dsr, vector_buf_s1dsr);
+    //         // @mov32(ctrl_2nd_0_dsr, ctrl_buf_dsr);
+    //         reduce_reset_case_6();
+    //     },
+    //     7 => {  // X_1st=0, X_2nd=5: 1st recv both, 2nd faddh→send_1
+    //         // @faddh(vector_buf_ddsr, reduce_1st_0_recv_dsr, vector_buf_s1dsr);
+    //         // @faddh(vector_buf_ddsr, reduce_1st_1_recv_dsr, vector_buf_s1dsr);
+    //         // @faddh(reduce_2nd_1_send_dsr, reduce_2nd_0_recv_dsr, vector_buf_s1dsr);
+    //         // @mov32(ctrl_2nd_1_dsr, ctrl_buf_dsr);
+    //         reduce_reset_case_7();
+    //     },
+    //     8 => {  // X_1st=1, X_2nd=2
+    //         // @mov32(ctrl_1st_0_dsr, ctrl_buf_dsr);
+    //         // @faddh(vector_buf_ddsr, reduce_1st_1_recv_dsr, vector_buf_s1dsr);
+    //         // @fmovh(reduce_2nd_0_send_dsr, vector_buf_s1dsr);    // TODO: merge this into the previous faddh
+    //         // @mov32(ctrl_2nd_0_dsr, ctrl_buf_dsr);
+    //         // @mov32(ctrl_2nd_1_dsr, ctrl_buf_dsr);
+    //         reduce_reset_case_8();
+    //     },
+    //     9 => {  // X_1st=1, X_2nd=3
+    //         // @mov32(ctrl_1st_0_dsr, ctrl_buf_dsr);
+    //         // @faddh(vector_buf_ddsr, reduce_1st_1_recv_dsr, vector_buf_s1dsr);
+    //         // @fmovh(reduce_2nd_1_send_dsr, vector_buf_s1dsr);    // TODO: merge this into the previous faddh
+    //         // @mov32(ctrl_2nd_1_dsr, ctrl_buf_dsr);
+    //         // @mov32(ctrl_2nd_0_dsr, ctrl_buf_dsr);
+    //         reduce_reset_case_9();
+    //     },
+    //     10 => {  // X_1st=1, X_2nd=4
+    //         // @mov32(ctrl_1st_0_dsr, ctrl_buf_dsr);
+    //         // @faddh(vector_buf_ddsr, reduce_1st_1_recv_dsr, vector_buf_s1dsr);
+    //         // @faddh(reduce_2nd_0_send_dsr, reduce_2nd_1_recv_dsr, vector_buf_s1dsr);
+    //         // @mov32(ctrl_2nd_0_dsr, ctrl_buf_dsr);
+    //         reduce_reset_case_10();
+    //     },
+    //     11 => {  // X_1st=1, X_2nd=5
+    //         // @mov32(ctrl_1st_0_dsr, ctrl_buf_dsr);
+    //         // @faddh(vector_buf_ddsr, reduce_1st_1_recv_dsr, vector_buf_s1dsr);
+    //         // @faddh(reduce_2nd_1_send_dsr, reduce_2nd_0_recv_dsr, vector_buf_s1dsr);
+    //         // @mov32(ctrl_2nd_1_dsr, ctrl_buf_dsr);
+    //         reduce_reset_case_11();
+    //     },
+    //     // ==================== Group C: non-root (1st data op + 2nd teardown) ====================
+    //     12 => {  // X_1st=2, X_2nd=6
+    //         // @fmovh(reduce_1st_0_send_dsr, vector_buf_s1dsr);
+    //         // @mov32(ctrl_1st_1_dsr, ctrl_buf_dsr);
+    //         // @mov32(ctrl_1st_0_dsr, ctrl_buf_dsr);
+    //         // @mov32(ctrl_2nd_1_dsr, ctrl_buf_dsr);
+    //         reduce_reset_case_12();
+    //     },
+    //     13 => {  // X_1st=2, X_2nd=7
+    //         // @fmovh(reduce_1st_0_send_dsr, vector_buf_s1dsr);
+    //         // @mov32(ctrl_1st_1_dsr, ctrl_buf_dsr);
+    //         // @mov32(ctrl_1st_0_dsr, ctrl_buf_dsr);
+    //         // @mov32(ctrl_2nd_0_dsr, ctrl_buf_dsr);
+    //         reduce_reset_case_13();
+    //     },
+    //     14 => {  // X_1st=2, X_2nd=8
+    //         // @fmovh(reduce_1st_0_send_dsr, vector_buf_s1dsr);
+    //         // @mov32(ctrl_1st_1_dsr, ctrl_buf_dsr);
+    //         // @mov32(ctrl_1st_0_dsr, ctrl_buf_dsr);
+    //         // @mov32(ctrl_2nd_0_dsr, ctrl_buf_dsr);
+    //         // @mov32(ctrl_2nd_1_dsr, ctrl_buf_dsr);
+    //         reduce_reset_case_14();
+    //     },
+    //     15 => {  // X_1st=3, X_2nd=6
+    //         // @faddh(reduce_1st_0_send_dsr, reduce_1st_1_recv_dsr, vector_buf_s1dsr);
+    //         // @mov32(ctrl_1st_0_dsr, ctrl_buf_dsr);
+    //         // @mov32(ctrl_2nd_1_dsr, ctrl_buf_dsr);
+    //         reduce_reset_case_15();
+    //     },
+    //     16 => {  // X_1st=3, X_2nd=7
+    //         // @faddh(reduce_1st_0_send_dsr, reduce_1st_1_recv_dsr, vector_buf_s1dsr);
+    //         // @mov32(ctrl_1st_0_dsr, ctrl_buf_dsr);
+    //         // @mov32(ctrl_2nd_0_dsr, ctrl_buf_dsr);
+    //         reduce_reset_case_16();
+    //     },
+    //     17 => {  // X_1st=3, X_2nd=8
+    //         // @faddh(reduce_1st_0_send_dsr, reduce_1st_1_recv_dsr, vector_buf_s1dsr);
+    //         // @mov32(ctrl_1st_0_dsr, ctrl_buf_dsr);
+    //         // @mov32(ctrl_2nd_0_dsr, ctrl_buf_dsr);
+    //         // @mov32(ctrl_2nd_1_dsr, ctrl_buf_dsr);
+    //         reduce_reset_case_17();
+    //     },
+    //     18 => {  // X_1st=4, X_2nd=6
+    //         // @fmovh(reduce_1st_1_send_dsr, vector_buf_s1dsr);
+    //         // @mov32(ctrl_1st_0_dsr, ctrl_buf_dsr);
+    //         // @mov32(ctrl_1st_1_dsr, ctrl_buf_dsr);
+    //         // @mov32(ctrl_2nd_1_dsr, ctrl_buf_dsr);
+    //         reduce_reset_case_18();
+    //     },
+    //     19 => {  // X_1st=4, X_2nd=7
+    //         // @fmovh(reduce_1st_1_send_dsr, vector_buf_s1dsr);
+    //         // @mov32(ctrl_1st_0_dsr, ctrl_buf_dsr);
+    //         // @mov32(ctrl_1st_1_dsr, ctrl_buf_dsr);
+    //         // @mov32(ctrl_2nd_0_dsr, ctrl_buf_dsr);
+    //         reduce_reset_case_19();
+    //     },
+    //     20 => {  // X_1st=4, X_2nd=8
+    //         // @fmovh(reduce_1st_1_send_dsr, vector_buf_s1dsr);
+    //         // @mov32(ctrl_1st_0_dsr, ctrl_buf_dsr);
+    //         // @mov32(ctrl_1st_1_dsr, ctrl_buf_dsr);
+    //         // @mov32(ctrl_2nd_0_dsr, ctrl_buf_dsr);
+    //         // @mov32(ctrl_2nd_1_dsr, ctrl_buf_dsr);
+    //         reduce_reset_case_20();
+    //     },
+    //     21 => {  // X_1st=5, X_2nd=6
+    //         // @faddh(reduce_1st_1_send_dsr, reduce_1st_0_recv_dsr, vector_buf_s1dsr);
+    //         // @mov32(ctrl_1st_1_dsr, ctrl_buf_dsr);
+    //         // @mov32(ctrl_2nd_1_dsr, ctrl_buf_dsr);
+    //         reduce_reset_case_21();
+    //     },
+    //     22 => {  // X_1st=5, X_2nd=7
+    //         // @faddh(reduce_1st_1_send_dsr, reduce_1st_0_recv_dsr, vector_buf_s1dsr);
+    //         // @mov32(ctrl_1st_1_dsr, ctrl_buf_dsr);
+    //         // @mov32(ctrl_2nd_0_dsr, ctrl_buf_dsr);
+    //         reduce_reset_case_22();
+    //     },
+    //     23 => {  // X_1st=5, X_2nd=8
+    //         // @faddh(reduce_1st_1_send_dsr, reduce_1st_0_recv_dsr, vector_buf_s1dsr);
+    //         // @mov32(ctrl_1st_1_dsr, ctrl_buf_dsr);
+    //         // @mov32(ctrl_2nd_0_dsr, ctrl_buf_dsr);
+    //         // @mov32(ctrl_2nd_1_dsr, ctrl_buf_dsr);
+    //         reduce_reset_case_23();
+    //     },
+    //     else => {},
+    // }
+    reduce_reset_funcs[reduce_pe_type]();
+
+
+    if (bdcast_pe_type == 0) {
+        @mov16(bdcast_send_dsr, vector_buf_s1dsr);
+        @mov32(ctrl_bdcast_dsr, ctrl_buf_dsr);
     } else {
-        if (remainder_pe_id == root_1st_phase) {
-            if (pe_id < pe_num_p_group) {
-                @fmovh(reduce_2nd_1_send_bsz_dim_QKV_fusion, vector_buf_dsr);
-            } else {
-                if (quotient_pe_id % 2 == 0) {
-                    @faddh(reduce_2nd_1_send_bsz_dim_QKV_fusion, reduce_2nd_0_recv_bsz_dim_QKV_fusion, vector_buf_dsr);
-                } else {
-                    @faddh(reduce_2nd_0_send_bsz_dim_QKV_fusion, reduce_2nd_1_recv_bsz_dim_QKV_fusion, vector_buf_dsr);
-                }
-            }
-        }
+        @mov16(vector_buf_ddsr, bdcast_recv_dsr);
     }
 
-    // Broadcast
-    if (pe_id == root_2nd_phase) {
-        @mov16(bdcast_send_bsz_dim_QKV_fusion, vector_buf_dsr);
-    } else {
-        @mov16(vector_buf_dsd_bsz_dim_QKV_fusion, bdcast_recv_bsz_dim_QKV_fusion);
-    }
+    @block(reduce_1st_0_recv_queue_id);
+    @block(reduce_1st_1_recv_queue_id);
+    @block(reduce_2nd_0_recv_queue_id);
+    @block(reduce_2nd_1_recv_queue_id);
+    @block(broadcast_recv_queue_id);
 }
 
-fn all_reduce_bsz_seq_len(pe_id: i16, quotient_pe_id: i16, remainder_pe_id: i16, vector_buf_ptr: [*]f16) void {
-    vector_buf_dsd_bsz_seq_len = @set_dsd_base_addr(vector_buf_dsd_bsz_seq_len, vector_buf_ptr);
-    @load_to_dsr(vector_buf_dsr, vector_buf_dsd_bsz_seq_len);
-
-    // 1st phase reduce
-    if (remainder_pe_id == root_1st_phase) {
-        if (root_1st_phase < pe_num_p_group - 1) {
-            @faddh(vector_buf_dsd_bsz_seq_len, reduce_1st_0_recv_bsz_seq_len, vector_buf_dsr);
-        }
-        @faddh(vector_buf_dsd_bsz_seq_len, reduce_1st_1_recv_bsz_seq_len, vector_buf_dsr);
-    } else if (remainder_pe_id > root_1st_phase) {
-        if (remainder_pe_id % 2 == 0) {
-            if (remainder_pe_id == pe_num_p_group - 1) {
-                @fmovh(reduce_1st_0_send_bsz_seq_len, vector_buf_dsr);
-            } else {
-                @faddh(reduce_1st_0_send_bsz_seq_len, reduce_1st_1_recv_bsz_seq_len, vector_buf_dsr);
-            }
-        } else {
-            // remainder_pe_id % 2 == 1
-            if (remainder_pe_id == pe_num_p_group - 1) {
-                @fmovh(reduce_1st_1_send_bsz_seq_len, vector_buf_dsr);
-            } else {
-                @faddh(reduce_1st_1_send_bsz_seq_len, reduce_1st_0_recv_bsz_seq_len, vector_buf_dsr);
-            }
-        }
-    } else {
-        // remainder_pe_id < root_1st_phase
-        if (remainder_pe_id % 2 == 0) {
-            if (remainder_pe_id == 0) {
-                @fmovh(reduce_1st_1_send_bsz_seq_len, vector_buf_dsr);
-            } else {
-                @faddh(reduce_1st_1_send_bsz_seq_len, reduce_1st_0_recv_bsz_seq_len, vector_buf_dsr);
-            }
-        } else {
-            // remainder_pe_id never be 0
-            @faddh(reduce_1st_0_send_bsz_seq_len, reduce_1st_1_recv_bsz_seq_len, vector_buf_dsr);
-        }
-    }
-
-    // 2nd phase reduce
-    if (pe_id == root_2nd_phase) {
-        if (root_2nd_phase < P - pe_num_p_group) {
-            @faddh(vector_buf_dsd_bsz_seq_len, reduce_2nd_0_recv_bsz_seq_len, vector_buf_dsr);
-        }
-        @faddh(vector_buf_dsd_bsz_seq_len, reduce_2nd_1_recv_bsz_seq_len, vector_buf_dsr);
-    } else if (pe_id > root_2nd_phase) {
-        if (remainder_pe_id == root_1st_phase) {
-            if (pe_id > P - pe_num_p_group - 1) {
-                if (quotient_pe_id % 2 == 0) {
-                    @fmovh(reduce_2nd_0_send_bsz_seq_len, vector_buf_dsr);
-                } else {
-                    @fmovh(reduce_2nd_1_send_bsz_seq_len, vector_buf_dsr);
-                }
-            } else {
-                if (quotient_pe_id % 2 == 0) {
-                    @faddh(reduce_2nd_0_send_bsz_seq_len, reduce_2nd_1_recv_bsz_seq_len, vector_buf_dsr);
-                } else {
-                    @faddh(reduce_2nd_1_send_bsz_seq_len, reduce_2nd_0_recv_bsz_seq_len, vector_buf_dsr);
-                }
-            }
-        }
-    } else {
-        if (remainder_pe_id == root_1st_phase) {
-            if (pe_id < pe_num_p_group) {
-                @fmovh(reduce_2nd_1_send_bsz_seq_len, vector_buf_dsr);
-            } else {
-                if (quotient_pe_id % 2 == 0) {
-                    @faddh(reduce_2nd_1_send_bsz_seq_len, reduce_2nd_0_recv_bsz_seq_len, vector_buf_dsr);
-                } else {
-                    @faddh(reduce_2nd_0_send_bsz_seq_len, reduce_2nd_1_recv_bsz_seq_len, vector_buf_dsr);
-                }
-            }
-        }
-    }
-
-    // Broadcast
-    if (pe_id == root_2nd_phase) {
-        @mov16(bdcast_send_bsz_seq_len, vector_buf_dsr);
-    } else {
-        @mov16(vector_buf_dsd_bsz_seq_len, bdcast_recv_bsz_seq_len);
-    }
+// ==================== helper fns for all_reduce_without_reset ====================
+fn reduce_noreset_case_0() void {
+    @faddh(vector_buf_ddsr, reduce_1st_0_recv_dsr, vector_buf_s1dsr);
+    @faddh(vector_buf_ddsr, reduce_1st_1_recv_dsr, vector_buf_s1dsr);
+    @faddh(vector_buf_ddsr, reduce_2nd_0_recv_dsr, vector_buf_s1dsr);
+    @faddh(vector_buf_ddsr, reduce_2nd_1_recv_dsr, vector_buf_s1dsr);
+}
+fn reduce_noreset_case_1() void {
+    @faddh(vector_buf_ddsr, reduce_1st_0_recv_dsr, vector_buf_s1dsr);
+    @faddh(vector_buf_ddsr, reduce_1st_1_recv_dsr, vector_buf_s1dsr);
+    @faddh(vector_buf_ddsr, reduce_2nd_1_recv_dsr, vector_buf_s1dsr);
+}
+fn reduce_noreset_case_2() void {
+    @faddh(vector_buf_ddsr, reduce_1st_1_recv_dsr, vector_buf_s1dsr);
+    @faddh(vector_buf_ddsr, reduce_2nd_0_recv_dsr, vector_buf_s1dsr);
+    @faddh(vector_buf_ddsr, reduce_2nd_1_recv_dsr, vector_buf_s1dsr);
+}
+fn reduce_noreset_case_3() void {
+    @faddh(vector_buf_ddsr, reduce_1st_1_recv_dsr, vector_buf_s1dsr);
+    @faddh(vector_buf_ddsr, reduce_2nd_1_recv_dsr, vector_buf_s1dsr);
+}
+fn reduce_noreset_case_4() void {
+    @faddh(vector_buf_ddsr, reduce_1st_0_recv_dsr, vector_buf_s1dsr);
+    // @faddh(vector_buf_ddsr, reduce_1st_1_recv_dsr, vector_buf_s1dsr);
+    // @fmovh(reduce_2nd_0_send_dsr, vector_buf_s1dsr);    // TODO: merge this into the previous faddh
+    @faddh(reduce_2nd_0_send_dsr, reduce_1st_1_recv_dsr, vector_buf_s1dsr);
+}
+fn reduce_noreset_case_5() void {
+    @faddh(vector_buf_ddsr, reduce_1st_0_recv_dsr, vector_buf_s1dsr);
+    // @faddh(vector_buf_ddsr, reduce_1st_1_recv_dsr, vector_buf_s1dsr);
+    // @fmovh(reduce_2nd_1_send_dsr, vector_buf_s1dsr);    // TODO: merge this into the previous faddh
+    @faddh(reduce_2nd_1_send_dsr, reduce_1st_1_recv_dsr, vector_buf_s1dsr);
+}
+fn reduce_noreset_case_6() void {
+    @faddh(vector_buf_ddsr, reduce_1st_0_recv_dsr, vector_buf_s1dsr);
+    @faddh(vector_buf_ddsr, reduce_1st_1_recv_dsr, vector_buf_s1dsr);
+    @faddh(reduce_2nd_0_send_dsr, reduce_2nd_1_recv_dsr, vector_buf_s1dsr);
+}
+fn reduce_noreset_case_7() void {
+    @faddh(vector_buf_ddsr, reduce_1st_0_recv_dsr, vector_buf_s1dsr);
+    @faddh(vector_buf_ddsr, reduce_1st_1_recv_dsr, vector_buf_s1dsr);
+    @faddh(reduce_2nd_1_send_dsr, reduce_2nd_0_recv_dsr, vector_buf_s1dsr);
+}
+fn reduce_noreset_case_8() void {
+    // @faddh(vector_buf_ddsr, reduce_1st_1_recv_dsr, vector_buf_s1dsr);
+    // @fmovh(reduce_2nd_0_send_dsr, vector_buf_s1dsr);    // TODO: merge this into the previous faddh
+    @faddh(reduce_2nd_0_send_dsr, reduce_1st_1_recv_dsr, vector_buf_s1dsr);
+}
+fn reduce_noreset_case_9() void {
+    // @faddh(vector_buf_ddsr, reduce_1st_1_recv_dsr, vector_buf_s1dsr);
+    // @fmovh(reduce_2nd_1_send_dsr, vector_buf_s1dsr);    // TODO: merge this into the previous faddh
+    @faddh(reduce_2nd_1_send_dsr, reduce_1st_1_recv_dsr, vector_buf_s1dsr);
+}
+fn reduce_noreset_case_10() void {
+    @faddh(vector_buf_ddsr, reduce_1st_1_recv_dsr, vector_buf_s1dsr);
+    @faddh(reduce_2nd_0_send_dsr, reduce_2nd_1_recv_dsr, vector_buf_s1dsr);
+}
+fn reduce_noreset_case_11() void {
+    @faddh(vector_buf_ddsr, reduce_1st_1_recv_dsr, vector_buf_s1dsr);
+    @faddh(reduce_2nd_1_send_dsr, reduce_2nd_0_recv_dsr, vector_buf_s1dsr);
+}
+fn reduce_noreset_case_12_13_14() void {
+    @fmovh(reduce_1st_0_send_dsr, vector_buf_s1dsr);
+}
+fn reduce_noreset_case_15_16_17() void {
+    @faddh(reduce_1st_0_send_dsr, reduce_1st_1_recv_dsr, vector_buf_s1dsr);
+}
+fn reduce_noreset_case_18_19_20() void {
+    @fmovh(reduce_1st_1_send_dsr, vector_buf_s1dsr);
+}
+fn reduce_noreset_case_21_22_23() void {
+    @faddh(reduce_1st_1_send_dsr, reduce_1st_0_recv_dsr, vector_buf_s1dsr);
 }
 
-fn all_reduce_bsz_ffn_dim_ZZ_fusion(pe_id: i16, quotient_pe_id: i16, remainder_pe_id: i16, vector_buf_ptr: [*]f16) void {
-    vector_buf_dsd_bsz_ffn_dim_ZZ_fusion = @set_dsd_base_addr(vector_buf_dsd_bsz_ffn_dim_ZZ_fusion, vector_buf_ptr);
-    @load_to_dsr(vector_buf_dsr, vector_buf_dsd_bsz_ffn_dim_ZZ_fusion);
+const reduce_noreset_funcs = [24](*const fn()void) {
+    reduce_noreset_case_0,
+    reduce_noreset_case_1,
+    reduce_noreset_case_2,
+    reduce_noreset_case_3,
+    reduce_noreset_case_4,
+    reduce_noreset_case_5,
+    reduce_noreset_case_6,
+    reduce_noreset_case_7,
+    reduce_noreset_case_8,
+    reduce_noreset_case_9,
+    reduce_noreset_case_10,
+    reduce_noreset_case_11,
+    reduce_noreset_case_12_13_14,
+    reduce_noreset_case_12_13_14,
+    reduce_noreset_case_12_13_14,
+    reduce_noreset_case_15_16_17,
+    reduce_noreset_case_15_16_17,
+    reduce_noreset_case_15_16_17,
+    reduce_noreset_case_18_19_20,
+    reduce_noreset_case_18_19_20,
+    reduce_noreset_case_18_19_20,
+    reduce_noreset_case_21_22_23,
+    reduce_noreset_case_21_22_23,
+    reduce_noreset_case_21_22_23,
+};
 
-    // 1st phase reduce
-    if (remainder_pe_id == root_1st_phase) {
-        if (root_1st_phase < pe_num_p_group - 1) {
-            @faddh(vector_buf_dsd_bsz_ffn_dim_ZZ_fusion, reduce_1st_0_recv_bsz_ffn_dim_ZZ_fusion, vector_buf_dsr);
-        }
-        @faddh(vector_buf_dsd_bsz_ffn_dim_ZZ_fusion, reduce_1st_1_recv_bsz_ffn_dim_ZZ_fusion, vector_buf_dsr);
-    } else if (remainder_pe_id > root_1st_phase) {
-        if (remainder_pe_id % 2 == 0) {
-            if (remainder_pe_id == pe_num_p_group - 1) {
-                @fmovh(reduce_1st_0_send_bsz_ffn_dim_ZZ_fusion, vector_buf_dsr);
-            } else {
-                @faddh(reduce_1st_0_send_bsz_ffn_dim_ZZ_fusion, reduce_1st_1_recv_bsz_ffn_dim_ZZ_fusion, vector_buf_dsr);
-            }
-        } else {
-            // remainder_pe_id % 2 == 1
-            if (remainder_pe_id == pe_num_p_group - 1) {
-                @fmovh(reduce_1st_1_send_bsz_ffn_dim_ZZ_fusion, vector_buf_dsr);
-            } else {
-                @faddh(reduce_1st_1_send_bsz_ffn_dim_ZZ_fusion, reduce_1st_0_recv_bsz_ffn_dim_ZZ_fusion, vector_buf_dsr);
-            }
-        }
-    } else {
-        // remainder_pe_id < root_1st_phase
-        if (remainder_pe_id % 2 == 0) {
-            if (remainder_pe_id == 0) {
-                @fmovh(reduce_1st_1_send_bsz_ffn_dim_ZZ_fusion, vector_buf_dsr);
-            } else {
-                @faddh(reduce_1st_1_send_bsz_ffn_dim_ZZ_fusion, reduce_1st_0_recv_bsz_ffn_dim_ZZ_fusion, vector_buf_dsr);
-            }
-        } else {
-            // remainder_pe_id never be 0
-            @faddh(reduce_1st_0_send_bsz_ffn_dim_ZZ_fusion, reduce_1st_1_recv_bsz_ffn_dim_ZZ_fusion, vector_buf_dsr);
-        }
-    }
-
-    // 2nd phase reduce
-    if (pe_id == root_2nd_phase) {
-        if (root_2nd_phase < P - pe_num_p_group) {
-            @faddh(vector_buf_dsd_bsz_ffn_dim_ZZ_fusion, reduce_2nd_0_recv_bsz_ffn_dim_ZZ_fusion, vector_buf_dsr);
-        }
-        @faddh(vector_buf_dsd_bsz_ffn_dim_ZZ_fusion, reduce_2nd_1_recv_bsz_ffn_dim_ZZ_fusion, vector_buf_dsr);
-    } else if (pe_id > root_2nd_phase) {
-        if (remainder_pe_id == root_1st_phase) {
-            if (pe_id > P - pe_num_p_group - 1) {
-                if (quotient_pe_id % 2 == 0) {
-                    @fmovh(reduce_2nd_0_send_bsz_ffn_dim_ZZ_fusion, vector_buf_dsr);
-                } else {
-                    @fmovh(reduce_2nd_1_send_bsz_ffn_dim_ZZ_fusion, vector_buf_dsr);
-                }
-            } else {
-                if (quotient_pe_id % 2 == 0) {
-                    @faddh(reduce_2nd_0_send_bsz_ffn_dim_ZZ_fusion, reduce_2nd_1_recv_bsz_ffn_dim_ZZ_fusion, vector_buf_dsr);
-                } else {
-                    @faddh(reduce_2nd_1_send_bsz_ffn_dim_ZZ_fusion, reduce_2nd_0_recv_bsz_ffn_dim_ZZ_fusion, vector_buf_dsr);
-                }
-            }
-        }
-    } else {
-        if (remainder_pe_id == root_1st_phase) {
-            if (pe_id < pe_num_p_group) {
-                @fmovh(reduce_2nd_1_send_bsz_ffn_dim_ZZ_fusion, vector_buf_dsr);
-            } else {
-                if (quotient_pe_id % 2 == 0) {
-                    @faddh(reduce_2nd_1_send_bsz_ffn_dim_ZZ_fusion, reduce_2nd_0_recv_bsz_ffn_dim_ZZ_fusion, vector_buf_dsr);
-                } else {
-                    @faddh(reduce_2nd_0_send_bsz_ffn_dim_ZZ_fusion, reduce_2nd_1_recv_bsz_ffn_dim_ZZ_fusion, vector_buf_dsr);
-                }
-            }
-        }
-    }
-
-    // Broadcast
-    if (pe_id == root_2nd_phase) {
-        @mov16(bdcast_send_bsz_ffn_dim_ZZ_fusion, vector_buf_dsr);
-    } else {
-        @mov16(vector_buf_dsd_bsz_ffn_dim_ZZ_fusion, bdcast_recv_bsz_ffn_dim_ZZ_fusion);
-    }
+// ==================== helper fns for all_reduceMax_without_reset ====================
+fn reduceMax_noreset_case_0() void {
+    @fmaxh(vector_buf_ddsr, reduce_1st_0_recv_dsr, vector_buf_s1dsr);
+    @fmaxh(vector_buf_ddsr, reduce_1st_1_recv_dsr, vector_buf_s1dsr);
+    @fmaxh(vector_buf_ddsr, reduce_2nd_0_recv_dsr, vector_buf_s1dsr);
+    @fmaxh(vector_buf_ddsr, reduce_2nd_1_recv_dsr, vector_buf_s1dsr);
+}
+fn reduceMax_noreset_case_1() void {
+    @fmaxh(vector_buf_ddsr, reduce_1st_0_recv_dsr, vector_buf_s1dsr);
+    @fmaxh(vector_buf_ddsr, reduce_1st_1_recv_dsr, vector_buf_s1dsr);
+    @fmaxh(vector_buf_ddsr, reduce_2nd_1_recv_dsr, vector_buf_s1dsr);
+}
+fn reduceMax_noreset_case_2() void {
+    @fmaxh(vector_buf_ddsr, reduce_1st_1_recv_dsr, vector_buf_s1dsr);
+    @fmaxh(vector_buf_ddsr, reduce_2nd_0_recv_dsr, vector_buf_s1dsr);
+    @fmaxh(vector_buf_ddsr, reduce_2nd_1_recv_dsr, vector_buf_s1dsr);
+}
+fn reduceMax_noreset_case_3() void {
+    @fmaxh(vector_buf_ddsr, reduce_1st_1_recv_dsr, vector_buf_s1dsr);
+    @fmaxh(vector_buf_ddsr, reduce_2nd_1_recv_dsr, vector_buf_s1dsr);
+}
+fn reduceMax_noreset_case_4() void {
+    @fmaxh(vector_buf_ddsr, reduce_1st_0_recv_dsr, vector_buf_s1dsr);
+    // @fmaxh(vector_buf_ddsr, reduce_1st_1_recv_dsr, vector_buf_s1dsr);
+    // @fmovh(reduce_2nd_0_send_dsr, vector_buf_s1dsr);    // TODO: merge this into the previous fmaxh
+    @fmaxh(reduce_2nd_0_send_dsr, reduce_1st_1_recv_dsr, vector_buf_s1dsr);
+}
+fn reduceMax_noreset_case_5() void {
+    @fmaxh(vector_buf_ddsr, reduce_1st_0_recv_dsr, vector_buf_s1dsr);
+    // @fmaxh(vector_buf_ddsr, reduce_1st_1_recv_dsr, vector_buf_s1dsr);
+    // @fmovh(reduce_2nd_1_send_dsr, vector_buf_s1dsr);    // TODO: merge this into the previous fmaxh
+    @fmaxh(reduce_2nd_1_send_dsr, reduce_1st_1_recv_dsr, vector_buf_s1dsr);
+}
+fn reduceMax_noreset_case_6() void {
+    @fmaxh(vector_buf_ddsr, reduce_1st_0_recv_dsr, vector_buf_s1dsr);
+    @fmaxh(vector_buf_ddsr, reduce_1st_1_recv_dsr, vector_buf_s1dsr);
+    @fmaxh(reduce_2nd_0_send_dsr, reduce_2nd_1_recv_dsr, vector_buf_s1dsr);
+}
+fn reduceMax_noreset_case_7() void {
+    @fmaxh(vector_buf_ddsr, reduce_1st_0_recv_dsr, vector_buf_s1dsr);
+    @fmaxh(vector_buf_ddsr, reduce_1st_1_recv_dsr, vector_buf_s1dsr);
+    @fmaxh(reduce_2nd_1_send_dsr, reduce_2nd_0_recv_dsr, vector_buf_s1dsr);
+}
+fn reduceMax_noreset_case_8() void {
+    // @fmaxh(vector_buf_ddsr, reduce_1st_1_recv_dsr, vector_buf_s1dsr);
+    // @fmovh(reduce_2nd_0_send_dsr, vector_buf_s1dsr);    // TODO: merge this into the previous fmaxh
+    @fmaxh(reduce_2nd_0_send_dsr, reduce_1st_1_recv_dsr, vector_buf_s1dsr);
+}
+fn reduceMax_noreset_case_9() void {
+    // @fmaxh(vector_buf_ddsr, reduce_1st_1_recv_dsr, vector_buf_s1dsr);
+    // @fmovh(reduce_2nd_1_send_dsr, vector_buf_s1dsr);    // TODO: merge this into the previous fmaxh
+    @fmaxh(reduce_2nd_1_send_dsr, reduce_1st_1_recv_dsr, vector_buf_s1dsr);
+}
+fn reduceMax_noreset_case_10() void {
+    @fmaxh(vector_buf_ddsr, reduce_1st_1_recv_dsr, vector_buf_s1dsr);
+    @fmaxh(reduce_2nd_0_send_dsr, reduce_2nd_1_recv_dsr, vector_buf_s1dsr);
+}
+fn reduceMax_noreset_case_11() void {
+    @fmaxh(vector_buf_ddsr, reduce_1st_1_recv_dsr, vector_buf_s1dsr);
+    @fmaxh(reduce_2nd_1_send_dsr, reduce_2nd_0_recv_dsr, vector_buf_s1dsr);
+}
+fn reduceMax_noreset_case_12_13_14() void {
+    @fmovh(reduce_1st_0_send_dsr, vector_buf_s1dsr);
+}
+fn reduceMax_noreset_case_15_16_17() void {
+    @fmaxh(reduce_1st_0_send_dsr, reduce_1st_1_recv_dsr, vector_buf_s1dsr);
+}
+fn reduceMax_noreset_case_18_19_20() void {
+    @fmovh(reduce_1st_1_send_dsr, vector_buf_s1dsr);
+}
+fn reduceMax_noreset_case_21_22_23() void {
+    @fmaxh(reduce_1st_1_send_dsr, reduce_1st_0_recv_dsr, vector_buf_s1dsr);
 }
 
-fn reconfig_allreduce_axis(axis: i16) void {
-    if (axis == 0) {
+const reduceMax_noreset_funcs = [24](*const fn()void) {
+    reduceMax_noreset_case_0,
+    reduceMax_noreset_case_1,
+    reduceMax_noreset_case_2,
+    reduceMax_noreset_case_3,
+    reduceMax_noreset_case_4,
+    reduceMax_noreset_case_5,
+    reduceMax_noreset_case_6,
+    reduceMax_noreset_case_7,
+    reduceMax_noreset_case_8,
+    reduceMax_noreset_case_9,
+    reduceMax_noreset_case_10,
+    reduceMax_noreset_case_11,
+    reduceMax_noreset_case_12_13_14,
+    reduceMax_noreset_case_12_13_14,
+    reduceMax_noreset_case_12_13_14,
+    reduceMax_noreset_case_15_16_17,
+    reduceMax_noreset_case_15_16_17,
+    reduceMax_noreset_case_15_16_17,
+    reduceMax_noreset_case_18_19_20,
+    reduceMax_noreset_case_18_19_20,
+    reduceMax_noreset_case_18_19_20,
+    reduceMax_noreset_case_21_22_23,
+    reduceMax_noreset_case_21_22_23,
+    reduceMax_noreset_case_21_22_23,
+};
+
+fn all_reduce_without_reset(size: u16, vector_buf_ptr: [*]f16, c_axis: comm_axis, is_max: bool) void {
+    @set_dsr_length(reduce_1st_0_send_dsr, size);
+    @set_dsr_length(reduce_1st_1_send_dsr, size);
+    @set_dsr_length(reduce_2nd_0_send_dsr, size);
+    @set_dsr_length(reduce_2nd_1_send_dsr, size);
+    @set_dsr_length(bdcast_send_dsr, size);
+
+    @set_dsr_length(reduce_1st_0_recv_dsr, size);
+    @set_dsr_length(reduce_1st_1_recv_dsr, size);
+    @set_dsr_length(reduce_2nd_0_recv_dsr, size);
+    @set_dsr_length(reduce_2nd_1_recv_dsr, size);
+    @set_dsr_length(bdcast_recv_dsr, size);
+
+    vector_buf_dsd = @set_dsd_length(vector_buf_dsd, size);
+    vector_buf_dsd = @set_dsd_base_addr(vector_buf_dsd, vector_buf_ptr);
+    @load_to_dsr(vector_buf_ddsr, vector_buf_dsd);
+    @load_to_dsr(vector_buf_s1dsr, vector_buf_dsd);
+
+    switch (c_axis) {
+        comm_axis.horizontal => {
+            reduce_pe_type = X_reduce_pe_type;
+            bdcast_pe_type = X_bdcast_pe_type;
+        },
+        comm_axis.vertical => {
+            reduce_pe_type = Y_reduce_pe_type;
+            bdcast_pe_type = Y_bdcast_pe_type;
+        },
+        comm_axis.horizontal_in_head => {
+            reduce_pe_type = XH_reduce_pe_type;
+            bdcast_pe_type = XH_bdcast_pe_type;
+        },
+    }
+
+    // switch (reduce_pe_type) {
+    //     // ==================== Group A: absolute root ====================
+    //     0 => {  // X_1st=0, X_2nd=0: 1st recv both, 2nd recv from both
+    //         // @faddh(vector_buf_ddsr, reduce_1st_0_recv_dsr, vector_buf_s1dsr);
+    //         // @faddh(vector_buf_ddsr, reduce_1st_1_recv_dsr, vector_buf_s1dsr);
+    //         // @faddh(vector_buf_ddsr, reduce_2nd_0_recv_dsr, vector_buf_s1dsr);
+    //         // @faddh(vector_buf_ddsr, reduce_2nd_1_recv_dsr, vector_buf_s1dsr);
+    //         reduce_noreset_case_0();
+    //     },
+    //     1 => {  // X_1st=0, X_2nd=1: 1st recv both, 2nd recv from head sides (i.e., it is tail group)
+    //         // @faddh(vector_buf_ddsr, reduce_1st_0_recv_dsr, vector_buf_s1dsr);
+    //         // @faddh(vector_buf_ddsr, reduce_1st_1_recv_dsr, vector_buf_s1dsr);
+    //         // @faddh(vector_buf_ddsr, reduce_2nd_1_recv_dsr, vector_buf_s1dsr);
+    //         reduce_noreset_case_1();
+    //     },
+    //     2 => {  // X_1st=1, X_2nd=0: 1st only from top (end of the group), 2nd recv both sides
+    //         // @faddh(vector_buf_ddsr, reduce_1st_1_recv_dsr, vector_buf_s1dsr);
+    //         // @faddh(vector_buf_ddsr, reduce_2nd_0_recv_dsr, vector_buf_s1dsr);
+    //         // @faddh(vector_buf_ddsr, reduce_2nd_1_recv_dsr, vector_buf_s1dsr);
+    //         reduce_noreset_case_2();
+    //     },
+    //     3 => {  // X_1st=1, X_2nd=1: 1st only from top, 2nd only from head sides (i.e., it is tail group)
+    //         // @faddh(vector_buf_ddsr, reduce_1st_1_recv_dsr, vector_buf_s1dsr);
+    //         // @faddh(vector_buf_ddsr, reduce_2nd_1_recv_dsr, vector_buf_s1dsr);
+    //         reduce_noreset_case_3();
+    //     },
+    //     // ==================== Group B: 1st root, 2nd relay ====================
+    //     4 => {  // X_1st=0, X_2nd=2: 1st recv both, 2nd fmovh→send_0 (root of tail group; even)
+    //         // @faddh(vector_buf_ddsr, reduce_1st_0_recv_dsr, vector_buf_s1dsr);
+    //         // @faddh(vector_buf_ddsr, reduce_1st_1_recv_dsr, vector_buf_s1dsr);
+    //         // @fmovh(reduce_2nd_0_send_dsr, vector_buf_s1dsr);    // TODO: merge this into the previous faddh
+    //         reduce_noreset_case_4();
+    //     },
+    //     5 => {  // X_1st=0, X_2nd=3: 1st recv both, 2nd fmovh→send_1 (root of head group, or root of tail group; odd)
+    //         // @faddh(vector_buf_ddsr, reduce_1st_0_recv_dsr, vector_buf_s1dsr);
+    //         // @faddh(vector_buf_ddsr, reduce_1st_1_recv_dsr, vector_buf_s1dsr);
+    //         // @fmovh(reduce_2nd_1_send_dsr, vector_buf_s1dsr);    // TODO: merge this into the previous faddh
+    //         reduce_noreset_case_5();
+    //     },
+    //     6 => {  // X_1st=0, X_2nd=4: 1st recv both, 2nd faddh→send_0
+    //         // @faddh(vector_buf_ddsr, reduce_1st_0_recv_dsr, vector_buf_s1dsr);
+    //         // @faddh(vector_buf_ddsr, reduce_1st_1_recv_dsr, vector_buf_s1dsr);
+    //         // @faddh(reduce_2nd_0_send_dsr, reduce_2nd_1_recv_dsr, vector_buf_s1dsr);
+    //         reduce_noreset_case_6();
+    //     },
+    //     7 => {  // X_1st=0, X_2nd=5: 1st recv both, 2nd faddh→send_1
+    //         // @faddh(vector_buf_ddsr, reduce_1st_0_recv_dsr, vector_buf_s1dsr);
+    //         // @faddh(vector_buf_ddsr, reduce_1st_1_recv_dsr, vector_buf_s1dsr);
+    //         // @faddh(reduce_2nd_1_send_dsr, reduce_2nd_0_recv_dsr, vector_buf_s1dsr);
+    //         reduce_noreset_case_7();
+    //     },
+    //     8 => {  // X_1st=1, X_2nd=2
+    //         // @faddh(vector_buf_ddsr, reduce_1st_1_recv_dsr, vector_buf_s1dsr);
+    //         // @fmovh(reduce_2nd_0_send_dsr, vector_buf_s1dsr);    // TODO: merge this into the previous faddh
+    //         reduce_noreset_case_8();
+    //     },
+    //     9 => {  // X_1st=1, X_2nd=3
+    //         // @faddh(vector_buf_ddsr, reduce_1st_1_recv_dsr, vector_buf_s1dsr);
+    //         // @fmovh(reduce_2nd_1_send_dsr, vector_buf_s1dsr);    // TODO: merge this into the previous faddh
+    //         reduce_noreset_case_9();
+    //     },
+    //     10 => {  // X_1st=1, X_2nd=4
+    //         // @faddh(vector_buf_ddsr, reduce_1st_1_recv_dsr, vector_buf_s1dsr);
+    //         // @faddh(reduce_2nd_0_send_dsr, reduce_2nd_1_recv_dsr, vector_buf_s1dsr);
+    //         reduce_noreset_case_10();
+    //     },
+    //     11 => {  // X_1st=1, X_2nd=5
+    //         // @faddh(vector_buf_ddsr, reduce_1st_1_recv_dsr, vector_buf_s1dsr);
+    //         // @faddh(reduce_2nd_1_send_dsr, reduce_2nd_0_recv_dsr, vector_buf_s1dsr);
+    //         reduce_noreset_case_11();
+    //     },
+    //     // ==================== Group C: non-root (1st data op + 2nd teardown) ====================
+    //     12, 13, 14 => {  // X_1st=2, X_2nd=6/7/8
+    //         // @fmovh(reduce_1st_0_send_dsr, vector_buf_s1dsr);
+    //         reduce_noreset_case_12_13_14();
+    //     },
+    //     15, 16, 17 => {  // X_1st=3, X_2nd=6/7/8
+    //         // @faddh(reduce_1st_0_send_dsr, reduce_1st_1_recv_dsr, vector_buf_s1dsr);
+    //         reduce_noreset_case_15_16_17();
+    //     },
+    //     18, 19, 20 => {  // X_1st=4, X_2nd=6/7/8
+    //         // @fmovh(reduce_1st_1_send_dsr, vector_buf_s1dsr);
+    //         reduce_noreset_case_18_19_20();
+    //     },
+    //     21, 22, 23 => {  // X_1st=5, X_2nd=6/7/8
+    //         // @faddh(reduce_1st_1_send_dsr, reduce_1st_0_recv_dsr, vector_buf_s1dsr);
+    //         reduce_noreset_case_21_22_23();
+    //     },
+    //     else => {},
+    // }
+    // const func_to_call: *const fn() void = reduce_noreset_funcs[reduce_pe_type];
+    // func_to_call();
+    if (is_max) {
+        reduceMax_noreset_funcs[reduce_pe_type]();
+    } else {
+        reduce_noreset_funcs[reduce_pe_type]();
+    }
+    // reduce_noreset_funcs[reduce_pe_type]();
+
+    if (bdcast_pe_type == 0) {
+        @mov16(bdcast_send_dsr, vector_buf_s1dsr);
+    } else {
+        @mov16(vector_buf_ddsr, bdcast_recv_dsr);
+    }
+
+    @block(reduce_1st_0_recv_queue_id);
+    @block(reduce_1st_1_recv_queue_id);
+    @block(reduce_2nd_0_recv_queue_id);
+    @block(reduce_2nd_1_recv_queue_id);
+    @block(broadcast_recv_queue_id);
+}
+
+fn reconfig_allreduce_axis(axis: i16, is_in_head: bool) void {
+    // confirm all wavelets in output queue are already sent
+    var cnt: u16 = 0;    // endless loop prevention
+    var status = output_queue_status.get();
+    while (status.empty != @as(u8, 255) and cnt < 500) {
+        status = output_queue_status.get();
+        cnt += 1;
+    }
+    // simprint.fmt_with_coords("print: output_queue is now empty (cnt={d})!\n", .{@as(u16, cnt)});
+
+    while ((is_in_teardown(reduce_1st_color_0) and is_in_teardown(reduce_1st_color_1) and is_in_teardown(reduce_2nd_color_0) and is_in_teardown(reduce_2nd_color_1) and is_in_teardown(broadcast_color)) == false) {
+        cnt += 1;
+        if (cnt > 1000) {
+            // simprint.fmt_with_coords("print: some colors are still not in teardown (cnt={d})!\n", .{@as(u16, cnt)});
+            if ((is_in_teardown(reduce_1st_color_0)) == false) {
+                simprint.fmt_with_coords("print: 1st_color_0 is still not in teardown (cnt={d})!\n", .{@as(u16, cnt)});
+            }
+            if ((is_in_teardown(reduce_1st_color_1)) == false) {
+                simprint.fmt_with_coords("print: 1st_color_1 is still not in teardown (cnt={d})!\n", .{@as(u16, cnt)});
+            }
+            if ((is_in_teardown(reduce_2nd_color_0)) == false) {
+                simprint.fmt_with_coords("print: 2nd_color_0 is still not in teardown (cnt={d})!\n", .{@as(u16, cnt)});
+            }
+            if ((is_in_teardown(reduce_2nd_color_1)) == false) {
+                simprint.fmt_with_coords("print: 2nd_color_1 is still not in teardown (cnt={d})!\n", .{@as(u16, cnt)});
+            }
+            if ((is_in_teardown(broadcast_color)) == false) {
+                simprint.fmt_with_coords("print: broadcast_color is still not in teardown (cnt={d})!\n", .{@as(u16, cnt)});
+            }
+            break;
+        }
+    }
+    if (is_in_head and axis == 0) {
+        // Allreduce along X axis in each attention head
+        color_config.reset_rx_routes(reduce_1st_color_0, X_1st_RD_IN_H_0.rx);
+        color_config.reset_tx_routes(reduce_1st_color_0, &X_1st_RD_IN_H_0.tx, 1);
+        color_config.reset_rx_routes(reduce_1st_color_1, X_1st_RD_IN_H_1.rx);
+        color_config.reset_tx_routes(reduce_1st_color_1, &X_1st_RD_IN_H_1.tx, 1);
+        color_config.reset_rx_routes(reduce_2nd_color_0, X_2nd_RD_IN_H_0.rx);
+        color_config.reset_tx_routes(reduce_2nd_color_0, &X_2nd_RD_IN_H_0.tx, 1);
+        color_config.reset_rx_routes(reduce_2nd_color_1, X_2nd_RD_IN_H_1.rx);
+        color_config.reset_tx_routes(reduce_2nd_color_1, &X_2nd_RD_IN_H_1.tx, 1);
+        color_config.reset_rx_routes(broadcast_color, X_BD_IN_H.rx);
+        color_config.reset_tx_routes(broadcast_color, &X_BD_IN_H.tx, X_BD_IN_H.tx_cnt);
+
+    } else if (axis == 0) {
         // Allreduce along X axis
-        color_config.reset_routes(reduce_1st_color_0, X_1st_RD_0);
-        color_config.reset_routes(reduce_1st_color_1, X_1st_RD_1);
-        color_config.reset_routes(reduce_2nd_color_0, X_2nd_RD_0);
-        color_config.reset_routes(reduce_2nd_color_1, X_2nd_RD_1);
-        color_config.reset_routes(broadcast_color, X_BD);
+        color_config.reset_rx_routes(reduce_1st_color_0, X_1st_RD_0.rx);
+        color_config.reset_tx_routes(reduce_1st_color_0, &X_1st_RD_0.tx, 1);
+        color_config.reset_rx_routes(reduce_1st_color_1, X_1st_RD_1.rx);
+        color_config.reset_tx_routes(reduce_1st_color_1, &X_1st_RD_1.tx, 1);
+        color_config.reset_rx_routes(reduce_2nd_color_0, X_2nd_RD_0.rx);
+        color_config.reset_tx_routes(reduce_2nd_color_0, &X_2nd_RD_0.tx, 1);
+        color_config.reset_rx_routes(reduce_2nd_color_1, X_2nd_RD_1.rx);
+        color_config.reset_tx_routes(reduce_2nd_color_1, &X_2nd_RD_1.tx, 1);
+        color_config.reset_rx_routes(broadcast_color, X_BD.rx);
+        color_config.reset_tx_routes(broadcast_color, &X_BD.tx, X_BD.tx_cnt);
+
     } else if (axis == 1) {
         // Allreduce along Y axis
-        color_config.reset_routes(reduce_1st_color_0, Y_1st_RD_0);
-        color_config.reset_routes(reduce_1st_color_1, Y_1st_RD_1);
-        color_config.reset_routes(reduce_2nd_color_0, Y_2nd_RD_0);
-        color_config.reset_routes(reduce_2nd_color_1, Y_2nd_RD_1);
-        color_config.reset_routes(broadcast_color, Y_BD);
+        color_config.reset_rx_routes(reduce_1st_color_0, Y_1st_RD_0.rx);
+        color_config.reset_tx_routes(reduce_1st_color_0, &Y_1st_RD_0.tx, 1);
+        color_config.reset_rx_routes(reduce_1st_color_1, Y_1st_RD_1.rx);
+        color_config.reset_tx_routes(reduce_1st_color_1, &Y_1st_RD_1.tx, 1);
+        color_config.reset_rx_routes(reduce_2nd_color_0, Y_2nd_RD_0.rx);
+        color_config.reset_tx_routes(reduce_2nd_color_0, &Y_2nd_RD_0.tx, 1);
+        color_config.reset_rx_routes(reduce_2nd_color_1, Y_2nd_RD_1.rx);
+        color_config.reset_tx_routes(reduce_2nd_color_1, &Y_2nd_RD_1.tx, 1);
+        color_config.reset_rx_routes(broadcast_color, Y_BD.rx);
+        color_config.reset_tx_routes(broadcast_color, &Y_BD.tx, Y_BD.tx_cnt);
+
     } else {
         @assert(false);
     }
+    teardown_exit(reduce_1st_color_0);
+    teardown_exit(reduce_1st_color_1);
+    teardown_exit(reduce_2nd_color_0);
+    teardown_exit(reduce_2nd_color_1);
+    teardown_exit(broadcast_color);
 }
 
 comptime {
@@ -1076,11 +2465,24 @@ comptime {
 
 
 comptime {
-    // For Debugging
-
-    // @set_local_color_config(reduce_2nd_color_0, .{ .routes = X_2nd_RD_0 });
-    // @set_local_color_config(reduce_2nd_color_1, .{ .routes = X_2nd_RD_1 });
-
-    // @set_local_color_config(reduce_2nd_color_0, .{ .routes = Y_2nd_RD_0 });
-    // @set_local_color_config(reduce_2nd_color_1, .{ .routes = Y_2nd_RD_1 });
+    @set_local_color_config(reduce_1st_color_0, .{
+        .routes = .{},
+        .teardown = true,
+    });
+    @set_local_color_config(reduce_1st_color_1, .{
+        .routes = .{},
+        .teardown = true,
+    });
+    @set_local_color_config(reduce_2nd_color_0, .{
+        .routes = .{},
+        .teardown = true,
+    });
+    @set_local_color_config(reduce_2nd_color_1, .{
+        .routes = .{},
+        .teardown = true,
+    });
+    @set_local_color_config(broadcast_color, .{
+        .routes = .{},
+        .teardown = true,
+    });
 }

@@ -1,7 +1,7 @@
 out/
 simfab_traces/
 
-
+config.json
 sim_stats.json
 sim.log
 simconfig.json
@@ -19,3 +19,5 @@ wio_flows*/
 
 **/compile_out/*
 !**/compile_out/.gitkeep
+
+__pycache__/

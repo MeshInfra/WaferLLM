@@ -14,18 +14,23 @@
 // - "Head" denotes the PE with the smaller coordinate value (x,y) then the center PE.
 // - "Tail" denotes the PE with the larger coordinate value (x,y) then the center PE.
 
-param P: i16;
+param Ph: i16;
+param Pw: i16;
 param bsz: i16;
-param dim_p_pe: i16;
+param v_dim_p_pe: i16;
+param h_dim_p_pe: i16;
 param pes_p_head: i16;
-param pes_p_kv_head: i16;
-param head_dim_p_pe: i16;
-param seq_len_p_pe: i16;
-param ffn_dim_p_pe: i16;
+param pes_p_kv_head: i16;   // not used now
+param head_dim: i16;   // horizontally partitioned
+param seq_len_p_pe: i16;    // vertically partitioned
+param ffn_dim_p_pe: i16;    // horizontally partitioned
 
-param pe_num_p_group: i16;
-param root_1st_phase: i16;
-param root_2nd_phase: i16;
+param pe_num_p_h_group: i16;
+param pe_num_p_v_group: i16;
+param pe_num_p_group_in_head: i16;
+// ----
+//  root_1st_phase=$((pe_num_p_group / 2))
+//  root_2nd_phase=$(((($GROUP_NUM / 2) * pe_num_p_group) + root_1st_phase))
 
 const C_1st_RD_0: color = @get_color(8);
 const C_1st_RD_1: color = @get_color(7);
@@ -35,64 +40,84 @@ const C_2nd_RD_1: color = @get_color(5);
 const C_BD: color = @get_color(9);
 
 const memcpy = @import_module( "<memcpy/get_params>", .{
-    .width = P,
-    .height = P,
-});
-
-const math = @import_module("<math>");
-
-const comm = @import_module("comm_lib/comm_layout.csl", .{
-    .P = P, .pe_num_p_group = pe_num_p_group,
-    .root_1st_phase = root_1st_phase,
-    .root_2nd_phase = root_2nd_phase,
-    .broadcast_color = C_BD,
-    .reduce_1st_color = [2]color{C_1st_RD_0, C_1st_RD_1},
-    .reduce_2nd_color = [2]color{C_2nd_RD_0, C_2nd_RD_1},
+    .width = Pw,
+    .height = Ph,
 });
 
 layout {
-    @set_rectangle(P, P);
+    // @comptime_assert(h_remainder != 1,    "Pw % h_group_num must not be 1 (group size 1 is unsupported)");
+    // @comptime_assert(v_remainder != 1,    "Ph % v_group_num must not be 1");
+    // @comptime_assert(head_remainder != 1, "pes_p_head % group_num_in_head must not be 1");
+    @comptime_assert(pes_p_head > pe_num_p_group_in_head, "pes_p_head must have more than 1 group");
+    // @comptime_assert(v_dim_p_pe % 2 == 0, "v_dim_p_pe must be even");
+    @comptime_assert(h_dim_p_pe % 2 == 0, "h_dim_p_pe must be even");
+    @comptime_assert(Pw % pe_num_p_h_group != 1,    "Pw % h_group_num must not be 1 (group size 1 is unsupported)");
+    @comptime_assert(Ph % pe_num_p_v_group != 1,    "Ph % v_group_num must not be 1");
+    @comptime_assert(pes_p_head % pe_num_p_group_in_head != 1, "pes_p_head % group_num_in_head must not be 1");
+
+    @set_rectangle(Pw, Ph);
 
     var px: i16 = 0;
     var py: i16 = 0;
 
-    px = 0;
-    while (px < P) : (px += 1) {
+    const pe_num_p_last_h_group: i16 = if (Pw % pe_num_p_h_group == 0) pe_num_p_h_group else Pw % pe_num_p_h_group;
+    const pe_num_p_last_v_group: i16 = if (Ph % pe_num_p_v_group == 0) pe_num_p_v_group else Ph % pe_num_p_v_group;
+    const pe_num_p_last_group_in_head: i16 = if (pes_p_head % pe_num_p_group_in_head == 0) pe_num_p_group_in_head else pes_p_head % pe_num_p_group_in_head;
 
-        const quotient_x: i16 = @as(i16, math.floor_f16(@as(f16, px) / @as(f16, pe_num_p_group)));
-        const remainder_x: i16 = px - quotient_x * pe_num_p_group;
+    px = 0;
+    var is_first_col = true;
+    while (px < Pw) : (px += 1) {
 
         const memcpy_params = memcpy.get_params(px);
 
         py = 0;
-        while (py < P) : (py += 1) {
-
-            const quotient_y: i16 = @as(i16, math.floor_f16(@as(f16, py) / @as(f16, pe_num_p_group)));
-            const remainder_y: i16 = py - quotient_y * pe_num_p_group;
-            
-            const comm_params = comm.get_params(px, quotient_x, remainder_x, py, quotient_y, remainder_y);
+        var is_first_row = true;
+        while (py < Ph) : (py += 1) {
 
             @set_tile_code(px, py, "decode.csl", .{
                 .memcpy_params = memcpy_params,
-                .comm_params = comm_params,
 
-                .P = P, .bsz = bsz, .dim_p_pe = dim_p_pe, 
-                .pes_p_head = pes_p_head, 
-                .pes_p_kv_head = pes_p_kv_head,
-                .head_dim_p_pe = head_dim_p_pe,
+                // general attention block
+                .Pw = Pw, .Ph = Ph,
+                .bsz = bsz, 
+                .h_dim_p_pe = h_dim_p_pe, 
+                .v_dim_p_pe = v_dim_p_pe,
                 .seq_len_p_pe = seq_len_p_pe,
                 .ffn_dim_p_pe = ffn_dim_p_pe,
 
-                .pe_num_p_group = pe_num_p_group,
-                .root_1st_phase = root_1st_phase,
-                .root_2nd_phase = root_2nd_phase,
+                .pe_num_p_h_group = pe_num_p_h_group,
+                .pe_num_p_v_group = pe_num_p_v_group,
+                .pe_num_p_group_in_head = pe_num_p_group_in_head,
+
+                // multi-head attention
+                .pes_p_head = pes_p_head, 
+                .pes_p_kv_head = pes_p_kv_head,
+                .head_dim = head_dim,
+
+                .pe_num_p_last_h_group = pe_num_p_last_h_group,
+                .pe_num_p_last_v_group = pe_num_p_last_v_group,
+                .pe_num_p_last_group_in_head = pe_num_p_last_group_in_head,
+
+                .C_1st_RD_0 = C_1st_RD_0,
+                .C_1st_RD_1 = C_1st_RD_1,
+                .C_2nd_RD_0 = C_2nd_RD_0,
+                .C_2nd_RD_1 = C_2nd_RD_1,
+                .C_BD = C_BD,
+
+                .is_first_row = is_first_row,
+                .is_first_col = is_first_col,
+                .is_last_row = py == @as(i16, Ph) - 1,
+                .is_last_col = px == @as(i16, Pw) - 1,
             });
+            is_first_row = false;
         }
+        is_first_col = false;
     }
 
 
     @export_name("X", [*]f16, true);
     @export_name("W", [*]f16, true);
+    @export_name("Z", [*]f16, true);
     @export_name("Q_weight", [*]f16, true);
     @export_name("K_weight", [*]f16, true);
     @export_name("V_weight", [*]f16, true);
@@ -104,11 +129,13 @@ layout {
     @export_name("UP_weight", [*]f16, true);
     @export_name("GATE_weight", [*]f16, true);
     @export_name("DOWN_weight", [*]f16, true);
+    @export_name("score_mask", [*]f16, true);
 
     @export_name("init_task", fn()void);
     @export_name("decode_host", fn(i16, i16)void);
 
-    @export_name("timer_buf", [*]f32, true);
-    @export_name("time_ref", [*]f32, true);
+    // @export_name("timer_buf", [*]f32, true);
+    // @export_name("time_ref", [*]f32, true);
+    @export_name("time_buf", [*]u16, true);
     @export_name("debug", [*]f16, true);
 }

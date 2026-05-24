@@ -1,17 +1,18 @@
 set -e
 
-# export SINGULARITYENV_SIMFABRIC_DEBUG=router
 CONFIG=$1
 
 if [ -z "$CONFIG" ]; then
     CONFIG="config.json"
 fi
 
-debug=false
+simulator=false
 
 if [ -n "$2" ]; then
-    debug=$2
+    simulator=$2
 fi
+
+CSV_OUTPUT=${3:-}
 
 # if config.json exists
 if [ -f $CONFIG ]; then
@@ -57,8 +58,13 @@ else
     _ffn_dim_p_pe=""
 fi
 
-FABRIC_W=$(($Pw + 7))
-FABRIC_H=$(($Ph + 2))
+if [ "$simulator" == "true" ]; then
+    FABRIC_W=$(($Pw + 7))
+    FABRIC_H=$(($Ph + 2))
+else
+    FABRIC_W=762
+    FABRIC_H=1172
+fi
 
 # Use JSON-specified tile sizes if present; otherwise compute ceil-division
 if [ -n "$_v_dim_p_pe" ] && [ "$_v_dim_p_pe" != "null" ]; then
@@ -98,17 +104,28 @@ echo "FFN_DIM: $FFN_DIM, ffn_dim_p_pe: $ffn_dim_p_pe"
 echo "pe_num_p_h_group: $pe_num_p_h_group, pe_num_p_v_group: $pe_num_p_v_group"
 echo "pe_num_p_group_in_head: $pe_num_p_group_in_head"
 
-echo "Debug: $debug"
+echo "Simulator: $simulator"
 
-cslc --arch=wse3 ./src/layout.csl --fabric-dims="$FABRIC_W","$FABRIC_H" --fabric-offsets=4,1 \
+EXEC=""
+cs_python="cs_python"
+
+$EXEC cslc --arch=wse3 ./src/layout.csl --fabric-dims="$FABRIC_W","$FABRIC_H" --fabric-offsets=4,1 \
     --params=Pw:"$Pw",Ph:"$Ph",bsz:"$BSZ",v_dim_p_pe:"$v_dim_p_pe",h_dim_p_pe:"$h_dim_p_pe",pes_p_head:"$pes_p_head",pes_p_kv_head:"$pes_p_kv_head",head_dim:"$HEAD_DIM",seq_len_p_pe:"$seq_len_p_pe",ffn_dim_p_pe:"$ffn_dim_p_pe",pe_num_p_h_group:"$pe_num_p_h_group",pe_num_p_v_group:"$pe_num_p_v_group",pe_num_p_group_in_head:"$pe_num_p_group_in_head"\
     -o out --memcpy --channels 1
 
-if [ "$debug" == "true" ]; then
-    export APPTAINERENV_SIMFABRIC_DEBUG=hwtile,router,landing
+if [ "$simulator" == "true" ]; then
+    if [ -n "$CSV_OUTPUT" ]; then
+        $cs_python launch_wse3.py --config $CONFIG --simulator --csv-output "${CSV_OUTPUT}"
+    else
+        $cs_python launch_wse3.py --config $CONFIG --simulator
+    fi
+else
+    if [ -n "$CSV_OUTPUT" ]; then
+        $cs_python launch_wse3.py --config $CONFIG  --csv-output "${CSV_OUTPUT}"
+    else
+        $cs_python launch_wse3.py --config $CONFIG
+    fi
 fi
-cs_python launch_sim.py --config $CONFIG
 
 rm -rf simfab_traces
 rm -rf wio_flows_tmpdir.*
-rm run_meta.json
