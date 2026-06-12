@@ -8,19 +8,10 @@ param pe_num_p_group: i16;
 param root_1st_phase: i16;
 param root_2nd_phase: i16;
 
-param X_1st_RD_0;
-param X_1st_RD_1;
-param Y_1st_RD_0;
-param Y_1st_RD_1;
-
-param X_2nd_RD_0;
-param X_2nd_RD_1;
-param Y_2nd_RD_0;
-param Y_2nd_RD_1;
-
-param X_BD;
-param Y_BD;
-
+// Routing is computed at RUNTIME from each PE's own coordinate (see init() and
+// reconfig_allreduce_axis() below), instead of being passed in as per-PE comptime
+// route structs from the layout. This keeps comm_pe.csl's comptime params identical
+// on every PE, so the module is no longer specialized per coordinate.
 param reduce_1st_color_0: color;
 param reduce_1st_color_1: color;
 
@@ -366,14 +357,136 @@ var vector_buf_dsd_bsz_seq_len = @get_dsd(mem1d_dsd, .{ .base_address = &dummy, 
 var vector_buf_dsd_bsz_ffn_dim_ZZ_fusion = @get_dsd(mem1d_dsd, .{ .base_address = &dummy, .extent = bsz * 2 * ffn_dim_p_pe });
 const vector_buf_dsr = @get_dsr(dsr_src1, 2);
 
-fn init() void {
-    color_config.reset_routes(reduce_1st_color_0, Y_1st_RD_0);
-    color_config.reset_routes(reduce_1st_color_1, Y_1st_RD_1);
+// Per-PE coordinate / reduce-tree role, captured at runtime in init().
+var m_px: i16 = 0;
+var m_py: i16 = 0;
+var m_quotient_x: i16 = 0;
+var m_remainder_x: i16 = 0;
+var m_quotient_y: i16 = 0;
+var m_remainder_y: i16 = 0;
 
-    color_config.reset_routes(reduce_2nd_color_0, Y_2nd_RD_0);
-    color_config.reset_routes(reduce_2nd_color_1, Y_2nd_RD_1);
+// The X-axis and Y-axis route logic is structurally identical: X uses HEAD=WEST /
+// TAIL=EAST, Y uses HEAD=NORTH / TAIL=SOUTH. These three helpers are the runtime
+// (if-tree + comptime route literal) form of comm_layout.csl::get_params; they are
+// parameterized on (HEAD, TAIL) comptime directions so one body serves both axes.
+// reset_routes() requires a comptime route, so the value is chosen by the runtime
+// branch, not assembled from runtime directions.
 
-    color_config.reset_routes(broadcast_color, Y_BD);
+fn config_1st_phase(comptime rd0: color, comptime rd1: color,
+                    comptime HEAD: direction, comptime TAIL: direction,
+                    remainder: i16) void {
+    if (remainder == root_1st_phase) {
+        if (remainder % 2 == 0) {
+            color_config.reset_routes(rd0, .{ .rx = HEAD, .tx = RAMP });
+            color_config.reset_routes(rd1, .{ .rx = TAIL, .tx = RAMP });
+        } else {
+            color_config.reset_routes(rd1, .{ .rx = HEAD, .tx = RAMP });
+            color_config.reset_routes(rd0, .{ .rx = TAIL, .tx = RAMP });
+        }
+    } else if (remainder < root_1st_phase) {
+        if (remainder % 2 == 0) {
+            color_config.reset_routes(rd0, .{ .rx = HEAD, .tx = RAMP });
+            color_config.reset_routes(rd1, .{ .rx = RAMP, .tx = TAIL });
+        } else {
+            color_config.reset_routes(rd1, .{ .rx = HEAD, .tx = RAMP });
+            color_config.reset_routes(rd0, .{ .rx = RAMP, .tx = TAIL });
+        }
+    } else {
+        if (remainder % 2 == 0) {
+            color_config.reset_routes(rd1, .{ .rx = TAIL, .tx = RAMP });
+            color_config.reset_routes(rd0, .{ .rx = RAMP, .tx = HEAD });
+        } else {
+            color_config.reset_routes(rd0, .{ .rx = TAIL, .tx = RAMP });
+            color_config.reset_routes(rd1, .{ .rx = RAMP, .tx = HEAD });
+        }
+    }
+}
+
+fn config_2nd_phase(comptime rd0: color, comptime rd1: color,
+                    comptime HEAD: direction, comptime TAIL: direction,
+                    pe_id: i16, quotient: i16, remainder: i16) void {
+    if (pe_id == root_2nd_phase) {
+        if (quotient % 2 == 0) {
+            color_config.reset_routes(rd0, .{ .rx = HEAD, .tx = RAMP });
+            color_config.reset_routes(rd1, .{ .rx = TAIL, .tx = RAMP });
+        } else {
+            color_config.reset_routes(rd1, .{ .rx = HEAD, .tx = RAMP });
+            color_config.reset_routes(rd0, .{ .rx = TAIL, .tx = RAMP });
+        }
+    } else if (pe_id < root_2nd_phase) {
+        if (remainder == root_1st_phase) {
+            if (quotient % 2 == 0) {
+                color_config.reset_routes(rd0, .{ .rx = HEAD, .tx = RAMP });
+                color_config.reset_routes(rd1, .{ .rx = RAMP, .tx = TAIL });
+            } else {
+                color_config.reset_routes(rd1, .{ .rx = HEAD, .tx = RAMP });
+                color_config.reset_routes(rd0, .{ .rx = RAMP, .tx = TAIL });
+            }
+        } else {
+            color_config.reset_routes(rd0, .{ .rx = HEAD, .tx = TAIL });
+            color_config.reset_routes(rd1, .{ .rx = HEAD, .tx = TAIL });
+        }
+    } else {
+        if (remainder == root_1st_phase) {
+            if (quotient % 2 == 0) {
+                color_config.reset_routes(rd1, .{ .rx = TAIL, .tx = RAMP });
+                color_config.reset_routes(rd0, .{ .rx = RAMP, .tx = HEAD });
+            } else {
+                color_config.reset_routes(rd0, .{ .rx = TAIL, .tx = RAMP });
+                color_config.reset_routes(rd1, .{ .rx = RAMP, .tx = HEAD });
+            }
+        } else {
+            color_config.reset_routes(rd0, .{ .rx = TAIL, .tx = HEAD });
+            color_config.reset_routes(rd1, .{ .rx = TAIL, .tx = HEAD });
+        }
+    }
+}
+
+fn config_bcast(comptime bc: color, comptime HEAD: direction, comptime TAIL: direction,
+                pe_id: i16) void {
+    if (pe_id == root_2nd_phase) {
+        color_config.reset_routes(bc, .{ .rx = RAMP, .tx = [2]direction{ HEAD, TAIL } });
+    } else if (pe_id < root_2nd_phase) {
+        if (pe_id == 0) {
+            color_config.reset_routes(bc, .{ .rx = TAIL, .tx = RAMP });
+        } else {
+            color_config.reset_routes(bc, .{ .rx = TAIL, .tx = [2]direction{ HEAD, RAMP } });
+        }
+    } else {
+        if (pe_id == P - 1) {
+            color_config.reset_routes(bc, .{ .rx = HEAD, .tx = RAMP });
+        } else {
+            color_config.reset_routes(bc, .{ .rx = HEAD, .tx = [2]direction{ RAMP, TAIL } });
+        }
+    }
+}
+
+fn config_routes_Y() void {
+    config_1st_phase(reduce_1st_color_0, reduce_1st_color_1, NORTH, SOUTH, m_remainder_y);
+    config_2nd_phase(reduce_2nd_color_0, reduce_2nd_color_1, NORTH, SOUTH, m_py, m_quotient_y, m_remainder_y);
+    config_bcast(broadcast_color, NORTH, SOUTH, m_py);
+}
+
+fn config_routes_X() void {
+    config_1st_phase(reduce_1st_color_0, reduce_1st_color_1, WEST, EAST, m_remainder_x);
+    config_2nd_phase(reduce_2nd_color_0, reduce_2nd_color_1, WEST, EAST, m_px, m_quotient_x, m_remainder_x);
+    config_bcast(broadcast_color, WEST, EAST, m_px);
+}
+
+// Caller passes its own coordinate and reduce-tree indices (decode.csl already
+// derives them in init_task). init() sets up the Y-axis routes, matching the
+// original comptime init().
+fn init(px: i16, py: i16,
+        quotient_x: i16, remainder_x: i16,
+        quotient_y: i16, remainder_y: i16) void {
+    m_px = px;
+    m_py = py;
+    m_quotient_x = quotient_x;
+    m_remainder_x = remainder_x;
+    m_quotient_y = quotient_y;
+    m_remainder_y = remainder_y;
+
+    config_routes_Y();
 }
 
 fn all_reduce_bsz(pe_id: i16, quotient_pe_id: i16, remainder_pe_id: i16, vector_buf_ptr: [*]f16) void {
@@ -877,18 +990,10 @@ fn all_reduce_bsz_ffn_dim_ZZ_fusion(pe_id: i16, quotient_pe_id: i16, remainder_p
 fn reconfig_allreduce_axis(axis: i16) void {
     if (axis == 0) {
         // Allreduce along X axis
-        color_config.reset_routes(reduce_1st_color_0, X_1st_RD_0);
-        color_config.reset_routes(reduce_1st_color_1, X_1st_RD_1);
-        color_config.reset_routes(reduce_2nd_color_0, X_2nd_RD_0);
-        color_config.reset_routes(reduce_2nd_color_1, X_2nd_RD_1);
-        color_config.reset_routes(broadcast_color, X_BD);
+        config_routes_X();
     } else if (axis == 1) {
         // Allreduce along Y axis
-        color_config.reset_routes(reduce_1st_color_0, Y_1st_RD_0);
-        color_config.reset_routes(reduce_1st_color_1, Y_1st_RD_1);
-        color_config.reset_routes(reduce_2nd_color_0, Y_2nd_RD_0);
-        color_config.reset_routes(reduce_2nd_color_1, Y_2nd_RD_1);
-        color_config.reset_routes(broadcast_color, Y_BD);
+        config_routes_Y();
     } else {
         @assert(false);
     }

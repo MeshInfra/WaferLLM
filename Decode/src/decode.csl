@@ -1,5 +1,13 @@
 param memcpy_params;
-param comm_params;
+
+// Reduce/broadcast colors (global, identical on every PE). The per-PE routing
+// itself is computed at runtime inside comm_pe.csl from this PE's coordinate,
+// so the layout no longer passes per-PE comptime route structs.
+param reduce_1st_color_0: color;
+param reduce_1st_color_1: color;
+param reduce_2nd_color_0: color;
+param reduce_2nd_color_1: color;
+param broadcast_color: color;
 
 // -------------------------------------------------------------------------- //
 // ---------------------------- Model Parameters ---------------------------- //
@@ -46,21 +54,11 @@ const math = @import_module("<math>");
 const layout_mod = @import_module("<layout>");
 
 const comm_mod = @import_module("comm_lib/comm_pe.csl", .{
-    .X_1st_RD_0 = comm_params.X_1st_RD_0,
-    .X_1st_RD_1 = comm_params.X_1st_RD_1,
-    .Y_1st_RD_0 = comm_params.Y_1st_RD_0,
-    .Y_1st_RD_1 = comm_params.Y_1st_RD_1,
-    .X_2nd_RD_0 = comm_params.X_2nd_RD_0,
-    .X_2nd_RD_1 = comm_params.X_2nd_RD_1,
-    .Y_2nd_RD_0 = comm_params.Y_2nd_RD_0,
-    .Y_2nd_RD_1 = comm_params.Y_2nd_RD_1,
-    .X_BD = comm_params.X_BD,
-    .Y_BD = comm_params.Y_BD,
-    .reduce_1st_color_0 = comm_params.reduce_1st_color_0,
-    .reduce_1st_color_1 = comm_params.reduce_1st_color_1,
-    .reduce_2nd_color_0 = comm_params.reduce_2nd_color_0,
-    .reduce_2nd_color_1 = comm_params.reduce_2nd_color_1,
-    .broadcast_color = comm_params.broadcast_color,
+    .reduce_1st_color_0 = reduce_1st_color_0,
+    .reduce_1st_color_1 = reduce_1st_color_1,
+    .reduce_2nd_color_0 = reduce_2nd_color_0,
+    .reduce_2nd_color_1 = reduce_2nd_color_1,
+    .broadcast_color = broadcast_color,
 
     .P = P, .bsz = bsz, .dim_p_pe = dim_p_pe,
     .seq_len_p_pe = seq_len_p_pe,
@@ -101,7 +99,7 @@ fn init_task() void {
     quotient_y = @as(i16, math.floor_f16(@as(f16, py) / @as(f16, pe_num_p_group)));
     remainder_y = py - quotient_y * pe_num_p_group;
 
-    comm_mod.init();
+    comm_mod.init(px, py, quotient_x, remainder_x, quotient_y, remainder_y);
 
     alpha = 1.0 / @as(f16, math.sqrt(head_dim));
 

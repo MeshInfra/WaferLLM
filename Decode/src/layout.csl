@@ -39,16 +39,9 @@ const memcpy = @import_module( "<memcpy/get_params>", .{
     .height = P,
 });
 
-const math = @import_module("<math>");
-
-const comm = @import_module("comm_lib/comm_layout.csl", .{
-    .P = P, .pe_num_p_group = pe_num_p_group,
-    .root_1st_phase = root_1st_phase,
-    .root_2nd_phase = root_2nd_phase,
-    .broadcast_color = C_BD,
-    .reduce_1st_color = [2]color{C_1st_RD_0, C_1st_RD_1},
-    .reduce_2nd_color = [2]color{C_2nd_RD_0, C_2nd_RD_1},
-});
+// comm_layout.csl is no longer imported: per-PE routing is computed at runtime
+// inside comm_pe.csl from each PE's coordinate, so the layout no longer needs the
+// comptime get_params() that produced (and specialized) per-PE route structs.
 
 layout {
     @set_rectangle(P, P);
@@ -59,25 +52,22 @@ layout {
     px = 0;
     while (px < P) : (px += 1) {
 
-        const quotient_x: i16 = @as(i16, math.floor_f16(@as(f16, px) / @as(f16, pe_num_p_group)));
-        const remainder_x: i16 = px - quotient_x * pe_num_p_group;
-
         const memcpy_params = memcpy.get_params(px);
 
         py = 0;
         while (py < P) : (py += 1) {
 
-            const quotient_y: i16 = @as(i16, math.floor_f16(@as(f16, py) / @as(f16, pe_num_p_group)));
-            const remainder_y: i16 = py - quotient_y * pe_num_p_group;
-            
-            const comm_params = comm.get_params(px, quotient_x, remainder_x, py, quotient_y, remainder_y);
-
             @set_tile_code(px, py, "decode.csl", .{
                 .memcpy_params = memcpy_params,
-                .comm_params = comm_params,
 
-                .P = P, .bsz = bsz, .dim_p_pe = dim_p_pe, 
-                .pes_p_head = pes_p_head, 
+                .reduce_1st_color_0 = C_1st_RD_0,
+                .reduce_1st_color_1 = C_1st_RD_1,
+                .reduce_2nd_color_0 = C_2nd_RD_0,
+                .reduce_2nd_color_1 = C_2nd_RD_1,
+                .broadcast_color = C_BD,
+
+                .P = P, .bsz = bsz, .dim_p_pe = dim_p_pe,
+                .pes_p_head = pes_p_head,
                 .pes_p_kv_head = pes_p_kv_head,
                 .head_dim_p_pe = head_dim_p_pe,
                 .seq_len_p_pe = seq_len_p_pe,
