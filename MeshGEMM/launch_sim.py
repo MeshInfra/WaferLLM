@@ -1,4 +1,4 @@
-"""SUMMA simulator launcher (cs_python, local out_<cfg> artifact)."""
+"""MeshGEMM simulator launcher (cs_python, local out_<cfg> artifact)."""
 import argparse
 import os
 import random
@@ -12,7 +12,7 @@ import host_common as hc
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="SUMMA GEMM on simulator")
+    parser = argparse.ArgumentParser(description="MeshGEMM on simulator")
     parser.add_argument("--P", required=True, type=int, help="PEs rectangle size: P x P")
     parser.add_argument("--M", required=True, type=int, help="Rows of X")
     parser.add_argument("--K", required=True, type=int, help="Inner dimension")
@@ -32,7 +32,7 @@ def main():
     io_dtype = MemcpyDataType.MEMCPY_16BIT
     memcpy_order = MemcpyOrder.ROW_MAJOR
 
-    tensor_X, tensor_W = hc.make_inputs(P, M, K, N)
+    tensor_X, tensor_W, tensor_W_offset = hc.make_inputs(P, M, K, N)
 
     # Run from inside out_<cfg> so simfab run artifacts (sim.log, sim_stats.json,
     # simconfig.json, simfab_traces/, out.core, wio_flows_tmpdir.*) land there
@@ -56,12 +56,12 @@ def main():
     runner.memcpy_h2d(sym_X, X_u32, 0, 0, P, P, Mt * Kt,
                       streaming=False, data_type=io_dtype, order=memcpy_order, nonblock=False)
 
-    W_u32 = input_array_to_u32(hc.tile_W(tensor_W, P, Kt, Nt), 1, 1)
+    W_u32 = input_array_to_u32(hc.tile_W(tensor_W_offset, P, Kt, Nt), 1, 1)
     runner.memcpy_h2d(sym_W, W_u32, 0, 0, P, P, Kt * Nt,
                       streaming=False, data_type=io_dtype, order=memcpy_order, nonblock=False)
 
     runner.launch("init_task", nonblock=False)
-    runner.launch("summa_host", np.int16(0), np.int16(1), nonblock=False)
+    runner.launch("meshgemm_host", np.int16(0), np.int16(1), nonblock=False)
 
     res_1d_u32 = np.zeros(M * N, dtype=np.uint32)
     runner.memcpy_d2h(res_1d_u32, sym_res, 0, 0, P, P, Mt * Nt,
@@ -70,8 +70,8 @@ def main():
     res = hc.untile_res(res_1d_fp16, P, Mt, Nt)
 
     runner.launch("init_task", nonblock=False)
-    total_warmup_times, total_repeat_times = 2, 10
-    runner.launch("summa_host", np.int16(total_warmup_times), np.int16(total_repeat_times), nonblock=False)
+    total_warmup_times, total_repeat_times = 1, 5
+    runner.launch("meshgemm_host", np.int16(total_warmup_times), np.int16(total_repeat_times), nonblock=False)
 
     time_memcpy_1d_f32 = np.zeros(P * P * 3, dtype=np.float32)
     runner.memcpy_d2h(time_memcpy_1d_f32, symbol_time_memcpy, 0, 0, P, P, 3, streaming=False,
@@ -87,13 +87,14 @@ def main():
 
     expected = np.matmul(tensor_X.astype(np.float32), tensor_W.astype(np.float32))
     actual = res.astype(np.float32)
-    rel_err = np.abs(actual - expected) / (np.abs(expected) + 1e-3)
+    abs_err = np.abs(actual - expected)
+    rel_err = abs_err / (np.abs(expected) + 1e-3)
 
     mean_cycle, max_cycle = hc.decode_timing(time_memcpy_hwl, time_ref_hwl, P, total_repeat_times)
     print(f"P: {P}, M: {M}, K: {K}, N: {N}")
     print(f"Mean cycle count: {mean_cycle}")
     print(f"Max Cycle count: {max_cycle}")
-    print(f"max rel err: {rel_err.max():.4f}")
+    print(f"max abs err: {abs_err.max():.4f}, max rel err: {rel_err.max():.4f}")
 
     assert rel_err.max() < 0.1, f"result mismatch: max rel err {rel_err.max()}"
     print("SUCCESS!")

@@ -56,6 +56,4 @@ layout {
 
     @export_name("time_memcpy", [*]f32, true);
     @export_name("time_ref", [*]f32, true);
-    @export_name("f_memcpy_timestamps", fn()void);
-    @export_name("f_reference_timestamps", fn()void);
 }

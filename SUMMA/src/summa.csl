@@ -4,8 +4,8 @@
 // After both broadcasts complete, each PE computes C += Xp * Wp.
 
 // ---------------------- Input Parameters --------------------- //
-param memcpy_params: comptime_struct;
-param c2d_params: comptime_struct;
+param memcpy_params;
+param c2d_params;
 
 param Mt: i16;
 param Kt: i16;

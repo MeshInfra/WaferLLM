@@ -1,4 +1,6 @@
 out/
+out_*/
+device_staging_*/
 simfab_traces/
 
 
@@ -12,10 +14,14 @@ wsjob-*.json
 run_meta.json
 
 wio_flows*/
+wio_flows_tmpdir.*/
 
 *.log
-**/log/*
-!*/log/.gitkeep
+**/log/
+**/compile_out/
 
-**/compile_out/*
-!**/compile_out/.gitkeep
+__pycache__/
+*.py[cod]
+
+AGENTS.md
+CLAUDE.md

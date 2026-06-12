@@ -1,7 +1,9 @@
-"""Unified compile entry for SUMMA.
+"""Unified compile entry for Decode (config-driven).
 
   --mode sim     : local `cslc` build into out_<cfg>/
   --mode device  : cloud SdkCompiler build -> compile_out/artifact_<cfg>.json
+
+<cfg> is the config-file basename, so concurrent configs never collide.
 """
 import argparse
 import json
@@ -10,26 +12,42 @@ import subprocess
 import time
 
 
-def parse_args():
-    ap = argparse.ArgumentParser(description="Compile SUMMA (WSE-3, SDK 2.10)")
-    ap.add_argument("--mode", choices=["sim", "device"], required=True)
-    ap.add_argument("--P", type=int, required=True)
-    ap.add_argument("--Mt", type=int, required=True)
-    ap.add_argument("--Kt", type=int, required=True)
-    ap.add_argument("--Nt", type=int, required=True)
-    return ap.parse_args()
+def derive_params(cj):
+    P = cj["P"]
+    G = cj["group_num"]
+    d = {
+        "P": P,
+        "bsz": cj["bsz"],
+        "dim_p_pe": cj["dim"] // P,
+        "pes_p_head": P // cj["n_heads"],
+        "pes_p_kv_head": P // cj["n_kv_heads"],
+        "head_dim_p_pe": cj["head_dim"] // P,
+        "seq_len_p_pe": cj["seq_len"] // P,
+        "ffn_dim_p_pe": cj["ffn_dim"] // P,
+        "pe_num_p_group": P // G,
+    }
+    d["root_1st_phase"] = d["pe_num_p_group"] // 2
+    d["root_2nd_phase"] = (G // 2) * d["pe_num_p_group"] + d["root_1st_phase"]
+    return d
 
 
 def main():
-    args = parse_args()
-    P, Mt, Kt, Nt = args.P, args.Mt, args.Kt, args.Nt
-    cfg = f"{P}_{Mt}_{Kt}_{Nt}"
-    params = f"P:{P},Mt:{Mt},Kt:{Kt},Nt:{Nt}"
+    ap = argparse.ArgumentParser(description="Compile Decode (WSE-3, SDK 2.10)")
+    ap.add_argument("--mode", choices=["sim", "device"], required=True)
+    ap.add_argument("--config", required=True)
+    args = ap.parse_args()
+
+    cfg_name = os.path.splitext(os.path.basename(args.config))[0]
+    with open(args.config, encoding="utf-8") as f:
+        cj = json.load(f)
+    d = derive_params(cj)
+    P = d["P"]
+    params = ",".join(f"{k}:{v}" for k, v in d.items())
 
     print("Start compiling: " + time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(time.time())), flush=True)
 
     if args.mode == "sim":
-        out_dir = f"out_{cfg}"
+        out_dir = f"out_{cfg_name}"
         subprocess.run(["rm", "-rf", out_dir], check=True)
         cmd = [
             "cslc", "--arch=wse3", "./src/layout.csl",
@@ -42,13 +60,13 @@ def main():
         os.makedirs("compile_out", exist_ok=True)
         options = (
             f"--arch=wse3 --fabric-dims=762,1172 --fabric-offsets=4,1 "
-            f"-o out --memcpy --channels=1 --params={params}"
+            f"-o out --memcpy --channels=4 --params={params}"
         )
         with SdkCompiler(resource_cpu=48000, resource_mem=64 << 30, disable_version_check=True) as compiler:
             artifact_id = compiler.compile(
                 app_path="src", csl_main="layout.csl", options=options, out_path="compile_out",
             )
-        with open(f"compile_out/artifact_{cfg}.json", "w", encoding="utf-8") as f:
+        with open(f"compile_out/artifact_{cfg_name}.json", "w", encoding="utf-8") as f:
             json.dump({"artifact_id": artifact_id}, f)
 
     print("End compiling: " + time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(time.time())), flush=True)

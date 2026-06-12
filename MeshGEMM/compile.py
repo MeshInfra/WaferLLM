@@ -1,7 +1,9 @@
-"""Unified compile entry for SUMMA.
+"""Unified compile entry for MeshGEMM.
 
-  --mode sim     : local `cslc` build into out_<cfg>/
+  --mode sim     : local `cslc` build into out_<cfg>/ (cs_python sim runtime loads it)
   --mode device  : cloud SdkCompiler build -> compile_out/artifact_<cfg>.json
+
+Per-config output paths keep concurrent compiles/runs from clobbering each other.
 """
 import argparse
 import json
@@ -11,7 +13,7 @@ import time
 
 
 def parse_args():
-    ap = argparse.ArgumentParser(description="Compile SUMMA (WSE-3, SDK 2.10)")
+    ap = argparse.ArgumentParser(description="Compile MeshGEMM (WSE-3, SDK 2.10)")
     ap.add_argument("--mode", choices=["sim", "device"], required=True)
     ap.add_argument("--P", type=int, required=True)
     ap.add_argument("--Mt", type=int, required=True)
@@ -38,6 +40,7 @@ def main():
         ]
         subprocess.run(cmd, check=True)
     else:
+        # Lazy import: cs_python (sim) lacks cerebras.sdk.client.
         from cerebras.sdk.client import SdkCompiler
         os.makedirs("compile_out", exist_ok=True)
         options = (
